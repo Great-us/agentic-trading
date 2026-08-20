@@ -1,0 +1,17 @@
+# Starter watchlist: liquid, diversified large-caps + 2 index ETFs for market-regime context.
+# Edit freely — the pipeline reads this file on every run, no code changes needed.
+symbols:
+  - AAPL   # tech
+  - MSFT   # tech
+  - NVDA   # semis
+  - GOOGL  # tech/ads
+  - AMZN   # consumer/cloud
+  - META   # tech/ads
+  - TSLA   # auto/EV
+  - JPM    # financials
+  - XOM    # energy
+  - JNJ    # healthcare
+  - WMT    # consumer staples
+  - UNH    # healthcare
+  - SPY    # S&P 500 ETF, market regime reference
+  - QQQ    # Nasdaq 100 ETF, market regime reference

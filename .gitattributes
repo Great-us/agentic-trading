@@ -1,0 +1,8 @@
+# Batch files must keep CRLF. cmd.exe misparses LF-only .cmd files: `REM`
+# becomes `RE` plus an unknown command `M`, and the script dies before doing
+# anything useful. Without this, git's autocrlf normalisation can strip them.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Everything else is normal text; let git normalise.
+* text=auto

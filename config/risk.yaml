@@ -1,0 +1,71 @@
+# Risk limits — the risk manager enforces these before any order is placed.
+#
+# Tuned aggressive on purpose. Three of these were previously set in ways that
+# capped upside without actually protecting (see README "Why these numbers"):
+# a fixed take-profit that cut winners short, a fixed 5% stop that sat inside
+# one day's noise on high-volatility names, and a noise floor high enough that
+# the LLM read almost never changed an outcome.
+
+# Position size is derived from RISK, not from a flat percentage of equity:
+#
+#     position value = (risk_per_trade_pct x equity) / stop distance
+#
+# so every entry puts roughly the same dollars at stake if its stop is hit.
+# A quiet name on a 6% stop gets a big position; a 90%-volatility name on a 20%
+# stop gets a small one. With a flat percentage the second position would carry
+# more than three times the risk of the first for the same headline "size".
+risk_per_trade_pct: 0.015    # ~1.5% of equity at risk per position
+max_position_pct: 0.18       # hard cap, whatever the formula asks for
+min_position_pct: 0.04       # below this a position isn't worth opening
+
+max_total_exposure_pct: 1.00 # no cash reserve held back; fully invested when signals are there
+max_open_positions: 8
+max_new_orders_per_cycle: 5
+
+# Entry gating. min_quant_score_to_consider is a noise floor on the QUANT score
+# alone: below it the technical read is treated as having no information, so the
+# LLM can't carry a trade by itself.
+min_quant_score_to_consider: 0.15
+buy_threshold: 0.25
+sell_threshold: -0.25
+
+# New entries below this 20-day average dollar volume are skipped (existing
+# positions can still be held/sold). Stops micro-caps that slipped in through
+# the research vault from ever reaching the order path.
+min_adv_usd: 20000000
+
+# Exits. Stops are ATR-based rather than a fixed percentage, so a 60%-volatility
+# name gets room to breathe while a quiet one is still cut quickly.
+# Effective stop distance = atr_stop_multiple x ATR14, clamped to the bounds.
+atr_stop_multiple: 2.5
+min_stop_pct: 0.06           # never tighter than this, however quiet the stock
+max_stop_pct: 0.20           # never wider than this, however wild the stock
+
+# Winners are cut by a trailing stop instead of a fixed take-profit target, so
+# a strong trend can keep running. Set take_profit_pct to a number to re-enable
+# a hard target.
+take_profit_pct: null
+trailing_stop_pct: 0.12      # give back at most ~12% from the high-water mark
+
+# Regime response. In a risk-off tape, position sizes are multiplied by this and
+# the entry bar is raised; in risk-on they get the full allowance.
+risk_off_size_multiplier: 0.5
+risk_off_score_penalty: 0.15  # added to the effective buy threshold when risk-off
+
+# Fast-tier (--fast) LLM-call throttling. Fundamentals and news don't move
+# within an hour, so if a symbol was fully analyzed recently AND its quant
+# score hasn't moved much since, a fast-tier scan skips the LLM call rather
+# than re-deriving the same verdict every 20 minutes. A score move bigger than
+# the delta below is treated as a new situation and analyzed anyway, even
+# inside the cooldown window. Only affects --fast; the twice-daily full cycle
+# always analyzes everything.
+escalation_cooldown_minutes: 60
+escalation_cooldown_score_delta: 0.15
+
+# Fast-tier entries score on the still-forming daily bar, so indicators move
+# continuously during the session and a symbol can cross the buy threshold,
+# fall back, and cross again within the hour. A new intraday BUY therefore has
+# to clear the bar on this many consecutive scans (~20 min apart) before an
+# order goes out. 1 disables the check. Does not apply to the twice-daily deep
+# cycle, which scores settled bars, or to exits — a risk exit never waits.
+min_intraday_confirm_scans: 2

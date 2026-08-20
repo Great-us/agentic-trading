@@ -1,0 +1,26 @@
+# Where the user's own research lives. Tickers found here are unioned into the
+# trading universe alongside config/watchlist.yaml, so the system discovers
+# candidates from what's actually being researched instead of a static list.
+enabled: true
+obsidian_vault_path: "C:\\Users\\helow\\Documents\\Obsidian Vault"
+
+# Folders with real per-instrument write-ups. "Seeking Alpha Daily" also
+# contains news blurbs, not just analysis — the scanner itself only trusts
+# tickers from type: analysis notes there, so the noisier news items don't
+# contribute (see obsidian_scanner.py docstring for why, and for the
+# ticker-shape validation that rejects things like FX pairs and index codes).
+obsidian_subfolders:
+  - "投资研究"
+  - "投资笔记"
+  - "ETF"
+  - "Seeking Alpha Daily"
+
+# Extracted tickers that look valid but aren't Alpaca-tradable, confirmed by
+# hand against the live asset list (see README). Kept here instead of
+# silently dropped so a symbol appearing in a rejected-order log line is
+# traceable back to a decision, not a mystery.
+exclude_symbols:
+  - LONN    # Lonza Group — SIX Swiss Exchange only, no Alpaca-tradable US listing
+  - BANB    # Bachem Holding — SIX Swiss Exchange only, no Alpaca-tradable US listing
+  - POW.CA  # Power Corporation of Canada — wrong suffix convention, unknown to Alpaca
+  - SSNLF   # Samsung Electronics OTC ADR — Alpaca lists it but marks it not tradable
