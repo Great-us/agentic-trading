@@ -30,6 +30,7 @@ class RiskConfig:
     escalation_cooldown_minutes: float
     escalation_cooldown_score_delta: float
     min_intraday_confirm_scans: int = 2
+    allow_intraday_entries: bool = False
     take_profit_pct: float | None = None  # None disables the hard target
     buy_threshold: float = 0.25
     sell_threshold: float = -0.25

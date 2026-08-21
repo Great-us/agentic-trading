@@ -26,7 +26,16 @@ max_new_orders_per_cycle: 5
 # alone: below it the technical read is treated as having no information, so the
 # LLM can't carry a trade by itself.
 min_quant_score_to_consider: 0.15
-buy_threshold: 0.25
+# 0.35 rather than 0.25, from a 2019-2026 backtest of the three settings on the
+# 14-symbol core universe. Being pickier won on every axis at once, which is
+# rare enough to trust:
+#     entry     CAGR   Sharpe   MaxDD   end equity   buys
+#     0.20    +17.3%    1.10   -26.3%     $337,960    227
+#     0.25    +16.7%    1.10   -24.5%     $325,227    206
+#     0.35    +21.3%    1.32   -16.4%     $434,909    196
+# Loosening to 0.20 bought 21 more times for no return and a deeper drawdown.
+# The constraint on this strategy is trade quality, not opportunity count.
+buy_threshold: 0.35
 sell_threshold: -0.25
 
 # New entries below this 20-day average dollar volume are skipped (existing
@@ -68,4 +77,17 @@ escalation_cooldown_score_delta: 0.15
 # to clear the bar on this many consecutive scans (~20 min apart) before an
 # order goes out. 1 disables the check. Does not apply to the twice-daily deep
 # cycle, which scores settled bars, or to exits — a risk exit never waits.
-min_intraday_confirm_scans: 2
+min_intraday_confirm_scans: 3
+
+# Whether the intraday scan may OPEN new positions at all, or only watch the
+# risk on existing ones.
+#
+# Set false because the backtest above says this strategy's edge comes from
+# being pickier, not from finding more entries — and intraday entry-hunting
+# pushes the other way. Exits, stop reconciliation, and trailing-stop ratchets
+# are unaffected: those are the fast tier's real job, and they're the part
+# that measurably benefits from seeing live prices instead of yesterday's close.
+#
+# Set true to let the fast tier take new positions again (still subject to
+# min_intraday_confirm_scans, the cooldown, and every risk limit).
+allow_intraday_entries: false

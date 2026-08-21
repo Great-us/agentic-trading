@@ -368,6 +368,13 @@ def run_cycle(
                 signal=signal, verdict=None, has_open_position=held is not None, **decide_kw,
             )
             wants_entry = quant_only.action == Action.BUY and held is None
+            if wants_entry and not settings.risk.allow_intraday_entries:
+                # Risk-watching only: the fast tier still runs exits, stop
+                # reconciliation, and trailing ratchets on live prices — it just
+                # leaves new positions to the twice-daily cycle, which scores
+                # settled bars. See allow_intraday_entries in config/risk.yaml.
+                clear_intraday_confirmation(conn, symbol)
+                continue
             actionable = wants_entry or (quant_only.action == Action.SELL and held is not None)
             if not actionable:
                 # A name that stopped qualifying loses its streak — otherwise an
