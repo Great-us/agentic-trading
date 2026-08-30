@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -13,8 +14,11 @@ from ..data.feed import HistoricalFeed
 from ..execution.sim_broker import Fill, SimulatedBroker
 from ..journal.logger import connect
 from ..run import run_cycle
+from ..signals.macro import MacroRegime
+from ..signals.technical import QuantSignal
 from .data import load_price_history
 from .metrics import Metrics, buy_and_hold, compute_metrics, equal_weight_hold
+from .universe import UniverseSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,8 @@ class BacktestResult:
     spy_metrics: Metrics | None
     equal_weight_metrics: Metrics | None
     equity: pd.Series
+    cash: pd.Series
+    exposure: pd.Series
     spy_equity: pd.Series | None
     fills: list[Fill]
     settings: Settings
@@ -59,13 +65,36 @@ def run_backtest(
     journal_path: Path | str | None = None,
     risk_overrides: dict | None = None,
     quiet: bool = True,
+    signal_weights: dict[str, float] | None = None,
+    disable_macro: bool = False,
+    extra_symbols: list[str] | None = None,
+    universe_schedule: UniverseSchedule | None = None,
+    cash_returns: pd.Series | None = None,
+    signal_model: Callable[..., QuantSignal | None] | None = None,
+    regime_model: Callable[[object], MacroRegime] | None = None,
+    correlation_model: Callable[[str, list[str], object, int], float | None] | None = None,
+    risk_schedule: Callable[[date], dict] | None = None,
 ) -> BacktestResult:
     """Quant-only daily replay. Decisions at T close, fills at T+1 open."""
     start_d = date.fromisoformat(start) if isinstance(start, str) else start
     end_d = date.fromisoformat(end) if isinstance(end, str) else end
 
-    settings = settings or load_settings(include_research=False)
-    settings.watchlist = list(settings.core_watchlist or settings.watchlist)
+    source_settings = settings or load_settings(include_research=False)
+    core = list(source_settings.core_watchlist or source_settings.watchlist)
+    sectors = dict(source_settings.sectors)
+    if universe_schedule is not None:
+        core = universe_schedule.symbols
+        sectors.update(universe_schedule.sectors)
+    settings = replace(
+        source_settings,
+        watchlist=list(core),
+        core_watchlist=list(core),
+        sectors=sectors,
+    )
+    if extra_symbols:
+        for symbol in extra_symbols:
+            if symbol not in settings.watchlist:
+                settings.watchlist.append(symbol)
     if risk_overrides:
         settings = replace(settings, risk=replace(settings.risk, **risk_overrides))
 
@@ -94,6 +123,7 @@ def run_backtest(
         atr_stop_multiple=settings.risk.atr_stop_multiple,
         min_stop_pct=settings.risk.min_stop_pct,
         max_stop_pct=settings.risk.max_stop_pct,
+        max_entry_gap_atr=settings.risk.max_entry_gap_atr,
         bars=bars,
     )
     if journal_path is None:
@@ -108,29 +138,63 @@ def run_backtest(
     logger.info("Backtest %s → %s, %d sessions, %d symbols, cash=$%.0f",
                 start_d, end_d, len(dates), len(settings.watchlist), initial_cash)
 
+    aligned_cash_returns = pd.Series(0.0, index=pd.DatetimeIndex(dates), dtype=float)
+    if cash_returns is not None and not cash_returns.empty:
+        rates = cash_returns.astype(float).copy()
+        rates.index = _as_dates(pd.DatetimeIndex(rates.index))
+        rates = rates[~rates.index.duplicated(keep="last")]
+        aligned_cash_returns = rates.reindex(aligned_cash_returns.index).fillna(0.0)
+
     for i, session in enumerate(dates):
+        cycle_settings = settings
+        if risk_schedule is not None:
+            scheduled = risk_schedule(session.date()) or {}
+            if scheduled:
+                cycle_settings = replace(settings, risk=replace(settings.risk, **scheduled))
+                broker.atr_stop_multiple = cycle_settings.risk.atr_stop_multiple
+                broker.min_stop_pct = cycle_settings.risk.min_stop_pct
+                broker.max_stop_pct = cycle_settings.risk.max_stop_pct
+        active = (
+            universe_schedule.active_on(session)
+            if universe_schedule is not None
+            else list(settings.watchlist)
+        )
+        if universe_schedule is not None:
+            broker.cancel_pending_buys(set(active))
+        if i > 0:
+            broker.accrue_cash(float(aligned_cash_returns.loc[session]))
         broker.process_bar(session)
+        held = list(broker.get_positions())
+        scan_symbols = list(dict.fromkeys([*active, *held]))
         run_cycle(
             skip_llm=True,
-            settings=settings,
+            settings=cycle_settings,
             broker=broker,
             feed=feed,
             conn=conn,
             asof=session,
+            signal_weights=signal_weights,
+            disable_macro=disable_macro,
+            signal_model=signal_model,
+            regime_model=regime_model,
+            scan_symbols=scan_symbols,
+            entry_symbols=set(active),
+            correlation_model=correlation_model,
         )
         if (i + 1) % 252 == 0:
             logger.info("  ... %s equity=$%.0f positions=%d",
                         session.date(), broker.equity(), len(broker.positions))
 
-    # Fill orders submitted on the last close, if a next session exists in the data.
-    spy_idx = _as_dates(spy.index) if not spy.empty else pd.DatetimeIndex([])
-    later = [ts for ts in spy_idx if ts > dates[-1]]
-    if later:
-        broker.process_bar(later[0])
-    elif dates:
-        # Synthetic fixtures may not have a trailing session; still snapshot equity.
-        if not broker.equity_curve or broker.equity_curve[-1][0] != dates[-1]:
-            broker.equity_curve.append((dates[-1], broker.equity(), broker.cash))
+    # Orders created from the final close cannot fill inside the requested
+    # window. Refund pending buys and mark the existing book at the final close
+    # rather than leaking the next session into the result.
+    broker.cancel_pending_buys()
+    if dates:
+        final_point = (dates[-1], broker.equity(), broker.cash)
+        if broker.equity_curve and broker.equity_curve[-1][0] == dates[-1]:
+            broker.equity_curve[-1] = final_point
+        else:
+            broker.equity_curve.append(final_point)
 
     conn.close()
 
@@ -141,6 +205,13 @@ def run_backtest(
         dtype=float,
     ).sort_index()
     equity = equity[~equity.index.duplicated(keep="last")]
+    cash = pd.Series(
+        {pd.Timestamp(t).tz_localize(None) if pd.Timestamp(t).tzinfo else pd.Timestamp(t): c
+         for t, _, c in broker.equity_curve},
+        dtype=float,
+    ).sort_index()
+    cash = cash[~cash.index.duplicated(keep="last")].reindex(equity.index).ffill()
+    exposure = (1.0 - cash / equity.replace(0, pd.NA)).fillna(0.0).clip(lower=0.0)
 
     spy_metrics = None
     spy_equity = None
@@ -154,18 +225,21 @@ def run_backtest(
             spy_metrics = compute_metrics(spy_curve, [], starting_cash=initial_cash)
 
     ew_metrics = None
-    watch_bars = {s: bars[s] for s in settings.watchlist if s in bars}
-    date_index = pd.DatetimeIndex(dates)
-    ew = equal_weight_hold(watch_bars, initial_cash, date_index)
-    if not ew.empty:
-        ew_curve = [(ts, float(v), 0.0) for ts, v in ew.items()]
-        ew_metrics = compute_metrics(ew_curve, [], starting_cash=initial_cash)
+    if universe_schedule is None:
+        watch_bars = {s: bars[s] for s in settings.watchlist if s in bars}
+        date_index = pd.DatetimeIndex(dates)
+        ew = equal_weight_hold(watch_bars, initial_cash, date_index)
+        if not ew.empty:
+            ew_curve = [(ts, float(v), 0.0) for ts, v in ew.items()]
+            ew_metrics = compute_metrics(ew_curve, [], starting_cash=initial_cash)
 
     return BacktestResult(
         metrics=metrics,
         spy_metrics=spy_metrics,
         equal_weight_metrics=ew_metrics,
         equity=equity,
+        cash=cash,
+        exposure=exposure,
         spy_equity=spy_equity,
         fills=broker.fills,
         settings=settings,

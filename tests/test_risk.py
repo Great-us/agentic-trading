@@ -1,6 +1,13 @@
+from dataclasses import replace
+
+import pandas as pd
+
 from agentic_trading.config import RiskConfig
+from agentic_trading.execution.broker import Position
 from agentic_trading.risk.manager import (
-    check_exit, protective_stop_price, size_position, stop_distance_pct,
+    average_corr_to_holdings, check_exit, effective_max_exposure_pct,
+    plan_trims, portfolio_stop_risk, protective_stop_price,
+    sector_of, sector_room_dollars, size_position, stop_distance_pct,
 )
 
 RISK = RiskConfig(
@@ -78,6 +85,151 @@ def test_risk_off_regime_halves_position_size():
 
 def test_size_position_rejects_an_invalid_stop():
     assert _size(0.0).approved is False
+
+
+def test_portfolio_stop_cap_shrinks_a_new_entry():
+    # 5.8% of equity already at risk; 6% cap leaves 0.2% = $200, so a 10% stop
+    # can only be $2,000 — below the 4% minimum, so the trade is declined.
+    r = size_position(
+        "TEST", 100.0, equity=100_000, cash=100_000, invested_value=0,
+        open_position_count=1, risk=RISK, stop_pct=0.10, existing_stop_risk=5_800,
+    )
+    assert r.approved is False
+    assert "minimum position" in r.reason
+
+
+def test_portfolio_stop_cap_leaves_room_when_book_is_empty():
+    r = _size(0.10)
+    assert r.approved is True
+    assert abs(r.notional * 0.10 - 1_500) < 1.0
+
+
+def test_correlation_haircut_halves_size():
+    full = _size(0.12)
+    cut = size_position(
+        "TEST", 100.0, equity=100_000, cash=100_000, invested_value=0,
+        open_position_count=0, risk=RISK, stop_pct=0.12, corr_multiplier=0.5,
+    )
+    assert cut.approved is True
+    assert cut.notional == round(full.notional * 0.5, 2)
+    assert "correlation" in cut.reason
+
+
+def test_average_corr_is_one_for_identical_series():
+    idx = pd.bdate_range("2020-01-02", periods=80)
+    close = pd.Series(100 + pd.RangeIndex(80) * 0.3, index=idx)
+    assert average_corr_to_holdings(close, {"A": close}) == 1.0
+
+
+def test_average_corr_none_without_holdings():
+    idx = pd.bdate_range("2020-01-02", periods=80)
+    close = pd.Series(100.0, index=idx)
+    assert average_corr_to_holdings(close, {}) is None
+
+
+def test_portfolio_stop_risk_sums_open_positions():
+    positions = {
+        "A": Position("A", qty=100, avg_entry_price=100.0, current_price=100.0, market_value=10_000),
+        "B": Position("B", qty=200, avg_entry_price=100.0, current_price=100.0, market_value=20_000),
+    }
+    # ATR 4 on a $100 name → 10% stop under 2.5× ATR.
+    total = portfolio_stop_risk(positions, {"A": 4.0, "B": 4.0}, RISK)
+    assert abs(total - 3_000.0) < 1e-6
+
+
+def test_portfolio_stop_risk_skips_names_without_atr():
+    positions = {
+        "A": Position("A", qty=100, avg_entry_price=100.0, current_price=100.0, market_value=10_000),
+    }
+    assert portfolio_stop_risk(positions, {}, RISK) == 0.0
+
+
+def test_regime_exposure_uses_the_label_table():
+    assert effective_max_exposure_pct(RISK, "neutral") == 0.80
+    assert effective_max_exposure_pct(RISK, "risk_off") == 0.55
+    assert effective_max_exposure_pct(RISK, None) == RISK.max_total_exposure_pct
+
+
+def test_sector_room_is_zero_when_the_cap_is_full():
+    mapping = {"AAPL": "Technology", "MSFT": "Technology", "JNJ": "Healthcare"}
+    occupancy = {"Technology": 35_000}
+    room = sector_room_dollars("NVDA", 100_000, occupancy, mapping | {"NVDA": "Technology"}, RISK)
+    assert room == 0.0
+    room_jnj = sector_room_dollars("JNJ", 100_000, occupancy, mapping, RISK)
+    assert room_jnj == 30_000
+
+
+def test_unknown_sector_uses_the_default_cap():
+    assert sector_of("ZZZ", {}) == "Unknown"
+    room = sector_room_dollars("ZZZ", 100_000, {}, {}, RISK)
+    assert room == 100_000 * RISK.default_max_sector_pct
+
+
+def test_sector_room_shrinks_a_new_entry():
+    full = _size(0.12)
+    cut = size_position(
+        "TEST", 100.0, equity=100_000, cash=100_000, invested_value=0,
+        open_position_count=0, risk=RISK, stop_pct=0.12, sector_room=5_000,
+    )
+    assert cut.approved is True
+    assert cut.notional == 5_000
+    assert cut.notional < full.notional
+    assert "sector" in cut.reason
+
+
+def test_sector_room_zero_vetoes_below_minimum():
+    r = size_position(
+        "TEST", 100.0, equity=100_000, cash=100_000, invested_value=0,
+        open_position_count=0, risk=RISK, stop_pct=0.10, sector_room=0.0,
+    )
+    assert r.approved is False
+
+
+def test_plan_trims_weakest_first_down_to_the_cap():
+    positions = {
+        "WEAK": Position("WEAK", 400, 100, 100, 40_000),
+        "STRONG": Position("STRONG", 600, 100, 100, 60_000),
+    }
+    plans = plan_trims(
+        positions, {"WEAK": -0.2, "STRONG": 0.8},
+        equity=100_000, invested_value=100_000,
+        prices={"WEAK": 100.0, "STRONG": 100.0},
+        risk=RISK, target_exposure_pct=0.55,
+    )
+    assert plans
+    assert plans[0].symbol == "WEAK"
+    sold = sum(p.notional for p in plans)
+    assert sold >= 44_000  # 100k → 55k, excess 45k
+    remaining = 100_000 - sold
+    assert remaining <= 55_000 + 1.0
+
+
+def test_plan_trims_skips_names_already_exiting():
+    positions = {
+        "WEAK": Position("WEAK", 400, 100, 100, 40_000),
+        "STRONG": Position("STRONG", 600, 100, 100, 60_000),
+    }
+    plans = plan_trims(
+        positions, {"WEAK": -0.2, "STRONG": 0.8},
+        equity=100_000, invested_value=100_000,
+        prices={"WEAK": 100.0, "STRONG": 100.0},
+        risk=RISK, target_exposure_pct=0.55, skip={"WEAK"},
+    )
+    assert all(p.symbol != "WEAK" for p in plans)
+
+
+def test_plan_trims_full_exits_dust():
+    # 50k position, need to cut 48k → remainder 2k < 4% min → full exit.
+    positions = {"A": Position("A", 500, 100, 100, 50_000)}
+    plans = plan_trims(
+        positions, {"A": 0.0},
+        equity=100_000, invested_value=50_000,
+        prices={"A": 100.0},
+        risk=RISK, target_exposure_pct=0.02,
+    )
+    assert len(plans) == 1
+    assert plans[0].full_exit is True
+    assert plans[0].qty == 500
 
 
 # --- ATR-derived stop distance ---------------------------------------------
@@ -174,3 +326,40 @@ def test_stop_price_widens_for_a_volatile_name():
 def test_stop_price_is_penny_rounded():
     price = protective_stop_price(entry_price=173.33, high_water_mark=191.77, atr14=3.1, risk=RISK)
     assert price == round(price, 2)
+
+
+# --- veto attribution ------------------------------------------------------
+# `notional` is the minimum of five separate caps. Reporting only the surviving
+# number made a $0 that meant "the exposure ceiling is already breached" read as
+# "the account is out of cash" — the 2026-08-29 weekly review chased a
+# non-existent broker-cash bug on exactly that wording. The reason string must
+# name the cap that actually bound.
+
+def test_veto_names_the_exposure_cap_when_it_is_the_binding_limit():
+    # Fully invested against the cap, but plenty of cash on hand.
+    result = _size(0.06, equity=100_000, cash=50_000, invested=95_000)
+    assert not result.approved
+    assert "exposure cap" in result.reason
+    assert "cash" not in result.reason
+
+
+def test_veto_names_cash_when_cash_is_the_binding_limit():
+    result = _size(0.06, equity=100_000, cash=100.0, invested=0)
+    assert not result.approved
+    assert "limited by cash" in result.reason
+
+
+def test_veto_names_the_book_stop_risk_budget_when_it_binds():
+    # Exposure and cash are both wide open; the book's stop-risk budget is not.
+    risk = replace(RISK, max_portfolio_stop_risk_pct=0.06)
+    result = size_position("TEST", 100.0, equity=100_000, cash=100_000,
+                           invested_value=0, open_position_count=1, risk=risk,
+                           stop_pct=0.06, existing_stop_risk=5_990.0)
+    assert not result.approved
+    assert "book stop-risk budget" in result.reason
+
+
+def test_approved_sizing_also_reports_what_set_the_number():
+    result = _size(0.06, equity=100_000, cash=100_000, invested=0)
+    assert result.approved
+    assert "set by " in result.reason

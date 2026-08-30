@@ -31,6 +31,11 @@ _TOOL = {
                 "confidence": {"type": "number", "description": FIELD_DOC["confidence"]},
                 "rationale": {"type": "string", "description": FIELD_DOC["rationale"]},
                 "risk_flags": {"type": "array", "items": {"type": "string"}, "description": FIELD_DOC["risk_flags"]},
+                "evidence_quality": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low", "none"],
+                    "description": FIELD_DOC["evidence_quality"],
+                },
             },
             "required": ["stance", "confidence", "rationale", "risk_flags"],
         },
@@ -60,13 +65,20 @@ def analyze_via_api(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": build_user_prompt(signal, news, fundamentals) + "\n\nCall submit_analysis with your assessment."},
             ],
+            # A hung request must not eat the whole cycle window, and a rambling
+            # response cannot help — a verdict is a small JSON object.
+            timeout=120,
+            max_tokens=1024,
         )
+        message = response.choices[0].message
+        calls = list(message.tool_calls or [])
     except Exception:
+        # Everything from HTTP failure to a malformed envelope degrades to
+        # 'no LLM input' instead of aborting the caller's cycle.
         logger.exception("Analyst API call failed for %s", signal.symbol)
         return None
 
-    message = response.choices[0].message
-    for call in message.tool_calls or []:
+    for call in calls:
         if call.function.name != "submit_analysis":
             continue
         try:

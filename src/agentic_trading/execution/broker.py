@@ -5,6 +5,7 @@ logs what it would have done and reports an empty, zero-cash book.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from dataclasses import dataclass
 from typing import Protocol
@@ -42,6 +43,38 @@ def _enum_str(value) -> str:
     return str(getattr(value, "value", value))
 
 
+def _is_not_found(exc: Exception) -> bool:
+    """True when an exception means 'order does not exist' (already filled,
+    expired, or cancelled elsewhere) rather than a real failure."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 404:
+        return True
+    text = str(exc).lower()
+    return "404" in text or "not found" in text
+
+
+class OrderIdMinter:
+    """Mints client_order_ids that are unique per placement *action*.
+
+    Alpaca never recycles a consumed client_order_id: re-submitting the same id
+    for a later placement in the same cycle (cancel/replace of a stop, the
+    post-failed-sell restore) is rejected with 422, and the position sits
+    without its replacement until the next cycle (observed live 2026-08-24).
+    The idempotency that matters — retrying an ambiguous submit with the SAME
+    id so a duplicate is a harmless server-side rejection — is preserved by
+    minting once per action and reusing that value for the action's retries.
+    The sequence number plus the cycle stamp keeps ids unique even across
+    in-cycle replacements; a process restart starts a new cycle timestamp, so
+    no cross-process collision is possible."""
+
+    def __init__(self, cycle_timestamp: str) -> None:
+        self._stamp = "".join(ch for ch in cycle_timestamp if ch.isalnum())
+        self._seq = itertools.count(1)
+
+    def mint(self, purpose: str, symbol: str) -> str:
+        return f"at-{purpose}-{symbol}-{self._stamp}-{next(self._seq)}"[:120]
+
+
 @dataclass
 class OpenOrder:
     order_id: str
@@ -56,10 +89,11 @@ class Broker(Protocol):
     def get_account(self) -> Account: ...
     def get_positions(self) -> dict[str, Position]: ...
     def is_market_open(self) -> bool: ...
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> OrderResult | None: ...
-    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None) -> OrderResult | None: ...
+    def get_today_open(self, symbol: str) -> float | None: ...
+    def submit_market_order(self, symbol: str, qty: float, side: str, *, client_order_id: str | None = None) -> OrderResult | None: ...
+    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None, client_order_id: str | None = None) -> OrderResult | None: ...
     def get_open_orders(self) -> list[OpenOrder]: ...
-    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float) -> OrderResult | None: ...
+    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None: ...
     def cancel_order(self, order_id: str) -> bool: ...
 
 
@@ -70,6 +104,9 @@ class AlpacaBroker:
         if not paper:
             raise ValueError("AlpacaBroker is paper-only in this project; refusing paper=False.")
         self._client = TradingClient(api_key, secret_key, paper=True)
+        self._api_key = api_key
+        self._secret_key = secret_key
+        self._data = None  # StockHistoricalDataClient, created lazily
 
     def get_account(self) -> Account:
         acct = self._client.get_account()
@@ -91,13 +128,36 @@ class AlpacaBroker:
     def is_market_open(self) -> bool:
         return bool(self._client.get_clock().is_open)
 
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> OrderResult:
+    def get_today_open(self, symbol: str) -> float | None:
+        """Today's regular-session open, for the entry chase guard.
+
+        None when there is no session bar yet or the request fails; callers
+        treat None as 'this gate cannot run' and fall back to the
+        signal-relative chase check, not as 'gate passed'."""
+        try:
+            if self._data is None:
+                from alpaca.data.historical import StockHistoricalDataClient
+
+                self._data = StockHistoricalDataClient(self._api_key, self._secret_key)
+            from alpaca.data.requests import StockSnapshotRequest
+
+            snapshot = self._data.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbol))
+            bar = getattr(snapshot, "daily_bar", None)
+            if bar is None or not bar.open:
+                return None
+            return float(bar.open)
+        except Exception:
+            logger.exception("Could not fetch today's open for %s", symbol)
+            return None
+
+    def submit_market_order(self, symbol: str, qty: float, side: str, *, client_order_id: str | None = None) -> OrderResult:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
         order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
         request = MarketOrderRequest(
-            symbol=symbol, qty=qty, side=order_side, time_in_force=TimeInForce.DAY
+            symbol=symbol, qty=qty, side=order_side, time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
         )
         try:
             order = self._client.submit_order(request)
@@ -111,7 +171,7 @@ class AlpacaBroker:
         logger.info("Submitted %s order: %s x%s (id=%s, status=%s)", side, symbol, qty, order.id, order.status)
         return OrderResult(symbol=symbol, side=side, qty=qty, status=_enum_str(order.status), order_id=str(order.id))
 
-    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None) -> OrderResult:
+    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None, client_order_id: str | None = None) -> OrderResult:
         """Buys a dollar amount rather than a share count. On a small account,
         whole-share rounding is a real distortion — $1,800 of a $780 stock is
         2 shares (13% under budget) — and fractional shares remove it.
@@ -120,7 +180,8 @@ class AlpacaBroker:
         from alpaca.trading.requests import MarketOrderRequest
 
         request = MarketOrderRequest(
-            symbol=symbol, notional=round(notional, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY
+            symbol=symbol, notional=round(notional, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            client_order_id=client_order_id,
         )
         try:
             order = self._client.submit_order(request)
@@ -150,7 +211,7 @@ class AlpacaBroker:
             for o in orders
         ]
 
-    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float) -> OrderResult | None:
+    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None:
         """Broker-side protective stop. Plain stop rather than trailing, because
         Alpaca does not accept trailing stops on fractional positions — the
         trailing behaviour is reproduced by ratcheting this order's price up on
@@ -166,6 +227,7 @@ class AlpacaBroker:
         request = StopOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY, stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
         )
         try:
             order = self._client.submit_order(request)
@@ -179,7 +241,12 @@ class AlpacaBroker:
         try:
             self._client.cancel_order_by_id(order_id)
             return True
-        except Exception:
+        except Exception as exc:
+            if _is_not_found(exc):
+                # Already filled / expired / cancelled elsewhere is a SUCCESS
+                # for our purposes: the caller may now place its replacement.
+                logger.info("Cancel %s: order no longer exists (404) — treating as cancelled.", order_id)
+                return True
             logger.exception("Failed to cancel order %s", order_id)
             return False
 
@@ -196,18 +263,23 @@ class DryRunBroker:
     def is_market_open(self) -> bool:
         return True
 
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> OrderResult:
+    def get_today_open(self, symbol: str) -> float | None:
+        # No simulated session bar: the open-relative chase gate cannot run in
+        # dry runs, so only the signal-relative gate applies.
+        return None
+
+    def submit_market_order(self, symbol: str, qty: float, side: str, *, client_order_id: str | None = None) -> OrderResult:
         logger.info("[DRY RUN] would submit %s order: %s x%s", side, symbol, qty)
         return OrderResult(symbol=symbol, side=side, qty=qty, status="dry_run", order_id=None)
 
-    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None) -> OrderResult:
+    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None, client_order_id: str | None = None) -> OrderResult:
         logger.info("[DRY RUN] would buy %s worth $%.2f", symbol, notional)
         return OrderResult(symbol=symbol, side="buy", qty=0.0, status="dry_run", order_id=None)
 
     def get_open_orders(self) -> list[OpenOrder]:
         return []
 
-    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float) -> OrderResult | None:
+    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None:
         logger.info("[DRY RUN] would place protective stop: %s x%s @ %.2f", symbol, qty, stop_price)
         return OrderResult(symbol=symbol, side="sell", qty=qty, status="dry_run", order_id=None)
 

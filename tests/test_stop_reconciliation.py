@@ -36,7 +36,7 @@ class FakeBroker:
         self.open_orders = [o for o in self.open_orders if o.order_id != order_id]
         return True
 
-    def submit_stop_sell(self, symbol, qty, stop_price):
+    def submit_stop_sell(self, symbol, qty, stop_price, *, client_order_id=None):
         if self.reject_stops:
             return None
         self.placed.append((symbol, qty, stop_price))
@@ -74,8 +74,12 @@ def test_leaves_an_adequate_stop_alone():
 
 def test_ratchets_the_stop_up_after_a_run():
     # Peak at 600 pulls the trailing level to 528, well above the resting 452.
+    # The market (595) sits just under the peak — a real ratchet, not a crash
+    # below the trail, which the client-side exit would have handled already.
     broker = FakeBroker([stop_order(stop_price=452.14)])
-    _reconcile_protective_stops(broker, {"MSFT": position()}, {"MSFT": 600.0}, {"MSFT": 12.0}, RISK, LOG)
+    _reconcile_protective_stops(
+        broker, {"MSFT": position(price=595.0)}, {"MSFT": 600.0}, {"MSFT": 12.0}, RISK, LOG,
+    )
     assert broker.cancelled == ["existing"]
     assert len(broker.placed) == 1
     assert broker.placed[0][2] == round(600.0 * 0.88, 2)
@@ -100,6 +104,28 @@ def test_survives_a_rejected_stop():
     broker = FakeBroker(reject_stops=True)
     _reconcile_protective_stops(broker, {"MSFT": position()}, {}, {"MSFT": 12.0}, RISK, LOG)
     assert broker.placed == []  # rejection is logged, not raised
+
+
+def test_live_retries_a_stop_after_cancel(monkeypatch):
+    monkeypatch.setattr("agentic_trading.run.time.sleep", lambda _s: None)
+
+    class Flaky(FakeBroker):
+        def __init__(self):
+            super().__init__([stop_order(stop_price=452.14)])
+            self.attempts = 0
+
+        def submit_stop_sell(self, symbol, qty, stop_price, *, client_order_id=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                return None
+            return super().submit_stop_sell(symbol, qty, stop_price, client_order_id=client_order_id)
+
+    broker = Flaky()
+    _reconcile_protective_stops(
+        broker, {"MSFT": position(price=595.0)}, {"MSFT": 600.0}, {"MSFT": 12.0}, RISK, LOG, live=True,
+    )
+    assert broker.attempts == 2
+    assert len(broker.placed) == 1
 
 
 def test_ignores_buy_orders_when_looking_for_protection():

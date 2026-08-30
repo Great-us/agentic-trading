@@ -14,6 +14,7 @@ from ..signals.macro import RATIOS, VIX_TICKER
 logger = logging.getLogger(__name__)
 
 MAX_CACHE_DIR = CACHE_DIR / "max"
+YFINANCE_CACHE_DIR = CACHE_DIR / "yfinance"
 REFRESH_AFTER_SECONDS = 20 * 60 * 60  # ~one trading day
 
 
@@ -30,17 +31,29 @@ def _max_path(symbol: str) -> Path:
     return MAX_CACHE_DIR / f"{safe}.parquet"
 
 
-def load_price_history(symbols: list[str], *, force: bool = False) -> dict[str, pd.DataFrame]:
+def load_price_history(
+    symbols: list[str], *, force: bool = False, allow_stale: bool = False,
+) -> dict[str, pd.DataFrame]:
     """Return {symbol: OHLCV} with as much daily history as Yahoo will give.
 
     Cached under data/cache/max/. A cache file newer than ~20h is reused as-is.
+    ``allow_stale`` deliberately freezes any readable cached history. This is useful
+    for reproducible research runs where refreshing an already captured input would
+    silently change the experiment.
     """
     MAX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    YFINANCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # yfinance otherwise creates SQLite metadata below the OS user-cache folder,
+    # which is not guaranteed to be writable in an isolated/reproducible run.
+    yf.set_tz_cache_location(str(YFINANCE_CACHE_DIR))
     wanted = list(dict.fromkeys([*symbols, *macro_tickers()]))
     out: dict[str, pd.DataFrame] = {}
     for symbol in wanted:
         path = _max_path(symbol)
-        if not force and path.exists() and (time.time() - path.stat().st_mtime) < REFRESH_AFTER_SECONDS:
+        cache_is_usable = path.exists() and (
+            allow_stale or (time.time() - path.stat().st_mtime) < REFRESH_AFTER_SECONDS
+        )
+        if not force and cache_is_usable:
             try:
                 out[symbol] = pd.read_parquet(path)
                 continue

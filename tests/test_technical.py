@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from agentic_trading.signals.technical import compute_signal
+from agentic_trading.signals.technical import compute_signal, weights_without
 
 
 def _make_price_df(closes: list[float]) -> pd.DataFrame:
@@ -45,6 +45,23 @@ def test_flat_price_scores_near_zero():
     signal = compute_signal("FLAT", df)
     assert signal is not None
     assert abs(signal.score) < 0.05
+
+
+def test_weights_without_rsi_renormalises():
+    weights = weights_without("rsi")
+    assert weights["rsi"] == 0.0
+    assert abs(sum(weights.values()) - 1.0) < 1e-9
+
+
+def test_dropping_rsi_changes_an_overbought_uptrend_score():
+    closes = list(np.linspace(100, 160, 80))
+    df = _make_price_df(closes)
+    full = compute_signal("UP", df)
+    no_rsi = compute_signal("UP", df, weights=weights_without("rsi"))
+    assert full is not None and no_rsi is not None
+    # Relentless uptrend: RSI is hot, so it was subtracting; dropping it
+    # should raise (or at least change) the composite.
+    assert no_rsi.score != full.score
 
 
 def test_score_always_within_bounds():

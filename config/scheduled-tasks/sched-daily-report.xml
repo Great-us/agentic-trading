@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <!-- After-close daily one-pager for BOTH books (16:25 ET, after the
+       16:15 deep cycle has flushed). Writes markdown only; never trades. -->
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-25T16:25:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday />
+          <Tuesday />
+          <Wednesday />
+          <Thursday />
+          <Friday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "cd /d C:\Users\helow\Documents\Trading &amp;&amp; .venv\Scripts\python.exe -m agentic_trading.daily_report --p2-db ..\Trading-P2\data\journal.db &amp; cd /d C:\Users\helow\Documents\Trading-P2 &amp;&amp; .venv\Scripts\python.exe -m agentic_trading.daily_report"</Arguments>
+    </Exec>
+  </Actions>
+</Task>

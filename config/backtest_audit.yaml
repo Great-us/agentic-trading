@@ -1,0 +1,57 @@
+start: 2007-04-11
+end: 2026-08-21
+initial_cash: 100000
+jobs: 2
+bootstrap_samples: 1000
+
+current_universe:
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - AMZN
+  - META
+  - TSLA
+  - JPM
+  - XOM
+  - JNJ
+  - WMT
+  - UNH
+
+stress_additions:
+  - INTC
+  - DIS
+  - PYPL
+  - BA
+  - PFE
+  - IBM
+  - GE
+  - CSCO
+  - CVX
+  - MRK
+
+stress_sectors:
+  INTC: Technology
+  DIS: Communication Services
+  PYPL: Financial Services
+  BA: Industrials
+  PFE: Healthcare
+  IBM: Technology
+  GE: Industrials
+  CSCO: Technology
+  CVX: Energy
+  MRK: Healthcare
+
+cost_scenarios:
+  base: {slippage_bps: 5, stop_slippage_bps: 10}
+  medium: {slippage_bps: 15, stop_slippage_bps: 30}
+  severe: {slippage_bps: 30, stop_slippage_bps: 60}
+
+point_in_time:
+  membership_csv: data/backtest/point_in_time/membership.csv
+  bars_dir: data/backtest/point_in_time/bars
+  quality_json: data/backtest/point_in_time/data_quality.json
+  theme_tickers: [AAPL, MSFT, NVDA, GOOG, GOOGL, AMZN, META, TSLA]
+  theme_max_pct: 0.25
+  theme_max_positions: 2
+  placebo_samples: 500

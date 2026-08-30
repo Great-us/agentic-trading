@@ -51,15 +51,24 @@ def cagr(equity: pd.Series) -> float:
     return float((equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1)
 
 
-def yearly_returns(equity: pd.Series) -> dict[int, float]:
+def yearly_returns(equity: pd.Series, *, starting_equity: float | None = None) -> dict[int, float]:
+    """Calendar returns chained from the prior year-end.
+
+    The first value is measured from ``starting_equity`` when supplied.  This
+    keeps partial first years and the product of reported years consistent with
+    the full-period return.  The old first-session-to-last-session calculation
+    silently dropped each year's first trading-day return.
+    """
     if equity.empty:
         return {}
     out: dict[int, float] = {}
-    grouped = equity.groupby(equity.index.year)
-    for year, series in grouped:
-        if len(series) < 2 or series.iloc[0] <= 0:
+    year_ends = equity.groupby(equity.index.year).last()
+    previous = float(starting_equity) if starting_equity is not None else float(equity.iloc[0])
+    for year, ending in year_ends.items():
+        if previous <= 0:
             continue
-        out[int(year)] = float(series.iloc[-1] / series.iloc[0] - 1)
+        out[int(year)] = float(ending / previous - 1)
+        previous = float(ending)
     return out
 
 
@@ -135,7 +144,7 @@ def compute_metrics(
         win_rate=win_rate,
         profit_factor=profit_factor,
         avg_exposure=avg_exposure,
-        years=yearly_returns(equity),
+        years=yearly_returns(equity, starting_equity=starting_cash),
     )
 
 

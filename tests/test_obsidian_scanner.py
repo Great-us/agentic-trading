@@ -15,6 +15,7 @@ def _write(path: Path, content: str) -> None:
 def test_extracts_frontmatter_ticker(tmp_path):
     _write(tmp_path / "notes" / "Nebius.md", """---
 ticker: NBIS
+tradeable: true
 公司: Nebius Group
 ---
 # Nebius
@@ -25,7 +26,12 @@ ticker: NBIS
 
 
 def test_extracts_filename_ticker_when_no_frontmatter_field(tmp_path):
-    _write(tmp_path / "notes" / "01-IQVIA-IQV.md", "# IQVIA deep dive\nno frontmatter ticker field here\n")
+    _write(tmp_path / "notes" / "01-IQVIA-IQV.md", """---
+tradeable: true
+---
+# IQVIA deep dive
+no ticker field here
+""")
     result = scan_vault(tmp_path)
     assert result.symbols == ["IQV"]
     assert result.tickers[0].method == "filename"
@@ -37,6 +43,7 @@ def test_does_not_pick_up_tags_as_tickers(tmp_path):
     # Only the explicit ticker: field should be trusted, not the tag list.
     _write(tmp_path / "notes" / "01-IQVIA-IQV.md", """---
 title: IQVIA deep dive
+tradeable: true
 tags: [投资研究, CRO, 医疗数据, IQV, Serenity]
 ---
 # IQVIA
@@ -59,15 +66,15 @@ def test_known_acronyms_excluded_from_filename_heuristic(tmp_path):
 
 
 def test_deduplicates_same_ticker_across_files(tmp_path):
-    _write(tmp_path / "notes" / "a.md", "---\nticker: VHT\n---\n")
-    _write(tmp_path / "notes" / "b.md", "---\nticker: VHT\n---\n")
+    _write(tmp_path / "notes" / "a.md", "---\nticker: VHT\ntradeable: true\n---\n")
+    _write(tmp_path / "notes" / "b.md", "---\nticker: VHT\ntradeable: true\n---\n")
     result = scan_vault(tmp_path)
     assert result.symbols == ["VHT"]
     assert len(result.tickers) == 2  # both occurrences still recorded, just deduped in .symbols
 
 
 def test_restricts_to_specified_subfolders(tmp_path):
-    _write(tmp_path / "included" / "a.md", "---\nticker: AAA\n---\n")
+    _write(tmp_path / "included" / "a.md", "---\nticker: AAA\ntradeable: true\n---\n")
     _write(tmp_path / "excluded" / "b.md", "---\nticker: BBB\n---\n")
     result = scan_vault(tmp_path, subfolders=["included"])
     assert result.symbols == ["AAA"]
@@ -79,13 +86,13 @@ def test_missing_vault_returns_empty_not_an_error(tmp_path):
 
 
 def test_missing_subfolder_is_skipped_not_an_error(tmp_path):
-    _write(tmp_path / "present" / "a.md", "---\nticker: AAA\n---\n")
+    _write(tmp_path / "present" / "a.md", "---\nticker: AAA\ntradeable: true\n---\n")
     result = scan_vault(tmp_path, subfolders=["present", "absent"])
     assert result.symbols == ["AAA"]
 
 
 def test_lowercase_frontmatter_ticker_is_uppercased(tmp_path):
-    _write(tmp_path / "notes" / "a.md", "---\nticker: nbis\n---\n")
+    _write(tmp_path / "notes" / "a.md", "---\nticker: nbis\ntradeable: true\n---\n")
     result = scan_vault(tmp_path)
     assert result.symbols == ["NBIS"]
 
@@ -161,7 +168,7 @@ def test_sector_summary_and_archive_types_are_excluded(tmp_path):
 def test_notes_without_a_type_field_are_never_excluded(tmp_path):
     # Pre-existing folders (投资研究/ETF/投资笔记) don't use type: at all and
     # must keep working exactly as before this change.
-    _write(tmp_path / "notes" / "a.md", "---\nticker: NBIS\n---\n")
+    _write(tmp_path / "notes" / "a.md", "---\nticker: NBIS\ntradeable: true\n---\n")
     result = scan_vault(tmp_path)
     assert result.symbols == ["NBIS"]
 
@@ -184,9 +191,24 @@ def test_share_class_suffix_is_recorded_as_a_mention(tmp_path):
     assert result.mentions == ["BRK.B"]
 
 
+def test_ticker_without_tradeable_flag_is_not_authorized(tmp_path):
+    _write(tmp_path / "notes" / "a.md", "---\nticker: IQV\n---\n")
+    result = scan_vault(tmp_path)
+    assert result.symbols == []
+    assert result.mentions == ["IQV"]
+
+
+def test_filename_ticker_without_tradeable_flag_is_not_authorized(tmp_path):
+    _write(tmp_path / "notes" / "01-IQVIA-IQV.md", "# research only\n")
+    result = scan_vault(tmp_path)
+    assert result.symbols == []
+    assert result.mentions == ["IQV"]
+
+
 def test_singular_ticker_is_tradeable_even_when_a_plural_list_is_also_present(tmp_path):
     _write(tmp_path / "notes" / "01-IQVIA-IQV.md", """---
 ticker: IQV
+tradeable: true
 tickers: [IQV, ACET, BSX]
 ---
 """)
@@ -220,7 +242,7 @@ def test_one_file_contributing_multiple_mentions_all_recorded(tmp_path):
 
 def test_unreadable_file_does_not_abort_the_scan(tmp_path, monkeypatch):
     good = tmp_path / "notes" / "a.md"
-    _write(good, "---\nticker: AAA\n---\n")
+    _write(good, "---\nticker: AAA\ntradeable: true\n---\n")
     bad = tmp_path / "notes" / "b.md"
     _write(bad, "---\nticker: BBB\n---\n")
 

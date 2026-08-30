@@ -21,12 +21,12 @@ worth knowing before raising call frequency.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .cli_provider import kill_process_tree, sanitized_child_env
 from .json_extract import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -126,38 +126,46 @@ def check_sentiment(
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             cwd=work_dir,
-            env=os.environ.copy(),
+            env=sanitized_child_env(),
             creationflags=creation_flags,
         )
     except FileNotFoundError:
         logger.error("Grok CLI not found at %s", grok_path)
         return None
-    except subprocess.TimeoutExpired:
-        logger.warning("Grok sentiment check timed out after %ss for %s — proceeding without it.", timeout, symbol)
-        return None
     except Exception:
         logger.exception("Grok CLI invocation failed for %s", symbol)
         return None
 
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc)
+        stdout, stderr = proc.communicate()
+        logger.warning(
+            "Grok sentiment check timed out after %ss for %s — process tree killed, proceeding without it.",
+            timeout, symbol,
+        )
+        return None
+
     if proc.returncode != 0:
-        logger.error("Grok CLI exited %s for %s: %s", proc.returncode, symbol, (proc.stderr or "").strip()[:500])
+        logger.error("Grok CLI exited %s for %s: %s", proc.returncode, symbol, (stderr or "").strip()[:500])
         return None
 
     # --output-format json wraps the answer in one envelope object with a
     # "text" field holding the model's (possibly still-messy) response.
-    envelope = extract_json_object(proc.stdout or "")
-    inner_text = envelope.get("text") if envelope else (proc.stdout or "")
+    envelope = extract_json_object(stdout or "")
+    inner_text = envelope.get("text") if envelope else (stdout or "")
     payload = extract_json_object(inner_text) if isinstance(inner_text, str) else None
     if payload is None:
-        logger.error("No JSON object in Grok output for %s: %r", symbol, (proc.stdout or "").strip()[:500])
+        logger.error("No JSON object in Grok output for %s: %r", symbol, (stdout or "").strip()[:500])
         return None
 
     return _parse_verdict(payload, symbol)

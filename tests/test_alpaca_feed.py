@@ -5,7 +5,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pytest
 
 from agentic_trading.data.alpaca_feed import AlpacaFeed
 

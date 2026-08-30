@@ -35,19 +35,44 @@ Then for each symbol in `config/watchlist.yaml`:
    structured stance/confidence/rationale/risk_flags. Two interchangeable
    backends (see [Analyst backends](#analyst-backends)); skipped entirely if
    neither is configured, or with `--skip-llm`.
-4. **Decision** (`decision/engine.py`) — quant and LLM scores are averaged. If
-   they *disagree* in direction, that's treated as no-conviction (hold/avoid)
-   rather than averaged away silently. Actions are BUY / SELL / HOLD / WAIT /
-   AVOID, where WAIT means "constructive, but not at this price".
+4. **Decision** (`decision/engine.py`) — quant and LLM scores are averaged for
+   the journal. A BUY requires the **quant score alone** to clear
+   `buy_threshold`; a SELL on an open position requires **quant alone** to
+   fall through `sell_threshold`. The LLM can veto a new entry or disagree
+   into HOLD; it cannot originate a BUY or a SELL. Hard stops and TRIM still
+   exit regardless. Actions are BUY / SELL / TRIM / HOLD / WAIT / AVOID.
 5. **Risk sizing** (`risk/manager.py`) — a BUY still has to clear
-   `max_position_pct`, `max_total_exposure_pct`, `max_open_positions`, and
-   `max_new_orders_per_cycle`, and gets cut by the regime multiplier, before an
-   order is placed.
-6. **Execution** (`execution/broker.py`) — buys go to Alpaca's paper API as
-   *notional* (fractional-share) orders, so a $1,800 budget buys $1,800 of a
-   $779 stock rather than rounding down to two shares. No Alpaca credentials
-   configured → falls back to `DryRunBroker`, which logs what it *would* have
-   done against a fake $100k book instead.
+   `max_position_pct`, the regime's `regime_max_exposure` cap (see the table in
+   `config/risk.yaml`; neutral 65%, risk-off 55%, plus a permanent cash
+   buffer), `max_open_positions`, `max_new_orders_per_cycle`,
+   `max_portfolio_stop_risk_pct`, and the per-sector cap in
+   `config/sectors.yaml`. Size is also halved when the candidate's 60-day
+   return correlation vs names already held averages above
+   `corr_penalty_threshold`. In a risk-off tape the regime multiplier cuts
+   new size again. Selling the existing book (**TRIM**) is double-buffered:
+   it only arms when the regime score is beyond `trim_trigger_score` (-0.30,
+   vs the -0.20 risk_off line) for `trim_confirm_cycles` consecutive
+   deep-cycle readings (~one trading day) — a shallow dip or a one-cycle VIX
+   spike sells nothing — and then only down to the 55% cap. New-entry
+   tightening stays immediate; TRIM never runs in `--fast`.
+6. **Execution** (`execution/broker.py`) — every live BUY is stored as a
+   `TradeIntent` and **not** submitted immediately. The intent carries a
+   `not_before` time and executes inside the **entry window**
+   (`entry_window_start_et`–`entry_window_end_et`, default 10:00–15:30 ET):
+   the open's first half hour is the widest-spread, most chaotic tape of the
+   day, and momentum names' historical edge concentrates overnight
+   (Lou-Polk-Skouras, JFE 2019), so no order is placed before 10:00. A 9:45
+   decision queues for that morning's window; a 16:15 decision queues for the
+   next day's. When a fast scan flushes the intent it revalidates against the
+   live quote — a gap of more than `max_entry_gap_atr` ATR past the signal
+   becomes WAIT, and the **chase guards** (`max_chase_vs_open_pct`,
+   `max_chase_vs_signal_pct`) hold an intent that would buy the top of the
+   morning's move for a later scan instead. Intents expire after **72
+   hours** — long enough to span a weekend, short enough that a week-old
+   analysis can't execute after an outage. With `require_llm_for_entry` on
+   (default), a BUY whose LLM verdict went missing mid-cycle is downgraded to
+   WAIT: a decision chain missing a layer doesn't open new risk (`--skip-llm`
+   stays an explicit operator override). No credentials → `DryRunBroker`.
 7. **Journal** (`journal/logger.py`) — every symbol's signal, verdict, decision,
    and order outcome is written to `data/journal.db` (SQLite) for later review.
 
@@ -56,7 +81,11 @@ Then once more at the end of the cycle:
 8. **Protective-stop reconciliation** — positions are re-read (so anything that
    just filled is included) and every one of them is checked against a resting
    stop order at Alpaca, which is placed or ratcheted up as needed. This is what
-   protects a position between cycles.
+   protects a position between cycles. The same reconciliation **also runs at
+   the start** of every cycle, so a position left bare by a mid-cycle crash
+   (killed process, timeout) gets its stop back within one cycle start instead
+   of surviving unprotected through an entire pass. A failed sell re-places the
+   stop immediately rather than waiting for the end-of-cycle pass.
 
 ## Setup
 
@@ -93,9 +122,20 @@ pay for instead of a separate per-token API key.
 
 ```ini
 ANALYST_PROVIDER=cli
-ANALYST_CLI_PATH=C:\Users\<you>\.kimi-code\bin\kimi.exe
-ANALYST_CLI_TIMEOUT=180
+ANALYST_CLI_PATH=C:\Users\<you>\AppData\Roaming\npm\claude.cmd
+ANALYST_CLI_TIMEOUT=300
+ANALYST_CLI_MODEL=sonnet
+ANALYST_CLI_HOME=
+ANALYST_CLI_EXTRA_ARGS=--effort high --tools "" --verbose --strict-mcp-config --disable-slash-commands --no-session-persistence
 ```
+
+Claude Code is the recommended scheduled backend. Its `-p` mode supports
+automation, and the flags above expose no built-in tools, MCP servers, skills,
+or slash commands to the analyst subprocess. Kimi Code remains mechanically
+compatible, but its subscription guidelines prohibit unattended automation,
+so it should not be used by this project's scheduled cycles.
+`--no-session-persistence` also prevents these one-shot analyst calls from
+creating Claude conversation JSONL files on disk.
 
 Verified with Kimi Code (`kimi.exe`); Claude Code (`claude`) exposes the same
 `-p` + `--output-format stream-json` interface and the output parser handles
@@ -105,12 +145,13 @@ for intraday.
 
 #### Pinning the model and reasoning effort
 
-`ANALYST_CLI_MODEL` is passed through as `-m`, so the analyst can't silently
+`ANALYST_CLI_MODEL` is passed through as `--model`, so the analyst can't silently
 ride on whatever the CLI's global `default_model` happens to be — if you change
 your everyday coding model, the trading system keeps using the one it was
 configured with.
 
-Reasoning effort is more awkward. In Kimi Code the global `[thinking] effort`
+The separate config-home procedure below is only needed for legacy/manual
+Kimi Code use. In Kimi Code the global `[thinking] effort`
 in `~/.kimi-code/config.toml` outranks both a per-model `default_effort` and a
 project-local `.kimi-code/local.toml`, and a built-in migration
 (`migrations-effort.json`, recorded as `thinking-effort-max-to-high`) rewrites
@@ -143,10 +184,30 @@ repo — it holds OAuth tokens.
 Two caveats worth knowing:
 
 - **The machine has to be on** when a cycle fires, since the CLI runs locally.
-- Coding-plan subscriptions are sold for coding assistance. Personal,
-  low-frequency use like this is what `-p` exists for, but heavy automated
-  querying is the kind of thing rate limits and abuse detection exist to catch.
-  Keep the cadence modest.
+- Claude Code's five-hour and weekly subscription limits still apply. A rate
+  limit makes this layer return `None`, and the system safely falls back to its
+  quant-only decision path for that symbol.
+
+#### What the analyst subprocess can and cannot see
+
+The analyst subprocess is deliberately boxed in:
+
+- **No credentials in reach.** Its environment strips anything matching
+  `ALPACA|APCA|MOONSHOT|TIINGO|SECRET|PASSWORD|TOKEN|API_KEY`, so no trading or
+  data-vendor key is visible to the agent (or to whatever IT spawns).
+- **News is untrusted input.** Headlines and fundamentals are embedded inside
+  `<untrusted_*>` tags under an explicit system-prompt rule that their contents
+  are data, never instructions; angle brackets inside them are neutralised and
+  length is capped. News feeds aggregate third-party content — this is the
+  injection boundary for everything between the tags.
+- **Tool exposure varies by backend.** The recommended Claude configuration
+  exposes zero tools via `ANALYST_CLI_EXTRA_ARGS`. Kimi Code has no `--tools`
+  switch; the provider points its `--skills-dir` at an empty directory to stop
+  skill auto-discovery, and prompt rules + running outside the repo directory
+  cover the rest of that gap.
+- **Timeouts kill the whole process tree.** A hung call gets `taskkill /T`, not
+  just the `.cmd` shim — previously the node grandchild survived as an orphan
+  still burning quota — and partial stderr is logged for diagnosis.
 
 ### `api` — pay-per-token
 
@@ -244,13 +305,14 @@ cycle at 9:45 AM and 4:15 PM US/Eastern on weekdays:
 .\.venv\Scripts\python.exe -m agentic_trading.scheduler
 ```
 
-**09:45, not pre-market.** Notional orders only fill during regular hours, so a
-pre-market cycle leaves its buys sitting in the queue — and the protective-stop
-reconciliation at the end of that cycle would find no position to protect,
-leaving the day's new entries uncovered until the next run. Running after the
-open lets a buy fill and receive its stop within the same cycle. Orders from
-the afternoon run queue for the next session, which is the intended behaviour
-for a swing-horizon strategy.
+**09:45, not pre-market.** The cycle must run after the open so its data, regime
+read, and stop reconciliation all see a live market. Since the entry-window
+change, the 9:45 cycle itself no longer submits buys: decisions queue as
+`TradeIntent`s and the 20-minute fast scans execute them from 10:00 ET once the
+gap and chase checks pass — so a buy fills *and* receives its protective stop
+without ever trading the opening chaos. Orders from the afternoon run queue for
+the next session's window, which is the intended behaviour for a
+swing-horizon strategy.
 
 ### Windows Task Scheduler (what's actually installed)
 
@@ -258,7 +320,10 @@ More robust than keeping `scheduler.py` alive: it survives reboots and can wake
 a sleeping machine. The task invokes the venv's `python.exe` directly:
 
 ```powershell
-$py       = "C:\Users\helow\Documents\Trading\.venv\Scripts\python.exe"
+$py       = "C:\Users\helow\Documents\Trading\.venv\Scripts\pythonw.exe"
+# pythonw (no console) on purpose: a scheduled task running plain python.exe
+# flashes a console window in the interactive session on every trigger.
+
 $dir      = "C:\Users\helow\Documents\Trading"
 $action   = New-ScheduledTaskAction -Execute $py -Argument "-m agentic_trading.run" -WorkingDirectory $dir
 $t1       = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 9:45am
@@ -315,7 +380,9 @@ running `python -m agentic_trading.run --fast` every 20 minutes from 9:35am to
 ~4:05pm ET:
 
 ```powershell
-$py  = "C:\Users\helow\Documents\Trading\.venv\Scripts\python.exe"
+$py  = "C:\Users\helow\Documents\Trading\.venv\Scripts\pythonw.exe"
+# See the note above the deep-cycle task: pythonw avoids the per-run console flash.
+
 $dir = "C:\Users\helow\Documents\Trading"
 $action  = New-ScheduledTaskAction -Execute $py -Argument "-m agentic_trading.run --fast" -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 9:35am
@@ -369,7 +436,8 @@ means indicators move continuously, so a symbol can cross the buy threshold at
 a stateless scan, on one wobble. Given the backtest's 41% win rate, more
 triggers is not self-evidently good:
 
-1. **`min_intraday_confirm_scans`** (`config/risk.yaml`, default 2) — a *new
+1. **`min_intraday_confirm_scans`** (`config/risk.yaml`; code default 2, the
+   live config runs 3) — a *new
    intraday entry* must clear the bar on that many consecutive scans (~20 min
    apart) before an order is placed. Streak state lives in the journal's
    `intraday_confirmations` table and resets the moment a symbol stops
@@ -388,8 +456,20 @@ One thing this deliberately does *not* do: **it is not tick-by-tick.** Reacting
 to an adverse move faster than 20 minutes is the broker-side protective stop's
 job (see below) — no polling loop beats a resting order at the exchange.
 
-- `config/watchlist.yaml` — core symbols to track, hand-maintained. Starts with
-  12 diversified large-caps + SPY/QQQ; edit freely, no code changes needed.
+**Deep and fast tasks can overlap — one OS-level lock guards both.**
+`MultipleInstances IgnoreNew` only stops a task from overlapping *itself*; a
+slow 9:45 deep cycle still running at 9:55 and a 9:55 fast scan are two separate
+processes on one account and one journal. Every entry point (`python -m
+agentic_trading.run`, `scheduler.py`) therefore holds an OS file lock
+(`data/cycle.lock`) for the duration of a cycle — a second process logs a
+warning and exits instead of double-trading, and the kernel releases the lock
+automatically if a process dies, so a killed cycle cannot wedge the next one.
+The journal is opened in WAL mode with a busy timeout for the same reason.
+
+- `config/watchlist.yaml` — tradeable symbols to track, hand-maintained. The
+  current book is the 14-name growth pool (2026-08-22, SA Quant + growth
+  factor); SPY/QQQ sit in `context_symbols` (regime reference only, never
+  bought). Edit freely, no code changes needed.
 - `config/research.yaml` — an Obsidian vault to mine for additional tickers
   (see [Research vault](#research-vault-as-a-symbol-source)).
 - `config/risk.yaml` — every hard limit (position size, exposure, stops, order
@@ -407,9 +487,11 @@ Extraction (`research/obsidian_scanner.py`) trusts exactly two signals, both
 deliberately narrow — a false-positive ticker here means the system could
 analyze or trade the wrong instrument, which is worse than missing a real one:
 
-1. A `ticker:` (singular) field in a note's YAML front matter.
+1. A `ticker:` (singular) field in a note's YAML front matter **and**
+   `tradeable: true`. Researching a name is not authorization to trade it.
 2. A filename ending `-XXXX.md` (1-5 uppercase letters), matching how the
-   vault's individual stock write-ups are actually named (`01-IQVIA-IQV.md` → `IQV`).
+   vault's individual stock write-ups are actually named (`01-IQVIA-IQV.md` → `IQV`),
+   also only when `tradeable: true` is set.
 
 A `tickers:` *array* is recorded as a mention and is **not** tradeable. Seeking
 Alpha Daily analysis notes stamp that field on every article; those are names
@@ -457,13 +539,17 @@ LLM-only trades (the technical signal must show *something*) without vetoing
 setups the quant model rates as merely moderate.
 
 The genuinely riskier dial is concentration: `max_position_pct` 0.18 with
-`max_open_positions` 6 means up to ~6 positions carrying real weight each,
-rather than a diluted basket. That is a real variance increase, and it is the
-one to turn down first if the swings are uncomfortable.
+`max_open_positions` 8 would let eight 1.5%-risk names stack ~12% of equity
+at the stop. `max_portfolio_stop_risk_pct` 0.06 is the book-level cap on that
+sum; a 60-day return correlation above 0.75 vs names already held halves the
+new size. Turn those down first if the swings are uncomfortable.
 
 Aggression is also **conditional on the regime** rather than constant: in a
-risk-off tape sizes are halved and the entry bar rises by
-`risk_off_score_penalty`. Exits are never gated by the regime.
+risk-off tape new sizes are halved, the entry bar rises by
+`risk_off_score_penalty`, and TRIM sells the weakest holdings down to the
+risk-off exposure cap. Neutral tapes cap *new* entries at their regime cap
+(0.65 in the live config) but do not auto-sell.
+Stop / trailing-stop exits are never gated by the regime.
 
 ### Protective stops are broker-side
 
@@ -541,9 +627,29 @@ exercised live against the paper account.
   capped regardless of how confident a signal is.
 - **Every position sits behind a broker-side stop**, so protection does not
   depend on this program being awake — see below.
+- **Holdings that leave the watchlist stay protected.** Peak updates and the
+  client-side exit checks run over everything the account holds, not just
+  current watchlist names — dropping a symbol no longer silently downgrades its
+  trailing stop to a frozen level and blinds its exit checks.
+- **A bad tick cannot poison the trailing stop.** An implausible bar High is
+  ignored for the peak update, and a computed stop at/above the market is
+  refused rather than submitted-and-rejected every cycle.
 - **LLM failures degrade to quant-only**, they never get treated as a
   bullish/bearish signal by default — a failed API call returns `None`, not a
   guess.
+- **Orders are idempotent within a cycle.** Every submit carries a
+  deterministic `client_order_id` derived from (cycle, purpose, symbol), so a
+  submit that times out client-side is retried with the same id — Alpaca
+  rejects the duplicate instead of doubling the position or stacking a second
+  protective stop.
+- **After close, exits queue instead of failing.** A stop/signal exit detected
+  by the 16:15 cycle is recorded as `queued_closed` rather than submitting a
+  market order Alpaca would reject anyway (and burning a Grok call on it); the
+  next open re-checks it against fresh prices.
+- **Stock splits re-base the trailing stop.** A detected forward split — share
+  count at a clean multiple with market value preserved — resets the
+  high-water mark to the post-split price instead of letting the position look
+  ~50% below its phantom peak and triggering a false exit.
 
 ### Backtesting
 
@@ -551,33 +657,142 @@ The live cycle is replayed against daily history: same `decide` / `size_position
 / `check_exit` / `compute_signal` / `assess_regime`, a `SimulatedBroker` for
 fills. Quant-only — LLM verdicts are not historically reproducible without
 look-ahead. Decisions at day T's close, fills at T+1 open; stops use the day's
-low (and fill at the open if the gap went through the stop).
+low (and fill at the open if the gap went through the stop). Entries respect
+the live **gap veto** as well: an entry whose fill-day open is more than
+`max_entry_gap_atr` ATR past the decision close is refunded, not filled.
+
+The default `--start` is **2007-04-11** — the first day HYG trades and the
+earliest date the five-ratio regime can run without silently dropping credit.
+Earlier defaults were tried and rejected: starting in 2019 re-validates the
+strategy on the mega-cap bull window (SPY itself +17.5%) that produced the
+overstated 22% CAGR quote. Any run extending into 2023+ overlaps the **consumed
+holdout window** recorded in [`HOLDOUT-LEDGER.md`](HOLDOUT-LEDGER.md); treat
+those numbers as in-sample for parameter decisions.
 
 ```powershell
 # Default universe is config/watchlist.yaml (not the research vault).
-.\.venv\Scripts\python.exe -m agentic_trading.backtest --start 2019-01-01
+# 2007-04-11 is also the default --start; shown here for clarity.
+.\.venv\Scripts\python.exe -m agentic_trading.backtest --start 2007-04-11
 
 # One-at-a-time sweep around the current risk.yaml knobs
 .\.venv\Scripts\python.exe -m agentic_trading.backtest --sweep
+
+# In-sample grid: buy_threshold × ATR stop (do not promote the winner to live)
+.\.venv\Scripts\python.exe -m agentic_trading.backtest --surface
+
+# Expanding IS, one-year OOS; concatenated OOS is the honest number
+.\.venv\Scripts\python.exe -m agentic_trading.backtest --walk-forward
+
+# What happens if we rip RSI / macro / score-SELL out, or let it buy SPY/QQQ
+.\.venv\Scripts\python.exe -m agentic_trading.backtest --ablate
+
+# Reproducible Stage-A audit (current winners + robustness matrix)
+.\.venv\Scripts\python.exe -m agentic_trading.backtest.audit
+
+# Build the licensed, frozen point-in-time S&P 500 membership and quality report
+.\.venv\Scripts\python.exe -m agentic_trading.backtest.pit_data build
+
+# Fill prices from Yahoo, existing Alpaca SIP credentials, then optional Tiingo
+.\.venv\Scripts\python.exe -m agentic_trading.backtest.pit_data prices --download
+
+# Re-run the strict data gates without downloading anything
+.\.venv\Scripts\python.exe -m agentic_trading.backtest.pit_data validate
 ```
 
-Writes `data/backtest/equity.csv` and a journal. Report is vs SPY buy-and-hold
-and vs equal-weight hold of the same universe.
+Default run writes `data/backtest/equity.csv` and a journal. `--surface` /
+`--walk-forward` / `--ablate` write matching text (and an OOS equity CSV)
+under the same directory. Report is vs SPY buy-and-hold and vs equal-weight
+hold of the same universe. The surface ranking is in-sample; concatenated
+walk-forward OOS is the number to believe.
+
+The point-in-time builder does **not** drop a constituent when its price is
+missing. It freezes the source commits and hashes, assigns a separate internal
+instrument ID to every membership episode (so ticker reuse cannot splice two
+securities), cross-checks membership against an independent source, and adds
+SEC-EDGAR-derived terminal delisting returns where available. Stage B runs only
+after `data/backtest/point_in_time/data_quality.json` passes its required gates.
+The free data remains an approximation: current CIK/GICS metadata does not form
+a complete historical permanent-ID/sector master. The builder uses cached Yahoo
+history first, then adjusted Alpaca SIP history for legacy/delisted names, with
+optional Tiingo as a final fallback; unresolved gaps still require a licensed
+institutional dataset rather than silently shrinking the universe.
+
+When Stage B is ready, the audit automatically adds the full historical
+universe, a 25%/two-position Big-Tech basket cap, an ex-Big-Tech run, three time
+splits, point-in-time equal-weight and sector-neutral benchmarks, and 500 seeded
+random-portfolio placebo paths.
+
+After cycles have been journaled, score each decision's forward path without
+changing any live knob:
+
+```powershell
+.\.venv\Scripts\python.exe -m agentic_trading.journal.evaluate
+```
+
+That writes `signal_outcomes` (+1d/+5d/+20d, 20-day MFE/MAE) and prints
+bucket averages. Small `n` is shown as-is, not treated as a finding.
+
+The **current growth-pool book has no historical evidence** — roughly half its
+names are under three years old and the pool was selected on recent strength.
+[`research/ACTIVE-BOOK-VALIDATION-PLAN.md`](research/ACTIVE-BOOK-VALIDATION-PLAN.md)
+is the standing contract for how it earns (or loses) trust: paper-forward
+tracking against exposure-matched benchmarks and the 252-name candidate-pool
+placebo, quarterly review, pre-registered promotion/demotion rules. The
+Technology sector cap is confirmed there as the book's deliberate
+theme-concentration limit, not an accident to be tuned away.
 
 ## What's not here yet
 
 Roughly in order of how much they'd improve the system:
 
-- **Risk flags don't affect sizing.** The LLM emits useful warnings ("earnings
-  in 3 days", "stretched valuation") that are logged and shown but have no
-  mechanical effect. Feeding flag count or severity into the size multiplier is
-  a small change with real value.
+- **Risk flags don't affect sizing.** The LLM emits `risk_flags` and
+  `evidence_quality` that are journaled for the forward evaluator
+  (`python -m agentic_trading.journal.evaluate`) and shown in reasoning, but
+  they have no mechanical effect. Wait until that evaluator has a real sample
+  before wiring flags into size.
 - Shorting, options, or anything beyond long-only equities.
-- Partial exits (TRIM). Exits are currently all-or-nothing.
+- Lot-level accounting (wash sale, average-in). TRIM reduces share count on
+  the existing Alpaca position; it does not track lots.
 - Multi-day position tracking beyond what Alpaca's own position/avg-cost
   reporting gives you — the journal is an audit log, not a source of truth for
   current holdings. The one exception is `position_peaks`, which the trailing
   stop needs because the broker doesn't report a high-water mark.
+
+## Dashboard
+
+A local, read-only web dashboard over both books — open
+**http://127.0.0.1:8600** after starting it:
+
+```powershell
+.\.venv\Scripts\python.exe -m agentic_trading.dashboard.api          # binds 127.0.0.1:8600
+```
+
+The dashboard is a bystander: journals open in SQLite `mode=ro`, and the only
+broker access is GET-only queries (positions, fills, resting stops) against the
+paper endpoint using each book's own `.env` credentials. It contains no
+order-placement code and writes nothing.
+
+What each page shows:
+
+- **总览 / 持仓 / 交易记录 / 决策链 / 策略逻辑** — per book: equity curve with
+  drawdown, current holdings with live stop distance, round-trips from the
+  broker's fill history (the journal records order *intents*, not fills), the
+  full quant → LLM → risk-gate chain for any past cycle, and the effective
+  `risk.yaml` values next to a plain-language description of the pipeline.
+- **轮动名单**（二号盘 only）— latest evening/midday RS rosters parsed from
+  `research/p2/rosters/`, including hysteresis streaks and watchlist diffs.
+- **双盘对比** — normalized equity overlay plus the two pre-registered
+  increment-information diagnostics from [`research/PAPER2-THEME-ROTATION.md`](research/PAPER2-THEME-ROTATION.md)
+  §5: daily holdings overlap and the 60-day rolling return correlation.
+
+Books are configured read-only in `config/dashboard.yaml` (id, display name,
+kind, repository root). The second entry points at `C:\Users\helow\Documents\Trading-P2`;
+if that root is missing, remove the entry rather than pointing it elsewhere.
+
+Frontend development: the React/Vite source lives under
+`src/agentic_trading/dashboard/frontend/`. For iteration, run `npm run dev`
+there (Vite proxies `/api` to :8600); for production use, `npm run build` emits
+`dist/`, which `api.py` serves automatically when present.
 
 ## Credits
 

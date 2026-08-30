@@ -10,3 +10,27 @@ data/backtest/
 data/llm_scratch/
 .pytest_cache/
 *.egg-info/
+.claude/settings.local.json
+
+# Runtime state, not source: the cycle lock, the watchdog stamp, and SQLite's
+# sidecar files. data/*.db is already ignored above; committing its -wal/-shm
+# would capture a half-flushed snapshot of a database that isn't in the repo.
+data/*.lock
+data/*.json
+data/*.db-shm
+data/*.db-wal
+
+# Generated one-pagers, rebuilt from journal.db by `daily_report`. The journal
+# itself is ignored, so these are derived output with no source in the repo.
+# Written analysis that is meant to last lives in research/ and IS tracked.
+logs/daily/
+
+# Scratch space for one-off research and scraping runs (132 files / 6.5 MB as
+# of 2026-08-30, including a vendored PyMuPDF install). Nothing here is
+# imported by the package; findings that mattered were written up in research/.
+tmp/
+
+# Dashboard frontend: node_modules is dependency output; dist is rebuilt by
+# `npm run build` (see README "Dashboard").
+src/agentic_trading/dashboard/frontend/node_modules/
+src/agentic_trading/dashboard/frontend/dist/

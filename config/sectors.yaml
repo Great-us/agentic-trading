@@ -1,0 +1,40 @@
+# Yahoo-style sector names for the tradeable universe. Backtests use this file
+# only (no network). Live research names missing here fall back to the
+# fundamentals snapshot, then to default_max_sector_pct.
+#
+# DESIGN INTENT: for the current growth pool (12/14 Technology names) the
+# Technology cap below is the book's THEME-CONCENTRATION limit, deliberately —
+# it is what keeps one AI/compute basket from swallowing the account. Do not
+# loosen it because "signals keep getting vetoed"; that is the cap working.
+# See research/ACTIVE-BOOK-VALIDATION-PLAN.md §5 before touching these numbers.
+#
+# Old mega-cap / staples mappings are kept so leftover positions still have a
+# sector for the per-sector cap. Core pool as of 2026-08-22 is the growth names.
+
+# Core growth pool
+MU: Technology
+SNDK: Technology
+AMD: Technology
+NVDA: Technology
+AMZN: Consumer Cyclical
+ANET: Technology
+CRDO: Technology
+ALAB: Technology
+NBIS: Technology
+HPE: Technology
+FLEX: Technology
+CIEN: Technology
+ARGX: Healthcare
+VEEV: Healthcare
+
+# Previous core — leftover / research-vault names
+AAPL: Technology
+MSFT: Technology
+GOOGL: Communication Services
+META: Communication Services
+TSLA: Consumer Cyclical
+JPM: Financial Services
+XOM: Energy
+JNJ: Healthcare
+UNH: Healthcare
+WMT: Consumer Defensive

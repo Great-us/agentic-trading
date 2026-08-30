@@ -1,0 +1,13 @@
+# Dashboard 书籍注册表 —— 纯展示用，不是交易配置。
+# 每个条目指向一套策略书的仓库根目录；journal/config/rosters 路径均由 root 推导。
+# dashboard 对这些系统零写入：journal 以 SQLite mode=ro 打开，
+# Alpaca 只发 GET（见 src/agentic_trading/dashboard/broker_read.py）。
+books:
+  - id: p1
+    display_name: "一号盘 · 成长池"
+    kind: fixed_pool
+    root: C:/Users/helow/Documents/Trading
+  - id: p2
+    display_name: "二号盘 · 主题轮动"
+    kind: rs_rotation
+    root: C:/Users/helow/Documents/Trading-P2

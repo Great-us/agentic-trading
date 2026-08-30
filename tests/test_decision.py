@@ -10,7 +10,7 @@ def make_signal(score: float, extended: bool = False) -> QuantSignal:
     return QuantSignal(
         symbol="TEST", score=score, last_price=100.0, sma20=101.0, sma50=99.0,
         rsi14=55.0, momentum_20d_pct=2.0, atr14=1.5, volatility_annualized_pct=20.0,
-        components={}, extended=extended,
+        extended=extended,
     )
 
 
@@ -46,6 +46,30 @@ def test_conflicting_signals_hold_existing_position():
     assert d.conflicting_signals is True
 
 
+def test_llm_cannot_originate_an_entry():
+    # Quant 0.20 clears the noise floor and a bullish LLM would lift combined
+    # over 0.25 — that used to be a BUY. LLM is a brake, not ignition.
+    d = decide(make_signal(0.20), make_verdict("bullish", 0.9),
+               has_open_position=False, min_quant_score_to_consider=MIN_SCORE)
+    assert d.action == Action.AVOID
+    assert "cannot originate" in d.reasoning
+
+
+def test_unknown_regime_blocks_new_entries():
+    unknown = MacroRegime(score=0.0, label="unknown")
+    d = decide(make_signal(0.8), None, has_open_position=False,
+               min_quant_score_to_consider=MIN_SCORE, regime=unknown)
+    assert d.action == Action.AVOID
+    assert "UNKNOWN" in d.reasoning
+
+
+def test_unknown_regime_does_not_block_an_exit():
+    unknown = MacroRegime(score=0.0, label="unknown")
+    d = decide(make_signal(-0.6), None, has_open_position=True,
+               min_quant_score_to_consider=MIN_SCORE, regime=unknown)
+    assert d.action == Action.SELL
+
+
 def test_agreement_raises_conviction_vs_quant_alone():
     quant_only = decide(make_signal(0.4), None, has_open_position=False, min_quant_score_to_consider=MIN_SCORE)
     with_llm = decide(make_signal(0.4), make_verdict("bullish", 0.9), has_open_position=False, min_quant_score_to_consider=MIN_SCORE)
@@ -54,6 +78,22 @@ def test_agreement_raises_conviction_vs_quant_alone():
 
 def test_sell_on_weak_score_with_open_position():
     d = decide(make_signal(-0.6), None, has_open_position=True, min_quant_score_to_consider=MIN_SCORE)
+    assert d.action == Action.SELL
+
+
+def test_llm_cannot_originate_an_exit():
+    # Quant is only mildly negative; a bearish LLM would drag combined under
+    # -0.25. That used to be a SELL. LLM is a brake, not ignition, on exits too.
+    d = decide(make_signal(-0.10), make_verdict("bearish", 0.9),
+               has_open_position=True, min_quant_score_to_consider=MIN_SCORE)
+    assert d.action == Action.HOLD
+    assert "cannot originate an exit" in d.reasoning
+    assert d.combined_score < -0.25
+
+
+def test_quant_sell_still_fires_when_llm_is_cheerful():
+    d = decide(make_signal(-0.6), make_verdict("bullish", 0.9),
+               has_open_position=True, min_quant_score_to_consider=MIN_SCORE)
     assert d.action == Action.SELL
 
 

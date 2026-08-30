@@ -18,7 +18,7 @@ risk_per_trade_pct: 0.015    # ~1.5% of equity at risk per position
 max_position_pct: 0.18       # hard cap, whatever the formula asks for
 min_position_pct: 0.04       # below this a position isn't worth opening
 
-max_total_exposure_pct: 1.00 # no cash reserve held back; fully invested when signals are there
+max_total_exposure_pct: 1.00 # absolute ceiling only — the regime table below and the cash buffer bind first
 max_open_positions: 8
 max_new_orders_per_cycle: 5
 
@@ -26,17 +26,25 @@ max_new_orders_per_cycle: 5
 # alone: below it the technical read is treated as having no information, so the
 # LLM can't carry a trade by itself.
 min_quant_score_to_consider: 0.15
-# 0.35 rather than 0.25, from a 2019-2026 backtest of the three settings on the
-# 14-symbol core universe. Being pickier won on every axis at once, which is
-# rare enough to trust:
-#     entry     CAGR   Sharpe   MaxDD   end equity   buys
-#     0.20    +17.3%    1.10   -26.3%     $337,960    227
-#     0.25    +16.7%    1.10   -24.5%     $325,227    206
-#     0.35    +21.3%    1.32   -16.4%     $434,909    196
-# Loosening to 0.20 bought 21 more times for no return and a deeper drawdown.
-# The constraint on this strategy is trade quality, not opportunity count.
+# 0.35 was the best of {0.20, 0.25, 0.35} on the *same* 2019–2026 window used
+# to pick it — in-sample selection, not a walk-forward proof. Live uses it as
+# a conservative bar; do not treat the 21.3% CAGR as out-of-sample evidence.
 buy_threshold: 0.35
 sell_threshold: -0.25
+
+# Exit bar for holdings that have fallen off the core watchlist — leftovers from
+# a pool swap, not part of the book under validation. They sit on the same risk
+# budget as the names being tested but contribute nothing to the question the
+# book is meant to answer, so a name that has stopped earning its exposure leaves
+# rather than parking the budget. Applied only on the off-watchlist path, where
+# the LLM is never consulted (combined == quant there), so this reads as either.
+#
+# 0.10 separates the two groups cleanly on the record to date: over the last ten
+# readings JPM (+0.035..+0.056) sat below it 10/10 and ACET (-0.002..+0.146)
+# 9/10, while MSFT (+0.593..+0.612) and IQV (+0.657..+0.666) never came near it.
+# It is a bookkeeping boundary for a retired universe, not a tuned parameter —
+# the core pool's own sell_threshold is untouched.
+legacy_sell_threshold: 0.10
 
 # New entries below this 20-day average dollar volume are skipped (existing
 # positions can still be held/sold). Stops micro-caps that slipped in through
@@ -91,3 +99,92 @@ min_intraday_confirm_scans: 3
 # Set true to let the fast tier take new positions again (still subject to
 # min_intraday_confirm_scans, the cooldown, and every risk limit).
 allow_intraday_entries: false
+
+# Overnight gap vs the signal's reference price, in ATR units. A BUY whose
+# live quote has already run more than this past the signal price is WAIT —
+# same idea as `extended`, applied to the close-to-open jump.
+max_entry_gap_atr: 0.75
+
+# Entry execution window (US/Eastern). BUY decisions queue as TradeIntents and
+# only execute inside this window, so no order is ever placed in the open's
+# first half hour — the widest-spread, most chaotic tape of the day (a robust
+# intraday microstructure result), and momentum names' historical edge is
+# concentrated overnight, not intraday (Lou-Polk-Skouras, JFE 2019).
+entry_window_start_et: "10:00"
+entry_window_end_et: "15:30"
+
+# Chase guards applied when an intent executes. If the live price is already
+# this far above today's open (or above the signal-time price), the intent
+# waits for a later scan instead of buying the top of the move — "no entry
+# point, no trade". Missing today's open disables only the open-relative gate;
+# the signal-relative gate always applies.
+max_chase_vs_open_pct: 0.015
+max_chase_vs_signal_pct: 0.010
+
+# A BUY whose LLM verdict is missing (analyst CLI/API crashed mid-cycle) is
+# downgraded to WAIT: a decision chain missing a layer must not open new risk.
+# Exits, stops, and trailing ratchets are unaffected. --skip-llm remains an
+# explicit operator override that allows quant-only entries.
+require_llm_for_entry: true
+
+# Portfolio risk. Equal-risk sizing only equalises *per-name* stop risk; eight
+# 1.5% names can still put ~12% of equity on the line together. This cap is the
+# book-level version: sum(position value × stop distance) / equity.
+max_portfolio_stop_risk_pct: 0.06
+
+# If a candidate's 60-day return correlation with names already held averages
+# above the threshold, size is multiplied by corr_size_multiplier. Cheap stand-in
+# for "don't stack another mega-cap on top of three you already own".
+corr_lookback: 60
+corr_penalty_threshold: 0.75
+corr_size_multiplier: 0.5
+
+# Book-level invested / equity cap by regime. Applied to NEW entries every cycle.
+# TRIM of names already held runs for labels in trim_regimes, so a tape that
+# degrades to neutral automatically sells the book down toward its target —
+# exposure follows the environment instead of only ratcheting in.
+#
+# risk_on 0.85 / neutral 0.65 (was 1.00 / 0.80): full exposure is a privilege of
+# a strongly risk-on tape, and even then the cash buffer below binds first.
+# Regime-based exposure control is the best-evidenced lever here (Cooper et al.
+# JF 2004: momentum profits concentrate in up-markets; partial-Kelly sizing).
+regime_max_exposure:
+  risk_on: 0.85
+  neutral: 0.65
+  risk_off: 0.55
+  unknown: 0.00
+
+# Cash that is never deployed, whatever the regime table says: the effective
+# cap is min(regime cap, 1 - this). "Buy quantity is computed, not 'spend all
+# the cash'" — the account always keeps visible dry powder.
+min_cash_buffer_pct: 0.05
+
+# The book is actively trimmed toward the regime target only in these labels,
+# and only when the sell buffers below are satisfied — existing positions are
+# never sold on a single bad reading.
+trim_regimes:
+  - risk_off
+
+# Sell buffers for TRIM. They gate selling the existing book only; the
+# risk-off tightening on NEW entries (size multiplier, higher threshold, 55%
+# cap) stays immediate — defense is cheap, dispositions are not.
+# - depth: the regime score must be beyond trim_trigger_score, not merely past
+#   the risk_off line (-0.20). A shallow dip sells nothing.
+# - time: the condition must hold on this many consecutive deep-cycle readings
+#   (9:45/16:15 ET, so 2 ≈ one full trading day). A one-cycle VIX spike that
+#   reverts by the afternoon sells nothing.
+trim_trigger_score: -0.30
+trim_confirm_cycles: 2
+
+# Per GICS-style sector (see config/sectors.yaml). A new buy that would breach
+# is shrunk; below min_position_pct it is vetoed. Mega-cap overlap across
+# Technology / Communication / Consumer Cyclical is still the correlation haircut.
+max_sector_pct:
+  Technology: 0.35
+  Communication Services: 0.30
+  Healthcare: 0.30
+  Energy: 0.25
+  Financial Services: 0.30
+  Consumer Cyclical: 0.30
+  Consumer Defensive: 0.25
+default_max_sector_pct: 0.35

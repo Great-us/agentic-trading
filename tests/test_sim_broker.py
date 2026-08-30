@@ -17,7 +17,7 @@ def _bars(symbol, rows: list[tuple[str, float, float, float, float]]) -> dict:
 def test_buy_fills_next_session_open_with_slippage():
     bars = _bars("AAA", [
         ("2020-01-02", 100, 101, 99, 100),
-        ("2020-01-03", 110, 112, 109, 111),
+        ("2020-01-03", 101, 112, 100, 111),  # +0.5 ATR gap — inside the veto cap
     ])
     broker = SimulatedBroker(starting_cash=10_000, slippage_bps=0, bars=bars)
     broker.process_bar(pd.Timestamp("2020-01-02"))
@@ -26,8 +26,36 @@ def test_buy_fills_next_session_open_with_slippage():
     assert "AAA" not in broker.positions
     broker.process_bar(pd.Timestamp("2020-01-03"))
     pos = broker.positions["AAA"]
-    assert pos.avg_entry_price == 110
-    assert abs(pos.qty * 110 - 1_000) < 1e-6
+    assert pos.avg_entry_price == 101
+    assert abs(pos.qty * 101 - 1_000) < 1e-6
+
+
+def test_gap_veto_refuses_to_chase_an_overnight_gap():
+    # Live TradeIntents WAIT when the open gaps more than max_entry_gap_atr
+    # past the decision close; the replay must refuse exactly those entries.
+    bars = _bars("AAA", [
+        ("2020-01-02", 100, 101, 99, 100),
+        ("2020-01-03", 115, 116, 114, 115),  # open is +7.5 ATR past the close
+    ])
+    broker = SimulatedBroker(starting_cash=10_000, slippage_bps=0, bars=bars)
+    broker.process_bar(pd.Timestamp("2020-01-02"))
+    broker.submit_notional_buy("AAA", 1_000, atr14=2.0)
+    broker.process_bar(pd.Timestamp("2020-01-03"))
+    assert "AAA" not in broker.positions
+    assert broker.cash == 10_000, "reserved cash must be refunded on a vetoed entry"
+    assert [(d, s) for d, s, _gap in broker.gap_vetoed_buys] == [(pd.Timestamp("2020-01-03"), "AAA")]
+
+
+def test_gap_veto_ignores_entries_without_an_atr():
+    bars = _bars("AAA", [
+        ("2020-01-02", 100, 101, 99, 100),
+        ("2020-01-03", 120, 121, 119, 120),  # huge gap, but no ATR recorded
+    ])
+    broker = SimulatedBroker(starting_cash=10_000, slippage_bps=0, bars=bars)
+    broker.process_bar(pd.Timestamp("2020-01-02"))
+    broker.submit_notional_buy("AAA", 1_000, atr14=None)
+    broker.process_bar(pd.Timestamp("2020-01-03"))
+    assert "AAA" in broker.positions
 
 
 def test_stop_fires_on_intraday_low_even_if_close_recovers():
@@ -63,6 +91,26 @@ def test_gapped_stop_fills_at_the_open_not_the_stop_price():
     sell = [f for f in broker.fills if f.side == "sell"][0]
     assert sell.reason == "gap_stop"
     assert sell.price == 70
+
+
+def test_partial_sell_leaves_the_remainder():
+    bars = _bars("AAA", [
+        ("2020-01-02", 100, 101, 99, 100),
+        ("2020-01-03", 100, 101, 99, 100),
+        ("2020-01-06", 110, 112, 109, 111),
+    ])
+    broker = SimulatedBroker(starting_cash=10_000, slippage_bps=0, bars=bars)
+    broker.process_bar(pd.Timestamp("2020-01-02"))
+    broker.submit_notional_buy("AAA", 2_000, atr14=2.0)
+    broker.process_bar(pd.Timestamp("2020-01-03"))
+    qty = broker.positions["AAA"].qty
+    broker.submit_market_order("AAA", qty / 2, "sell")
+    broker.process_bar(pd.Timestamp("2020-01-06"))
+    assert "AAA" in broker.positions
+    assert abs(broker.positions["AAA"].qty - qty / 2) < 1e-6
+    sells = [f for f in broker.fills if f.side == "sell"]
+    assert len(sells) == 1
+    assert abs(sells[0].qty - qty / 2) < 1e-6
 
 
 def test_pending_buy_counts_toward_equity():

@@ -53,3 +53,5 @@ def test_elevated_vix_scales_between():
 def test_regime_label_helpers():
     assert MacroRegime(score=-0.4, label="risk_off").is_risk_off is True
     assert MacroRegime(score=0.4, label="risk_on").is_risk_off is False
+    assert MacroRegime(score=0.0, label="unknown").is_unknown is True
+    assert MacroRegime(score=0.0, label="unknown").is_risk_off is False

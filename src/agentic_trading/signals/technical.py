@@ -23,8 +23,6 @@ class QuantSignal:
     momentum_20d_pct: float
     atr14: float
     volatility_annualized_pct: float
-    components: dict[str, float]
-    macd_histogram: float = 0.0
     extended: bool = False  # trend is healthy but the entry is chasing
 
 
@@ -58,11 +56,31 @@ def _macd_histogram(close: pd.Series, fast: int = 12, slow: int = 26, signal: in
     return macd_line - signal_line
 
 
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "trend": 0.30, "cross": 0.20, "momentum": 0.20, "macd": 0.20, "rsi": 0.10,
+}
+
+
+def weights_without(*dropped: str) -> dict[str, float]:
+    """Renormalise DEFAULT_WEIGHTS after dropping components (ablation helper)."""
+    kept = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in dropped}
+    total = sum(kept.values()) or 1.0
+    out = {k: v / total for k, v in kept.items()}
+    for key in dropped:
+        out[key] = 0.0
+    return out
+
+
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return float(max(lo, min(hi, x)))
 
 
-def compute_signal(symbol: str, df: pd.DataFrame, min_bars: int = 55) -> QuantSignal | None:
+def compute_signal(
+    symbol: str,
+    df: pd.DataFrame,
+    min_bars: int = 55,
+    weights: dict[str, float] | None = None,
+) -> QuantSignal | None:
     """Returns None if there isn't enough history to compute stable indicators."""
     if df.empty or len(df) < min_bars:
         return None
@@ -93,7 +111,7 @@ def compute_signal(symbol: str, df: pd.DataFrame, min_bars: int = 55) -> QuantSi
     # Normalised by price so the histogram is comparable across share prices.
     macd_component = _clip((last_macd_hist / last_price) * 100) if last_price else 0.0
 
-    weights = {"trend": 0.30, "cross": 0.20, "momentum": 0.20, "macd": 0.20, "rsi": 0.10}
+    weights = dict(DEFAULT_WEIGHTS if weights is None else weights)
     components = {
         "trend": trend_component,
         "cross": cross_component,
@@ -119,7 +137,5 @@ def compute_signal(symbol: str, df: pd.DataFrame, min_bars: int = 55) -> QuantSi
         momentum_20d_pct=momentum_20d_pct,
         atr14=last_atr,
         volatility_annualized_pct=volatility_annualized_pct,
-        components=components,
-        macd_histogram=last_macd_hist,
         extended=extended,
     )

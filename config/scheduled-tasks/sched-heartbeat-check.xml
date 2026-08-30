@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <!-- Hourly heartbeat sanity check for BOTH books, weekdays only.
+       Window 11:00-15:00 ET sits strictly inside both books' fast-scan
+       windows (first stamp >=10:10+35min stale guard, last stamp <=16:05),
+       so freshness thresholds cannot false-alarm on schedule gaps. -->
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-08-25T11:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <Monday />
+          <Tuesday />
+          <Wednesday />
+          <Thursday />
+          <Friday />
+        </DaysOfWeek>
+      </ScheduleByWeek>
+      <Repetition>
+        <Interval>PT1H</Interval>
+        <Duration>PT4H</Duration>
+        <StopAtDurationEnd>true</StopAtDurationEnd>
+      </Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "cd /d C:\Users\helow\Documents\Trading &amp;&amp; .venv\Scripts\python.exe -m agentic_trading.heartbeat --check &amp; cd /d C:\Users\helow\Documents\Trading-P2 &amp;&amp; .venv\Scripts\python.exe -m agentic_trading.heartbeat --check"</Arguments>
+    </Exec>
+  </Actions>
+</Task>

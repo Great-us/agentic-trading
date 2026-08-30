@@ -8,11 +8,18 @@ resting stops).
 
 A stop that is gapped through fills at the open, not at the stop price —
 matching the live caveat that a stop is not a floor.
+
+Buys respect the same **gap veto as the live stack**: an entry whose fill-day
+open has already run more than `max_entry_gap_atr` ATR past the decision-day
+close is refunded instead of filled, matching the TradeIntent revalidation
+live buys go through (`run.py`). Without this the replay would buy every
+overnight gap that the live system deliberately refuses to chase.
 """
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
+from datetime import date as calendar_date
 
 import pandas as pd
 
@@ -26,8 +33,9 @@ class Fill:
     side: str
     qty: float
     price: float
-    reason: str  # signal | stop | gap_stop
+    reason: str  # signal | stop | gap_stop | delisting
     notional: float
+    atr14: float | None = None
 
 
 @dataclass
@@ -53,6 +61,7 @@ class SimulatedBroker:
     atr_stop_multiple: float = 2.5
     min_stop_pct: float = 0.06
     max_stop_pct: float = 0.20
+    max_entry_gap_atr: float = 0.75
     bars: dict[str, pd.DataFrame] = field(default_factory=dict)
 
     cash: float = field(init=False)
@@ -61,12 +70,29 @@ class SimulatedBroker:
     pending_sells: list[_PendingSell] = field(default_factory=list)
     stops: dict[str, OpenOrder] = field(default_factory=dict)
     fills: list[Fill] = field(default_factory=list)
+    # (date, symbol, gap_in_atr) for entries the gap veto refused — the live
+    # system's WAITs, kept visible so replay-vs-live divergence stays auditable.
+    gap_vetoed_buys: list[tuple[pd.Timestamp, str, float]] = field(default_factory=list)
     equity_curve: list[tuple[pd.Timestamp, float, float]] = field(default_factory=list)
     current_date: pd.Timestamp | None = None
     _ids: itertools.count = field(default_factory=lambda: itertools.count(1))
+    _bar_positions: dict[str, dict[calendar_date, int]] = field(
+        init=False, default_factory=dict, repr=False,
+    )
+    _mtm_date: pd.Timestamp | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.cash = self.starting_cash
+        for symbol, df in self.bars.items():
+            if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+                continue
+            # Backtests address bars by exchange calendar date. Building this
+            # once turns the broker's hottest path from a full-index timezone
+            # normalization into an O(1) lookup.
+            self._bar_positions[symbol] = {
+                pd.Timestamp(timestamp).date(): position
+                for position, timestamp in enumerate(df.index)
+            }
 
     def _next_id(self) -> str:
         return f"sim-{next(self._ids)}"
@@ -75,24 +101,29 @@ class SimulatedBroker:
         df = self.bars.get(symbol)
         if df is None or df.empty:
             return None
-        idx = df.index
-        if not isinstance(idx, pd.DatetimeIndex):
+        position = self._bar_positions.get(symbol, {}).get(pd.Timestamp(date).date())
+        if position is None:
             return None
-        day = pd.Timestamp(date).normalize()
-        if idx.tz is not None:
-            day = day.tz_localize(idx.tz) if day.tzinfo is None else day.tz_convert(idx.tz)
-            day = day.normalize()
-            match = df.loc[idx.normalize() == day]
-        else:
-            day = day.tz_localize(None) if day.tzinfo is not None else day
-            match = df.loc[idx.tz_localize(None).normalize() == day.normalize()]
-        if match.empty:
-            return None
-        return match.iloc[0]
+        return df.iloc[position]
 
     def _slip(self, price: float, side: str, bps: float) -> float:
         signed = 1.0 if side == "buy" else -1.0
         return price * (1.0 + signed * bps / 10_000.0)
+
+    def _previous_close(self, symbol: str, date: pd.Timestamp) -> float | None:
+        df = self.bars.get(symbol)
+        if df is None or df.empty or "Close" not in df:
+            return None
+        idx = pd.DatetimeIndex(df.index)
+        day = pd.Timestamp(date)
+        if idx.tz is not None:
+            day = day.tz_localize(idx.tz) if day.tzinfo is None else day.tz_convert(idx.tz)
+        elif day.tzinfo is not None:
+            day = day.tz_localize(None)
+        prior = df.loc[idx < day]
+        if prior.empty:
+            return None
+        return float(prior["Close"].iloc[-1])
 
     def _mark_to_market(self, date: pd.Timestamp) -> None:
         for symbol, pos in list(self.positions.items()):
@@ -102,12 +133,34 @@ class SimulatedBroker:
             close = float(bar["Close"])
             pos.current_price = close
             pos.market_value = pos.qty * close
+        self._mtm_date = pd.Timestamp(date)
 
     def equity(self) -> float:
         # Cash is reserved when a buy is submitted; keep that notional in equity
         # so the curve doesn't dip for a day while the fill is in flight.
         in_flight = sum(p.notional for p in self.pending_buys)
         return self.cash + in_flight + sum(p.market_value for p in self.positions.values())
+
+    def accrue_cash(self, daily_return: float) -> float:
+        """Credit interest to settled cash and return the dollar amount earned."""
+        if daily_return != daily_return or daily_return <= -1.0:
+            return 0.0
+        earned = self.cash * daily_return
+        self.cash += earned
+        return earned
+
+    def cancel_pending_buys(self, allowed_symbols: set[str] | None = None) -> int:
+        """Refund unfilled buys, optionally retaining only currently eligible names."""
+        kept: list[_PendingBuy] = []
+        cancelled = 0
+        for pending in self.pending_buys:
+            if allowed_symbols is not None and pending.symbol in allowed_symbols:
+                kept.append(pending)
+                continue
+            self.cash += pending.notional
+            cancelled += 1
+        self.pending_buys = kept
+        return cancelled
 
     def process_bar(self, date: pd.Timestamp) -> list[Fill]:
         """Open fills, then stop checks against today's range, then close MTM."""
@@ -131,8 +184,15 @@ class SimulatedBroker:
                         qty=qty, price=price, reason="signal", notional=proceeds)
             self.fills.append(fill)
             day_fills.append(fill)
-            self.positions.pop(pending.symbol, None)
-            self.stops.pop(pending.symbol, None)
+            pos.qty -= qty
+            if pos.qty <= 1e-9:
+                self.positions.pop(pending.symbol, None)
+                self.stops.pop(pending.symbol, None)
+            else:
+                pos.market_value = pos.qty * float(bar["Close"]) if "Close" in bar else pos.qty * price
+                stop = self.stops.get(pending.symbol)
+                if stop is not None:
+                    stop.qty = pos.qty
         self.pending_sells = still_selling
 
         still_buying: list[_PendingBuy] = []
@@ -145,7 +205,21 @@ class SimulatedBroker:
             if bar is None:
                 still_buying.append(pending)
                 continue
-            price = self._slip(float(bar["Open"]), "buy", self.slippage_bps)
+            open_px = float(bar["Open"])
+            if (
+                pending.atr14 is not None and pending.atr14 > 0
+                and self.max_entry_gap_atr > 0
+            ):
+                prev_close = self._previous_close(pending.symbol, date)
+                if prev_close and (open_px - prev_close) / pending.atr14 > self.max_entry_gap_atr:
+                    # Same veto the live TradeIntent path applies at the open:
+                    # chasing a gap the signal never saw is not an entry.
+                    self.cash += pending.notional
+                    self.gap_vetoed_buys.append(
+                        (self.current_date, pending.symbol, (open_px - prev_close) / pending.atr14),
+                    )
+                    continue
+            price = self._slip(open_px, "buy", self.slippage_bps)
             if price <= 0:
                 self.cash += pending.notional
                 continue
@@ -156,7 +230,8 @@ class SimulatedBroker:
             )
             self.positions[pending.symbol] = pos
             fill = Fill(date=self.current_date, symbol=pending.symbol, side="buy",
-                        qty=qty, price=price, reason="signal", notional=pending.notional)
+                        qty=qty, price=price, reason="signal", notional=pending.notional,
+                        atr14=pending.atr14)
             self.fills.append(fill)
             day_fills.append(fill)
             if pending.atr14 is not None and pending.atr14 > 0:
@@ -170,6 +245,28 @@ class SimulatedBroker:
                     order_type="stop", qty=qty, stop_price=stop_price,
                 )
         self.pending_buys = still_buying
+
+        # Point-in-time datasets may provide a CRSP-style delisting return.
+        # It is the terminal total return from the prior close, so apply it
+        # directly and close the position instead of forward-filling a stale
+        # quote or pretending the security remained tradeable.
+        for symbol, pos in list(self.positions.items()):
+            bar = self._bar(symbol, date)
+            if bar is None or "DelistingReturn" not in bar or pd.isna(bar["DelistingReturn"]):
+                continue
+            previous = self._previous_close(symbol, date)
+            if previous is None:
+                continue
+            price = max(0.0, previous * (1.0 + float(bar["DelistingReturn"])))
+            proceeds = pos.qty * price
+            self.cash += proceeds
+            fill = Fill(date=self.current_date, symbol=symbol, side="sell",
+                        qty=pos.qty, price=price, reason="delisting", notional=proceeds)
+            self.fills.append(fill)
+            day_fills.append(fill)
+            self.positions.pop(symbol, None)
+            self.stops.pop(symbol, None)
+            self.pending_sells = [pending for pending in self.pending_sells if pending.symbol != symbol]
 
         for symbol, pos in list(self.positions.items()):
             stop = self.stops.get(symbol)
@@ -205,7 +302,7 @@ class SimulatedBroker:
         return Account(equity=self.equity(), cash=self.cash)
 
     def _refresh_mtm(self) -> None:
-        if self.current_date is not None:
+        if self.current_date is not None and self._mtm_date != self.current_date:
             self._mark_to_market(self.current_date)
 
     def get_positions(self) -> dict[str, Position]:
@@ -215,7 +312,7 @@ class SimulatedBroker:
     def is_market_open(self) -> bool:
         return True
 
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> OrderResult | None:
+    def submit_market_order(self, symbol: str, qty: float, side: str, *, client_order_id: str | None = None) -> OrderResult | None:
         if side != "sell":
             return None
         pos = self.positions.get(symbol)
@@ -226,7 +323,7 @@ class SimulatedBroker:
         self.stops.pop(symbol, None)
         return OrderResult(symbol=symbol, side="sell", qty=qty, status="accepted", order_id=order_id)
 
-    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None) -> OrderResult | None:
+    def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None, client_order_id: str | None = None) -> OrderResult | None:
         notional = round(notional, 2)
         if notional <= 0 or self.cash + 1e-9 < notional:
             return None
@@ -251,7 +348,7 @@ class SimulatedBroker:
             ))
         return orders
 
-    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float) -> OrderResult | None:
+    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None:
         if symbol not in self.positions:
             return None
         order_id = self._next_id()

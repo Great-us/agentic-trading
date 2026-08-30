@@ -37,6 +37,7 @@ def analyze(
             timeout=settings.analyst_cli_timeout,
             model=settings.analyst_cli_model,
             cli_home=settings.analyst_cli_home,
+            extra_args=settings.analyst_cli_extra_args,
         )
 
     from .api_provider import analyze_via_api

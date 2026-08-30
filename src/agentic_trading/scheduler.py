@@ -13,17 +13,11 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .run import _setup_logging, run_cycle
+from .cycle_lock import DEEP_LOCK_WAIT_SECONDS, CycleLock
+from .run import RUN_TIMES_ET, _setup_logging, run_cycle
 
 ET = ZoneInfo("America/New_York")
 
-# 09:45 rather than pre-market, deliberately. Notional orders only fill during
-# regular hours, so a pre-market cycle leaves its buys queued — and the
-# protective-stop reconciliation at the end of that cycle would then see no
-# position to protect, leaving the day's new entries naked until the next run.
-# Running after the open lets a buy fill and get its stop in the same cycle.
-# The 16:15 run reacts to the close; its orders queue for the next session.
-RUN_TIMES_ET = [(9, 45), (16, 15)]
 POLL_SECONDS = 30
 
 
@@ -40,7 +34,20 @@ def main() -> None:
             if key != last_run_key:
                 log.info("Triggering scheduled run at %s ET.", now.strftime("%H:%M"))
                 try:
-                    run_cycle()
+                    lock = CycleLock()
+                    # Same priority rule as run.main: this is a deep cycle, so
+                    # it waits for a fast scan rather than forfeiting the slot.
+                    if lock.acquire(timeout=DEEP_LOCK_WAIT_SECONDS):
+                        try:
+                            run_cycle()
+                        finally:
+                            lock.release()
+                    else:
+                        log.error(
+                            "DEEP CYCLE SKIPPED — waited %.0fs for the cycle lock and never "
+                            "got it. No decisions were made at this firing.",
+                            DEEP_LOCK_WAIT_SECONDS,
+                        )
                 except Exception:
                     log.exception("Scheduled run_cycle failed.")
                 last_run_key = key

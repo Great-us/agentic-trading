@@ -57,9 +57,19 @@ def slice_asof(df: pd.DataFrame, asof) -> pd.DataFrame:
         else:
             asof_ts = asof_ts.tz_convert(idx.tz)
         cutoff = asof_ts.normalize()
+        if idx.is_monotonic_increasing:
+            # Daily histories are ordered. A binary search avoids rebuilding a
+            # full-length normalized boolean mask for every symbol/session in a
+            # multi-decade backtest.
+            next_day = (cutoff.tz_localize(None) + pd.Timedelta(days=1)).tz_localize(idx.tz)
+            return df.iloc[: int(idx.searchsorted(next_day, side="left"))]
         return df.loc[idx.normalize() <= cutoff]
     asof_naive = asof_ts.tz_localize(None) if asof_ts.tzinfo is not None else asof_ts
-    return df.loc[idx.tz_localize(None).normalize() <= asof_naive.normalize()]
+    cutoff = asof_naive.normalize()
+    if idx.is_monotonic_increasing:
+        next_day = cutoff + pd.Timedelta(days=1)
+        return df.iloc[: int(idx.searchsorted(next_day, side="left"))]
+    return df.loc[idx.tz_localize(None).normalize() <= cutoff]
 
 
 def drop_forming_bar(df: pd.DataFrame, now: datetime | None = None) -> pd.DataFrame:
@@ -84,6 +94,25 @@ def drop_forming_bar(df: pd.DataFrame, now: datetime | None = None) -> pd.DataFr
     if last_date == now.date():
         return df.iloc[:-1]
     return df
+
+
+def fetch_last_price(symbol: str) -> float | None:
+    """Best-effort live/last quote. Never raises; None means 'don't know'."""
+    try:
+        info = yf.Ticker(yahoo_symbol(symbol)).fast_info
+        for key in ("lastPrice", "last_price", "regularMarketPrice"):
+            value = info.get(key) if hasattr(info, "get") else getattr(info, key, None)
+            if value is not None:
+                return float(value)
+    except Exception:
+        logger.debug("fast_info failed for %s", symbol, exc_info=True)
+    try:
+        df = yf.Ticker(yahoo_symbol(symbol)).history(period="1d", interval="1m")
+        if df is not None and not df.empty:
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        logger.debug("intraday last price failed for %s", symbol, exc_info=True)
+    return None
 
 
 def average_dollar_volume(df: pd.DataFrame, window: int = 20) -> float:

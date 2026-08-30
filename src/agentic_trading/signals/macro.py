@@ -38,7 +38,7 @@ VIX_STRESSED = 30.0  # at or above this, treat the tape as hostile
 @dataclass
 class MacroRegime:
     score: float                      # [-1, 1], positive = risk-on
-    label: str                        # risk_on | neutral | risk_off
+    label: str                        # risk_on | neutral | risk_off | unknown
     components: dict[str, float] = field(default_factory=dict)
     vix: float | None = None
     notes: list[str] = field(default_factory=list)
@@ -46,6 +46,10 @@ class MacroRegime:
     @property
     def is_risk_off(self) -> bool:
         return self.label == "risk_off"
+
+    @property
+    def is_unknown(self) -> bool:
+        return self.label == "unknown"
 
 
 def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -110,9 +114,10 @@ def assess_regime(period: str = "1y", *, feed=None, asof=None) -> MacroRegime:
         notes.append(f"{label} {score:+.2f} ({direction}: {meaning})")
 
     if len(components) < 3:
-        logger.error("Only %d/%d macro ratios available — reporting neutral regime", len(components), len(RATIOS))
-        return MacroRegime(score=0.0, label="neutral", components=components,
-                           notes=notes + ["insufficient macro data; defaulted to neutral"])
+        logger.error("Only %d/%d macro ratios available — reporting UNKNOWN regime (no new entries)",
+                     len(components), len(RATIOS))
+        return MacroRegime(score=0.0, label="unknown", components=components,
+                           notes=notes + ["insufficient macro data; fail-closed, no new entries"])
 
     base = sum(components.values()) / len(components)
 

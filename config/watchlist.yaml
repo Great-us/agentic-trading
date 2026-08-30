@@ -1,17 +1,23 @@
-# Starter watchlist: liquid, diversified large-caps + 2 index ETFs for market-regime context.
-# Edit freely — the pipeline reads this file on every run, no code changes needed.
+# Tradeable names. Edit freely — the pipeline reads this file on every run.
+# Growth pool 2026-08-22: SA Quant + growth factor, NVDA kept despite Quant Hold.
 symbols:
-  - AAPL   # tech
-  - MSFT   # tech
-  - NVDA   # semis
-  - GOOGL  # tech/ads
-  - AMZN   # consumer/cloud
-  - META   # tech/ads
-  - TSLA   # auto/EV
-  - JPM    # financials
-  - XOM    # energy
-  - JNJ    # healthcare
-  - WMT    # consumer staples
-  - UNH    # healthcare
-  - SPY    # S&P 500 ETF, market regime reference
-  - QQQ    # Nasdaq 100 ETF, market regime reference
+  - MU     # HBM / DRAM
+  - SNDK   # NAND
+  - AMD    # GPU
+  - NVDA   # AI compute (Quant Hold, Growth A+)
+  - AMZN   # cloud (only Mag7 Quant Strong Buy)
+  - ANET   # networking
+  - CRDO   # SerDes / AEC
+  - ALAB   # PCIe / CXL
+  - NBIS   # AI cloud
+  - HPE    # servers
+  - FLEX   # EMS
+  - CIEN   # optical
+  - ARGX   # biotech (non-tech)
+  - VEEV   # life-science software (non-tech)
+
+# Regime / context only — scored for macro, never bought. Put a name in
+# `symbols` instead if you actually want the agent to trade the ETF.
+context_symbols:
+  - SPY
+  - QQQ

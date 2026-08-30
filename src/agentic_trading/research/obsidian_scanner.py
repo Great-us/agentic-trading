@@ -9,10 +9,11 @@ them as a deliberate write-up rather than a news blurb or a
 summary/archive/ledger file — see _EXCLUDED_TYPES.
 
 1. A `ticker:` (singular) field in YAML front matter — one instrument, one
-   note. This is what the per-name write-ups actually use.
+   note — **and** `tradeable: true`. Researching a name is not authorization
+   to trade it.
 2. A filename ending in "-XXXX.md" where XXXX is 1-5 uppercase letters, which
    is the vault's naming convention for individual stock write-ups (e.g.
-   "01-IQVIA-IQV.md" -> IQV).
+   "01-IQVIA-IQV.md" -> IQV), also only when `tradeable: true` is set.
 
 `tickers:` (plural array) is recorded as a *mention* and is NOT tradeable.
 Seeking Alpha Daily analysis notes stamp a `tickers:` list on every article;
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _TYPE_FIELD_RE = re.compile(r'^type:\s*"?([A-Za-z-]+)"?\s*$', re.MULTILINE)
 _TICKER_FIELD_RE = re.compile(r"^ticker:\s*([A-Za-z.]{1,6})\s*$", re.MULTILINE)
+_TRADEABLE_RE = re.compile(r"^tradeable:\s*(true|yes|1)\s*$", re.IGNORECASE | re.MULTILINE)
 _TICKERS_FIELD_RE = re.compile(r"^tickers:\s*\[(.*?)\]\s*$", re.MULTILINE)
 _FILENAME_TICKER_RE = re.compile(r"-([A-Z]{1,5})$")
 
@@ -124,7 +126,11 @@ def _extract_tickers_from_file(path: Path, text: str) -> list[tuple[str, str]]:
         ticker_match = _TICKER_FIELD_RE.search(fm)
         if ticker_match:
             candidate = ticker_match.group(1).upper()
-            return [(candidate, "frontmatter")] if _looks_like_a_ticker(candidate) else []
+            if not _looks_like_a_ticker(candidate):
+                return []
+            if _TRADEABLE_RE.search(fm):
+                return [(candidate, "frontmatter")]
+            return [(candidate, "mention")]
 
         tickers_match = _TICKERS_FIELD_RE.search(fm)
         if tickers_match:
@@ -139,7 +145,9 @@ def _extract_tickers_from_file(path: Path, text: str) -> list[tuple[str, str]]:
 
     filename_match = _FILENAME_TICKER_RE.search(path.stem)
     if filename_match and _looks_like_a_ticker(filename_match.group(1)):
-        return [(filename_match.group(1), "filename")]
+        if fm is not None and _TRADEABLE_RE.search(fm):
+            return [(filename_match.group(1), "filename")]
+        return [(filename_match.group(1), "mention")]
 
     return []
 
