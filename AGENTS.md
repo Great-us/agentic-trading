@@ -5,7 +5,8 @@
 已完成/被取代的散装快照归档到 `research/archive/`（审计用，不再当任务书）；
 仍被代码或待决事项引用的文件不移动（如 `HANDOFF-BACKTEST.md` 被
 `backtest/__main__.py` 注释引用、`core-candidate-pool-2026-08-22.csv` 被
-`backtest/factor_ic.py` 引用、`stage-b-data-spec.md` 是唯一待决）。
+`backtest/factor_ic.py` 引用、`stage-b-data-spec.md` 是唯一待决、
+`HANDOFF-DASHBOARD.md` 是**进行中的任务书**且自带锚点校验，见 §交接记录 2026-08-31）。
 
 ## 系统是什么
 
@@ -59,7 +60,9 @@
 - 核心认知：quant 分数更像**风险过滤器不是选股器**（exploratory 级；IC 经济上
   可忽略，quant 微弱为负但统计可辨、RS 与零不可辨；分层杠铃形）。
   **负 IC ≠ 反向 alpha**（单调性 0.33，U 形失真摘要）。
-- 未提交改动很多（多会话累积），从未 commit——由用户决定节奏。
+- **已全部提交（2026-08-31 更正）**：工作区干净，分支 `mechanics-2026-08-30`
+  （未合回 master）。08-30 那句"从未 commit"已过期，不要再去找散落的未提交改动；
+  当前 HEAD 用 `git log --oneline -1` 自己看，别信文档里写死的 hash。
 
 ## 唯一待决：Stage B 数据抓取
 
@@ -208,6 +211,23 @@
      遗留未处理：**`config/risk.yaml` 的双盘一致性没有任何自动化守护**——
      `check_p2_sync.py` 只比对 `src/**/*.py`。这是实验设计的核心前提却只能靠人守，
      值得下次加进同步检查。
+- 2026-08-31（Claude）：**Dashboard 改造的 Phase 0**（设计+证伪，零引擎改动）。
+  产出 `HANDOFF-DASHBOARD.md`（任务书，11 节）+ `research/dashboard-phase0-demo.py`
+  （可跑的设计稿）+ `check_handoff_anchors.py` / `handoff-anchors.json`。
+  两个 commit：`bc78b21`、`9e20d8d`。**这是本文件"不要新建散装 handoff 文件"
+  规则的一个有意例外**——它是进行中的任务书，做完后归档到 `research/archive/`。
+  - **动手前先跑 `python check_handoff_anchors.py`**：任务书里 53 处 `文件:行号`
+    都锚定到具体代码行，脚本告诉你哪些漂了（`--fix` 自动改正，`--snapshot` 重设基线）。
+    **MISSING 是唯一的非零退出**，意思是被引用的代码已被改写、相应结论可能失效，
+    renumber 救不了，要人重新判断。当前状态：**OK 53 / MOVED 0 / MISSING 0**
+    （基线 `ba9e4f5`）。
+  - 任务书 §2 记了**三个已证伪方案**，接手者别重走；§0.1 记了**用户已拍板、
+    不必重新讨论的决策**（只绑 `127.0.0.1` 不做响应式；实时三件事全都要；
+    允许 dashboard 跑只读的 `signals/` 纯函数计算；Phase 2a 接受改 `run.py`
+    吐事件，代价是要过 P2 同步）。
+  - §11 建议**每个 Phase 开新会话**、按 1 → 2a → 2b/2c → 3 → 4 顺序，
+    2a 先独立冒烟验证（后两阶段依赖它的事件格式），Phase 4 最后（唯一牵涉双盘真实同步）。
+  - 本轮**没碰引擎、没碰冻结区**，测试基线不变（P1 424 / P2 405）。
 
 ## 运维速查
 
