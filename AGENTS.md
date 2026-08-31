@@ -85,8 +85,10 @@
   avoid/hold 决策纳入 outcome 评估（P1 已回填 506 条）、报告 exploratory 降级、
   Stage B 规格成文、D2 实盘验证通过。Claude 验收后自行完成五处收尾
   （区间落表/措辞/列数/244→252/重发 artifact），Kimi 复核合格。
-  原始 Claude 长会话（8/18–8/27，12MB）：
-  `~/.claude/projects/C--Users-helow-Documents-Trading/eb40f776-eca3-4cd5-8533-a28c94ebee71.jsonl`
+  原始 Claude 长会话（8/18–8/27）**已于 2026-08-31 由用户删除**，不必去找。
+  该轮的结论已全部落到文档与代码里：本文件 §交接记录、
+  `research/opensource-gap-analysis-2026-08-26.md`、`research/stage-b-data-spec.md`，
+  以及 `backtest/factor_ic.py` / `backtest/overfit.py` 及其测试。
 - 2026-08-22/29（Kimi）：接手 Grok 的 Round 2 跨行业宇宙重建并收尾——补齐 PX 断点后
   26 只缺失 SA Quant（LMT/TAL 为 SB，CDRE 为 Sell），13 个板块筛选器 1180 行
   market-wide backfill，700 只 ADV/市值 + 253 只 Alpaca 真实可交易性验证，
