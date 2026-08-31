@@ -1,0 +1,432 @@
+{
+ "commit": "ba9e4f5",
+ "docs": [
+  "HANDOFF-DASHBOARD.md"
+ ],
+ "anchors": [
+  {
+   "citation": "journal/logger.py:13-152",
+   "path": "src/agentic_trading/journal/logger.py",
+   "start": 13,
+   "span": 139,
+   "anchor_offset": 0,
+   "anchor_text": "SCHEMA = \"\"\""
+  },
+  {
+   "citation": "logger.py:37-39",
+   "path": "src/agentic_trading/journal/logger.py",
+   "start": 37,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "-- Live fills happen at the broker after TradeIntent execution; this column"
+  },
+  {
+   "citation": "run.py:1026-1136",
+   "path": "src/agentic_trading/run.py",
+   "start": 1026,
+   "span": 110,
+   "anchor_offset": 0,
+   "anchor_text": "for symbol in cycle_symbols:"
+  },
+  {
+   "citation": "cycle_lock.py:24",
+   "path": "src/agentic_trading/cycle_lock.py",
+   "start": 24,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "DEFAULT_LOCK_PATH = Path(__file__).resolve().parents[2] / \"data\" / \"cycle.lock\""
+  },
+  {
+   "citation": "cycle_lock.py:29",
+   "path": "src/agentic_trading/cycle_lock.py",
+   "start": 29,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "DEEP_LOCK_WAIT_SECONDS = 180.0"
+  },
+  {
+   "citation": "data/market_data.py:149-171",
+   "path": "src/agentic_trading/data/market_data.py",
+   "start": 149,
+   "span": 22,
+   "anchor_offset": 0,
+   "anchor_text": "def fetch_price_history("
+  },
+  {
+   "citation": "market_data.py:39-43",
+   "path": "src/agentic_trading/data/market_data.py",
+   "start": 39,
+   "span": 4,
+   "anchor_offset": 0,
+   "anchor_text": "def cache_path(symbol: str) -> Path:"
+  },
+  {
+   "citation": "signals/technical.py:78-141",
+   "path": "src/agentic_trading/signals/technical.py",
+   "start": 78,
+   "span": 63,
+   "anchor_offset": 0,
+   "anchor_text": "def compute_signal("
+  },
+  {
+   "citation": "signals/macro.py:90-139",
+   "path": "src/agentic_trading/signals/macro.py",
+   "start": 90,
+   "span": 49,
+   "anchor_offset": 0,
+   "anchor_text": "def assess_regime(period: str = \"1y\", *, feed=None, asof=None) -> MacroRegime:"
+  },
+  {
+   "citation": "macro.py:94-97",
+   "path": "src/agentic_trading/signals/macro.py",
+   "start": 94,
+   "span": 3,
+   "anchor_offset": 0,
+   "anchor_text": "def _history(ticker: str, hist_period: str) -> pd.DataFrame:"
+  },
+  {
+   "citation": "decision/engine.py:43-52",
+   "path": "src/agentic_trading/decision/engine.py",
+   "start": 43,
+   "span": 9,
+   "anchor_offset": 0,
+   "anchor_text": "def decide("
+  },
+  {
+   "citation": "engine.py:56-58",
+   "path": "src/agentic_trading/decision/engine.py",
+   "start": 56,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "if llm_score is None:"
+  },
+  {
+   "citation": "run.py:1070-1072",
+   "path": "src/agentic_trading/run.py",
+   "start": 1070,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "quant_only = decide("
+  },
+  {
+   "citation": "run.py:914-922",
+   "path": "src/agentic_trading/run.py",
+   "start": 914,
+   "span": 8,
+   "anchor_offset": 0,
+   "anchor_text": "if fast_mode and asof is None and settings.has_alpaca_credentials:"
+  },
+  {
+   "citation": "alpaca_feed.py:83-113",
+   "path": "src/agentic_trading/data/alpaca_feed.py",
+   "start": 83,
+   "span": 30,
+   "anchor_offset": 0,
+   "anchor_text": "\"\"\"One request for the whole universe. Failure is non-fatal: symbols"
+  },
+  {
+   "citation": "alpaca_feed.py:41-50",
+   "path": "src/agentic_trading/data/alpaca_feed.py",
+   "start": 41,
+   "span": 9,
+   "anchor_offset": 1,
+   "anchor_text": "def _is_index_symbol(symbol: str) -> bool:"
+  },
+  {
+   "citation": "journal/logger.py:299-307",
+   "path": "src/agentic_trading/journal/logger.py",
+   "start": 299,
+   "span": 8,
+   "anchor_offset": 0,
+   "anchor_text": "def record_escalation(conn: sqlite3.Connection, symbol: str, timestamp: str, quant_score: float) -> None:"
+  },
+  {
+   "citation": "run.py:1127",
+   "path": "src/agentic_trading/run.py",
+   "start": 1127,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "_journal_safe(log, record_escalation, conn, symbol, cycle_timestamp, signal.score)"
+  },
+  {
+   "citation": "views.py:11-15",
+   "path": "src/agentic_trading/dashboard/views.py",
+   "start": 11,
+   "span": 4,
+   "anchor_offset": 1,
+   "anchor_text": "def connect_ro(db_path: Path) -> sqlite3.Connection:"
+  },
+  {
+   "citation": "run.py:883",
+   "path": "src/agentic_trading/run.py",
+   "start": 883,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "cycle_timestamp = datetime.now(timezone.utc).isoformat()"
+  },
+  {
+   "citation": "api.py:270",
+   "path": "src/agentic_trading/dashboard/api.py",
+   "start": 270,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "uvicorn.run(app, host=args.host, port=args.port, log_level=\"info\")"
+  },
+  {
+   "citation": "App.tsx:24-26",
+   "path": "src/agentic_trading/dashboard/frontend/src/App.tsx",
+   "start": 24,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "useEffect(() => {"
+  },
+  {
+   "citation": "execution/broker.py:128-129",
+   "path": "src/agentic_trading/execution/broker.py",
+   "start": 128,
+   "span": 1,
+   "anchor_offset": 0,
+   "anchor_text": "def is_market_open(self) -> bool:"
+  },
+  {
+   "citation": "broker_read.py:76-88",
+   "path": "src/agentic_trading/dashboard/broker_read.py",
+   "start": 76,
+   "span": 12,
+   "anchor_offset": 0,
+   "anchor_text": "def _cached(self, name: str, producer):"
+  },
+  {
+   "citation": "scheduler.py:32",
+   "path": "src/agentic_trading/scheduler.py",
+   "start": 32,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "if now.weekday() < 5 and (now.hour, now.minute) in RUN_TIMES_ET:"
+  },
+  {
+   "citation": "heartbeat.py:179",
+   "path": "src/agentic_trading/heartbeat.py",
+   "start": 179,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "if now.astimezone(timezone.utc).weekday() < 5:  # weekday gate, evaluated in UTC"
+  },
+  {
+   "citation": "dashboard/compare.py:40",
+   "path": "src/agentic_trading/dashboard/compare.py",
+   "start": 40,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "if cursor.weekday() < 5:"
+  },
+  {
+   "citation": "run.py:1121-1122",
+   "path": "src/agentic_trading/run.py",
+   "start": 1121,
+   "span": 1,
+   "anchor_offset": 0,
+   "anchor_text": "news = feed.news(symbol)"
+  },
+  {
+   "citation": "run.py:1026",
+   "path": "src/agentic_trading/run.py",
+   "start": 1026,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "for symbol in cycle_symbols:"
+  },
+  {
+   "citation": "backtest/audit.py:808",
+   "path": "src/agentic_trading/backtest/audit.py",
+   "start": 808,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "with ThreadPoolExecutor(max_workers=jobs) as executor:"
+  },
+  {
+   "citation": "run.py:1535-1538",
+   "path": "src/agentic_trading/run.py",
+   "start": 1535,
+   "span": 3,
+   "anchor_offset": 0,
+   "anchor_text": "if args.fast and _near_deep_cycle(datetime.now(ET)):"
+  },
+  {
+   "citation": "run.py:1506",
+   "path": "src/agentic_trading/run.py",
+   "start": 1506,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "log.info(\"Fast-tier scan complete: %d/%d symbols escalated to full analysis, %d orders placed.\","
+  },
+  {
+   "citation": "heartbeat.py:53-54",
+   "path": "src/agentic_trading/heartbeat.py",
+   "start": 53,
+   "span": 1,
+   "anchor_offset": 0,
+   "anchor_text": "FAST_MAX_AGE_MINUTES = 35"
+  },
+  {
+   "citation": "daily_report.py:135-149",
+   "path": "src/agentic_trading/daily_report.py",
+   "start": 135,
+   "span": 14,
+   "anchor_offset": 0,
+   "anchor_text": "VETO_CATEGORIES: list[tuple[str, str, str]] = ["
+  },
+  {
+   "citation": "run.py:729",
+   "path": "src/agentic_trading/run.py",
+   "start": 729,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "if created is None or now_utc - created > TRADE_INTENT_TTL:"
+  },
+  {
+   "citation": "daily_report.py:319-331",
+   "path": "src/agentic_trading/daily_report.py",
+   "start": 319,
+   "span": 12,
+   "anchor_offset": 0,
+   "anchor_text": "def _count_intent_events(conn: sqlite3.Connection, kind: str,"
+  },
+  {
+   "citation": "views.py:109",
+   "path": "src/agentic_trading/dashboard/views.py",
+   "start": 109,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "def outcomes_summary(conn: sqlite3.Connection, min_n: int = 5) -> list[dict]:"
+  },
+  {
+   "citation": "run.py:248-259",
+   "path": "src/agentic_trading/run.py",
+   "start": 248,
+   "span": 11,
+   "anchor_offset": 0,
+   "anchor_text": "def _journal_safe(log, fn, *args, **kwargs) -> bool:"
+  },
+  {
+   "citation": "run.py:319",
+   "path": "src/agentic_trading/run.py",
+   "start": 319,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "RUN_TIMES_ET = [(9, 45), (16, 15)]"
+  },
+  {
+   "citation": "technical.py:59-61",
+   "path": "src/agentic_trading/signals/technical.py",
+   "start": 59,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "DEFAULT_WEIGHTS: dict[str, float] = {"
+  },
+  {
+   "citation": "views.py:152-161",
+   "path": "src/agentic_trading/dashboard/views.py",
+   "start": 152,
+   "span": 9,
+   "anchor_offset": 0,
+   "anchor_text": "pipeline_steps = ["
+  },
+  {
+   "citation": "AGENTS.md:186-189",
+   "path": "AGENTS.md",
+   "start": 186,
+   "span": 3,
+   "anchor_offset": 0,
+   "anchor_text": "刻意设计，`dashboard/broker_read.fills()` + `trades.round_trips()` 已有完整的"
+  },
+  {
+   "citation": "check_p2_sync.py:42",
+   "path": "check_p2_sync.py",
+   "start": 42,
+   "span": 0,
+   "anchor_offset": 0,
+   "anchor_text": "EXPECTED_ONLY_MAIN_PREFIX = (\"dashboard/\",)          # read-only dashboard lives here"
+  },
+  {
+   "citation": "api.py:5-7",
+   "path": "src/agentic_trading/dashboard/api.py",
+   "start": 5,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "Every route is a GET. Journal databases open read-only; broker access is the"
+  },
+  {
+   "citation": "views.py:3-4",
+   "path": "src/agentic_trading/dashboard/views.py",
+   "start": 3,
+   "span": 1,
+   "anchor_offset": 0,
+   "anchor_text": "Everything here opens the database with mode=ro — the dashboard can never"
+  },
+  {
+   "citation": "broker_read.py:8-18",
+   "path": "src/agentic_trading/dashboard/broker_read.py",
+   "start": 8,
+   "span": 10,
+   "anchor_offset": 0,
+   "anchor_text": "Safety posture:"
+  },
+  {
+   "citation": "broker_read.py:42-45",
+   "path": "src/agentic_trading/dashboard/broker_read.py",
+   "start": 42,
+   "span": 3,
+   "anchor_offset": 0,
+   "anchor_text": "if \"paper\" not in base:"
+  },
+  {
+   "citation": "AGENTS.md:22-24",
+   "path": "AGENTS.md",
+   "start": 22,
+   "span": 2,
+   "anchor_offset": 0,
+   "anchor_text": "1. **冻结区不碰**：`config/risk.yaml`、`config/watchlist.yaml`、`signals/`、"
+  },
+  {
+   "citation": "views.py:33-36",
+   "path": "src/agentic_trading/dashboard/views.py",
+   "start": 33,
+   "span": 3,
+   "anchor_offset": 0,
+   "anchor_text": "rows = conn.execute("
+  },
+  {
+   "citation": "run.py:104-118",
+   "path": "src/agentic_trading/run.py",
+   "start": 104,
+   "span": 14,
+   "anchor_offset": 0,
+   "anchor_text": "def _setup_logging() -> None:"
+  },
+  {
+   "citation": "logger.py:179-198",
+   "path": "src/agentic_trading/journal/logger.py",
+   "start": 179,
+   "span": 19,
+   "anchor_offset": 0,
+   "anchor_text": "def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:"
+  },
+  {
+   "citation": "tests/test_dashboard.py:40-95",
+   "path": "tests/test_dashboard.py",
+   "start": 40,
+   "span": 55,
+   "anchor_offset": 0,
+   "anchor_text": "@pytest.fixture()"
+  },
+  {
+   "citation": "tests/conftest.py:19-26",
+   "path": "tests/conftest.py",
+   "start": 19,
+   "span": 7,
+   "anchor_offset": 0,
+   "anchor_text": "@pytest.fixture(autouse=True)"
+  }
+ ]
+}
