@@ -26,6 +26,20 @@
 
 Phase 0 的设计稿**已完成并验证**，见第 5 节。
 
+### 0.1 已由用户拍板、不必重新讨论的决策
+
+这些是对话里明确问过、用户明确选过的，不是设计者的默认假设——改动前请留意：
+
+- **访问范围：只在本机看。** 绑 `127.0.0.1`（现有 dashboard 已如此），宽屏定宽、信息密度优先。
+  **明确不做手机/内网可访问、不做响应式布局。** 不要为了"手机也能看"改绑 `0.0.0.0` 或加媒体查询断点。
+- **实时到底要什么：三件事都要，不是三选一。**
+  a) 运算台·当前信号（watchlist 逐标的量化分实时算，见 §3.1）
+  b) 周期跟踪·决策流（cycle 跑的时候看它逐步在做什么，见 §2.1 已证伪 + §6 Phase 2a）
+  c) 持仓盯市·P&L 跳动（开市期间轮询 Alpaca 持仓，见 `broker_read.py` 现有能力）
+  用户原话是想要"那种可视化的、图形化的实时"，类比 X 上常见的那类交易/agent 监控画面——即 §6 Phase 3 的 8 步管线逐段点亮 + 大屏模式。
+- **架构分水岭：允许 dashboard 跑只读计算。** 用户明确选择放宽旁观者契约到"可以调用 `signals/` 的纯函数"（见 §7 约束 1 的例外条款），而不是严守"只展示已落库的东西"。这是 §3.1 影子计算方案成立的前提，没有这个选择 Phase 2c 就做不了。
+- **Phase 2a 改 `run.py` 吐事件：用户已确认接受改交易引擎**，代价是要过 P2 同步（§7 约束 2）。备选的"只 tail 日志、零引擎风险"方案已被明确放弃——不是没考虑，是权衡过后选了改引擎这条。
+
 ---
 
 ## 1. 系统现状（接手必读）
@@ -241,8 +255,8 @@ dashboard 目前**没有**开市判断。权威源是 `execution/broker.py:128-1
 
 设计稿已产出并验证：
 
-- `tmp/gen_demo.py` —— 可重跑的生成器（`tmp/` 已 gitignore）
-- `tmp/dashboard-demo.html` —— 15,469 字节，自包含
+- `research/dashboard-phase0-demo.py` —— 可重跑的生成器，**已 track**（`research/` 不 gitignore）
+- 跑它会在 `tmp/dashboard-demo.html` 产出自包含 HTML（`tmp/` 已 gitignore，重新生成即可，不必保留）
 
 **每个数字都是生成时从 `data/journal.db`（`mode=ro`）和 `data/heartbeat.json` 现读的，无手写无编造。** 不改 `src/`，不起 dashboard 服务。
 
@@ -265,7 +279,12 @@ dashboard 目前**没有**开市判断。权威源是 `execution/broker.py:128-1
 
 hold 桶 192 条只评了 43 条 +1d，avoid 是 293/326 —— **把两行均值并排比较是错的**。现有 `outcomes_summary()` 只返回总 n，正是会诱发这个误读。`wait` 桶 +5d 显示 **+4.78% 但 n 只有 5**，是噪声不是发现。n<30 标琥珀；`small_sample` 阈值与代码里 `outcomes_summary(min_n=5)` 对齐，未自行发明更严规则。
 
-> 查看：`cd tmp && python -m http.server 8899 --bind 127.0.0.1` → `http://127.0.0.1:8899/dashboard-demo.html`
+> 生成 + 查看：
+> ```powershell
+> .\.venv\Scripts\python.exe research\dashboard-phase0-demo.py
+> cd tmp; python -m http.server 8899 --bind 127.0.0.1
+> ```
+> → `http://127.0.0.1:8899/dashboard-demo.html`
 > （Chrome 扩展的 `file://` 被拦，所以要走 HTTP；直接双击文件用普通浏览器打开也行）
 
 ---
@@ -413,3 +432,23 @@ Phase 2a 改完 `run.py` 后必跑这个，并检查 `data/live_events.jsonl` �
 **HKUDS/AI-Trader**（21.9k stars）：**不借鉴。** 技术栈已撞车（双方都是 FastAPI + React 18 + react-router 6 + recharts + Vite 5 + TS）；它多出来的是社区/挑战赛/copy-trading/`ethers` 钱包，对单人双盘只读审计台是负资产；仓库树内**没有 LICENSE 文件**（只有 README 的 MIT 徽章），抄代码有法律模糊。
 
 **Freqtrade / FreqUI**（25k stars）：**结构可参考，控制面不可抄。** 有价值的是它把「实时状态端点」和「历史端点」分开，实时那部分靠 WebSocket 推 typed message（`analyzed_df` 推的就是当前算出的指标 dataframe）。但它是**常驻守护进程**（`/pair_candles` 文档原话 "while the bot is running"），我们不是——这是根本差异。且 FreqUI 能 start/stop bot、强制开平仓，**我们是严格只读，那部分绝不能抄**。
+
+---
+
+## 11. 分阶段执行建议：模型与 effort
+
+这是给协调者（人或另一个 Claude 会话）分派各阶段时的参考，不是强制流程。
+
+| 阶段 | 建议模型 | Effort | 理由 |
+|---|---|---|---|
+| Phase 1 补盲区 | Sonnet | medium | 高度模式化：`views.py` 有 6 个现成 view 函数可仿，`api.py` 有 9 条现成路由，`api.ts` 有成套类型，`tests/test_dashboard.py:40-95` 是现成测试模板。歧义低，代码量大，单价该省。 |
+| Phase 2a 改 `run.py` 吐事件 | Opus | high | 唯一能弄坏在跑的系统的一段——`run.py` 是双盘同步文件，P2 每天有真实计划任务在跑。写入必须走 `_journal_safe` 那种吃错误的包装，改错会中断真实交易决策。 |
+| Phase 2b/2c SSE + 影子计算端点 | Sonnet | medium | 照 §3.1/§3.4 给的实测方案（纯函数、路径、耗时都已给出）实现，路径清楚。 |
+| Phase 3 视觉（8 步管线动效 + 大屏） | Opus | medium | 这是需要判断力的部分：demo 已确认的设计要推广到全部页面，且要保证"什么都没跑的绝大多数时间也好看"（见 §4 末尾），这类取舍不是照抄代码能出的。 |
+| Phase 4 常驻化 + round_trips 上提 | Opus | high | 第二处有真实风险的改动：把 P1 专属的 `dashboard/trades.py`/`broker_read.py` 上提为共享模块，要过 `check_p2_sync.py`，P2 侧也要跑通。 |
+
+**不建议全程用 max**：这些任务的约束已经在本文档里写清楚了，需要的是照约束执行、量力选路，不是从零推导——max 只会在已有答案的地方空转。真正需要深推理的部分（"哪些方案证伪、为什么、影子计算是否可行"）已经在 Phase 0 做完，见第 2、3 节。
+
+**顺序建议**：1 → 2a → 2b/2c → 3 → 4。Phase 2a 建议在 2b/2c 和 3 之前先独立验证（跑一次 `--dry-run --skip-llm` 冒烟 + 检查 `data/live_events.jsonl` 产出），因为后两个阶段都依赖它的事件格式。Phase 4 放最后，因为它是唯一牵涉两个仓库真实同步的一步。
+
+**上下文管理**：每个阶段开新会话，把本文档作为起点交接，不要在一个长会话里连续做完全部阶段——Phase 0 探索阶段就已经把一次会话喂到接近 100% 上下文，实现阶段的代码量更大。
