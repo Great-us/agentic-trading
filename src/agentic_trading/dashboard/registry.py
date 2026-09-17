@@ -19,7 +19,7 @@ DEFAULT_REGISTRY_PATH = ROOT / "config" / "dashboard.yaml"
 class Book:
     id: str
     display_name: str
-    kind: str  # "fixed_pool" | "rs_rotation"
+    kind: str  # "fixed_pool" | "rs_rotation" | "llm_book"
     root: Path
 
     @property

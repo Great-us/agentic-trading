@@ -11,3 +11,7 @@ books:
     display_name: "二号盘 · 主题轮动"
     kind: rs_rotation
     root: C:/Users/helow/Documents/Trading-P2
+  - id: p3
+    display_name: "三号盘 · AI 操盘"
+    kind: llm_book
+    root: C:/Users/helow/Documents/Trading-P3

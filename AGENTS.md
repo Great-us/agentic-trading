@@ -230,6 +230,56 @@
   - §11 建议**每个 Phase 开新会话**、按 1 → 2a → 2b/2c → 3 → 4 顺序，
     2a 先独立冒烟验证（后两阶段依赖它的事件格式），Phase 4 最后（唯一牵涉双盘真实同步）。
   - 本轮**没碰引擎、没碰冻结区**，测试基线不变（P1 424 / P2 405）。
+- 2026-08-25（Kimi，补录于 09-01）：**观测层三件套落地**——`heartbeat.py`
+  （run_cycle 正常结束盖戳 + `--check` 判定 + PowerShell toast）、`daily_report.py`
+  （一页纸 + `--p2-db` 双盘重叠对照）、`scorecard.py`（LLM 影子计分三桶：
+  veto/rescue/一致性，阈值读 `buy_threshold`）。新增计划任务
+  `AgenticTradingHeartbeatCheck`（工作日 11:00–15:00 每小时，窗口刻意避开快扫
+  首末班次防误报）与 `AgenticTradingDailyReport`（工作日 16:25 两盘各一份）。
+  当时基线 302×2 全绿（后被 08-30 的 424/405 取代）。当时已知边界：toast 未实弹
+  触发过；dry_run 污染净值曲线（后由 08-30 条目⑤修掉）；08-30 条目③⑧在此基础上
+  扩展（intent_events 落库清空了 NOT_JOURNALED 清单、止损覆盖进心跳判定）。
+  **次线遗留**（本 session 计划过但主动推迟，此前未写进任何文件）：回测复刻入场
+  窗口 / chase 闸门 / cash buffer（下次任何调参之前的证据前置件）；252 池 placebo
+  随季度 audit 正式跑一次；reverse-split 检测随回测同栈一并做。
+- 2026-09-05（Grok）：**Codex stdin 把深周期卡死，已修。** 分析师切到
+  `codex.exe`（gpt-5.6-terra）后，09-02 / 09-04 下午深周期 14/14 次 LLM
+  失败，报错 `Reading additional input from stdin...`。`cli_provider.py` 的
+  `Popen` 没关 stdin；Codex 0.153.x 在管道上干等。09-04 09:45 深周期
+  regime 打完后从未写入 journal，快扫抢不到 `cycle.lock`，下一个成功周期
+  12:15（约 2.5 小时无止损棘轮、无心跳）。`require_llm_for_entry` 的
+  fail-closed 挡住了错误开仓，这是对的。修复：所有 CLI 后端
+  `stdin=DEVNULL`；同一周期连续 3 次 `analyze()` 失败后跳过本轮剩余 LLM
+  （`LLM_FAIL_FAST_STREAK`），退出和止损照常。数字未动。`risk.yaml` 那句
+  「neutral 会自动 TRIM」的假注释已改成与 `trim_regimes: [risk_off]` 一致。
+  **不要再把 09-04 上午空洞当成现金/敞口问题。** Dashboard「今日」页见
+  `HANDOFF-DASHBOARD.md` 之上的本会话计划（Wave B）；实况引擎仍是下一会话。
+- 2026-09-07（Grok）：**P3 从对照实验毕业成独立 AI 操盘书**（用户目标：AI
+  接手并实际操作）。PAPER3 原文冻结留档；新 trial，计时器从第一笔非 dry-run
+  且 midday `--execute` 起算。09-07 Labor Day 休市，第一枪最早 09-08 10:30。
+  **本会话已做 Wave 0 文件 + `--execute` 读券商持仓**：
+  `Trading-P3/run_p3.cmd`、`config/scheduled-tasks/sched-p3-*.xml`（默认未注册）、
+  `p3/watchdog.py`（只看 deep 戳）。计划任务需手动
+  `schtasks /Create`（见 P3 `config/scheduled-tasks/README.md`）。
+  明确不做：不动 `risk.yaml`、不改 `prompts/p3/v1.md`、不给模型 Alpaca 钥匙。
+  下一会话：失效离场接到执行层/评估器；增量决策与自有风控往后排。
+- 2026-09-09（Grok）：P3 按 `research/p3/lead-review-2026-09-09.md` 开工 **工作包 A**
+  （执行与安全退出）。新 trial / 30 分钟扫描尚未开始。共享 `risk.yaml` 仍不动。
+  flatten 不过 LLM；残仓必须能清；成功心跳只在 healthy execute。
+- 2026-09-09（Grok）：YouTube Astra 日内挑战的对照结论落地为 **交班卡**，不是多
+  代理委员会、也不是给模型券商钥匙。`data/progress.json` 在每次 P1/P2 周期和
+  P3 round（含失败 / flatten / 无交易）结束时覆盖写入：做了什么、未决、下一班
+  唯一任务。Dashboard 今日页渲染该卡；P3 以 `kind: llm_book` 进
+  `config/dashboard.yaml`，心跳只看 deep（无快扫）。主控仍是 Python。未做：
+  30 分钟槽、Telegram、P1/P2 策略改动。
+
+- 2026-09-17（Claude Opus 5，领导会话）：**ChatGPT 规划落地为 `PROGRESS.md`**（根目录，
+  唯一进度真相源；本规则"不要新建散装 handoff"的第二个有意例外，与 `HANDOFF-DASHBOARD.md`
+  同理：它是进行中的任务台账，做完归档）。只读取证结论：① **VEEV 持仓 09-16 夜间从 P1
+  券商账户消失**，无成交无现金变动，P2 的 VEEV 仍在，系统未察觉（progress 写 unresolved: []）；
+  ② **LLM 故障根因是 Codex 用量额度耗尽（至 09-20 16:00 ET），不是 stdin**——日志截前 500 字
+  把真实错误藏住了；③ `round_trips.py` 已平仓 avg_entry=0 用真实数据复现。测试基线 **P1 462**
+  全绿（424 已过期），四盘 sync exit 0。零代码改动。工作包与员工任务书见 `PROGRESS.md` §3/§5。
 
 ## 运维速查
 

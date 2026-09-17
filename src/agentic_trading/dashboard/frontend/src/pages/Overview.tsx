@@ -2,25 +2,38 @@ import { useEffect, useState } from "react";
 import {
   Area, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import { api, BookSummary, CycleRow, EquityPoint, pct, shortTime, usd } from "../api";
+import { api, BookSummary, CycleRow, EquityPoint, HealthPayload, pct, shortTime, usd } from "../api";
 
 export default function Overview({ bookId }: { bookId: string }) {
   const [series, setSeries] = useState<EquityPoint[]>([]);
   const [cycles, setCycles] = useState<CycleRow[]>([]);
   const [book, setBook] = useState<BookSummary | null>(null);
+  const [health, setHealth] = useState<HealthPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.equity(bookId).then((d) => setSeries(d.series)).catch((e) => setError(String(e)));
     api.cycles(bookId, 12).then((d) => setCycles(d.cycles)).catch(() => {});
     api.books().then((d) => setBook(d.books.find((b) => b.id === bookId) ?? null)).catch(() => {});
+    api.health(bookId).then(setHealth).catch(() => {});
   }, [bookId]);
 
   if (error) return <div className="warn-box">{error}</div>;
   const exposure = book && book.equity ? 1 - (book.cash ?? 0) / book.equity : null;
 
+  const healthCls = health
+    ? { ok: "ok", weekend: "idle", stale: "bad", missing: "bad", corrupt: "bad" }[health.status] ?? "idle"
+    : "idle";
+
   return (
     <>
+      {health && (
+        <div className={`health-bar ${healthCls}`}>
+          <strong>{health.message}</strong>
+          <span className="muted">深 {shortTime(health.deep.timestamp)}</span>
+          <span className="muted">快 {shortTime(health.fast.timestamp)}</span>
+        </div>
+      )}
       <div className="cards">
         <Kpi label="净值" value={usd(book?.equity)} />
         <Kpi label="现金" value={usd(book?.cash)} />

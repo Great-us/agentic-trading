@@ -244,8 +244,14 @@ def analyze_via_cli(
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
     try:
+        # DEVNULL stdin is load-bearing for Codex (and harmless for Claude/Kimi):
+        # `codex exec` takes the prompt as a positional argument, but 0.153.x
+        # still waits on an inherited stdin for "additional input" and then
+        # exits 1. Under Task Scheduler that hang ate the 09:45 deep cycle
+        # (2026-09-04) and held cycle.lock through the morning fast scans.
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

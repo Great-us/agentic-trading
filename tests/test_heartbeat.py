@@ -308,7 +308,7 @@ def test_run_cycle_stamps_the_heartbeat_at_both_normal_exits():
 
     # Exit 1: the market-closed fast-scan early return stamps before returning.
     anchor = source.index("Fast-tier scan skipped")
-    early_block = source[anchor:anchor + 400]
+    early_block = source[anchor:anchor + 900]
     assert early_block.index("write_heartbeat(") < early_block.index("return")
 
     # Exit 2: the full-cycle end stamps while conn is still open (before close).

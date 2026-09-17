@@ -34,3 +34,6 @@ tmp/
 # `npm run build` (see README "Dashboard").
 src/agentic_trading/dashboard/frontend/node_modules/
 src/agentic_trading/dashboard/frontend/dist/
+
+# Runtime event stream written by live_events.py; derived, unbounded, not source.
+data/*.jsonl

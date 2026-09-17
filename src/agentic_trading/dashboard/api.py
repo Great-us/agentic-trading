@@ -9,26 +9,35 @@ served from this same process; in dev the Vite server proxies /api here.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .broker_read import BookBrokerReader
 from .compare import normalized_equity, overlap_timeline, rolling_correlation
+from .live import build_meta, shadow_signals, sse_pack
 from .registry import Book, get_book, load_books
 from .rosters import latest_rosters
 from .trades import realized_pnl_timeline, round_trips
+from ..live_events import events_path, read_since, read_tail
+from ..progress import read_progress as read_progress_card
 from .views import (
+    book_health,
     connect_ro,
     cycles_index,
     decisions as decisions_view,
     equity_series,
     latest_cycle,
+    list_intents,
     logic_payload,
     outcomes_summary,
     position_snapshot,
+    today_payload,
+    veto_counts,
 )
 
 log = logging.getLogger(__name__)
@@ -142,6 +151,118 @@ def get_outcomes(book_id: str) -> JSONResponse:
 def get_logic(book_id: str) -> JSONResponse:
     book = _book_or_404(book_id)
     return JSONResponse(logic_payload(book.config_dir))
+
+
+@app.get("/api/books/{book_id}/health")
+def get_health(book_id: str) -> JSONResponse:
+    book = _book_or_404(book_id)
+    return JSONResponse(book_health(
+        book.root / "data" / "heartbeat.json",
+        deep_only=book.kind == "llm_book",
+    ))
+
+
+@app.get("/api/books/{book_id}/progress")
+def get_progress(book_id: str) -> JSONResponse:
+    book = _book_or_404(book_id)
+    card = read_progress_card(book.root / "data" / "progress.json")
+    if card is None:
+        return JSONResponse({"present": False, "card": None})
+    return JSONResponse({"present": True, "card": card})
+
+
+@app.get("/api/books/{book_id}/intents")
+def get_intents(book_id: str) -> JSONResponse:
+    conn = _conn(book_id)
+    try:
+        return JSONResponse({"intents": list_intents(conn)})
+    finally:
+        conn.close()
+
+
+@app.get("/api/books/{book_id}/vetoes")
+def get_vetoes(book_id: str, days: int = 7) -> JSONResponse:
+    conn = _conn(book_id)
+    try:
+        return JSONResponse({"vetoes": veto_counts(conn, days=days)})
+    finally:
+        conn.close()
+
+
+@app.get("/api/books/{book_id}/today")
+def get_today(book_id: str) -> JSONResponse:
+    book = _book_or_404(book_id)
+    logic = logic_payload(book.config_dir)
+    fills, fill_reason = _reader(book).fills()
+    live, _ = _reader(book).positions()
+    conn = _conn(book_id)
+    try:
+        journal_rows = position_snapshot(conn)
+        payload = today_payload(
+            conn,
+            heartbeat_path=book.root / "data" / "heartbeat.json",
+            watchlist=logic["watchlist"],
+            fills=fills,
+            fill_reason=fill_reason,
+            positions=live if live is not None else [
+                {"symbol": r["symbol"], "qty": r.get("last_qty"),
+                 "market_value": r.get("last_value"), "source": "journal"}
+                for r in journal_rows
+            ],
+            deep_only=book.kind == "llm_book",
+        )
+        card = read_progress_card(book.root / "data" / "progress.json")
+        payload["book_kind"] = book.kind
+        payload["progress"] = {"present": card is not None, "card": card}
+        return JSONResponse(payload)
+    finally:
+        conn.close()
+
+
+@app.get("/api/books/{book_id}/live/signals")
+def get_live_signals(book_id: str) -> JSONResponse:
+    book = _book_or_404(book_id)
+    return JSONResponse(shadow_signals(book, _reader(book)))
+
+
+@app.get("/api/books/{book_id}/live/stream")
+async def live_stream(book_id: str, request: Request, once: bool = False) -> StreamingResponse:
+    book = _book_or_404(book_id)
+    reader = _reader(book)
+    path = events_path(book.root)
+
+    async def gen():
+        yield sse_pack("replay", read_tail(path))
+        yield sse_pack("meta", build_meta(book, reader))
+        if once:
+            return
+        try:
+            pos = path.stat().st_size if path.is_file() else 0
+        except OSError:
+            pos = 0
+        last_meta = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                break
+            new, pos = await asyncio.to_thread(read_since, path, pos)
+            for ev in new:
+                yield sse_pack("message", ev)
+            now = time.monotonic()
+            if now - last_meta >= 5.0:
+                meta = await asyncio.to_thread(build_meta, book, reader)
+                yield sse_pack("meta", meta)
+                last_meta = now
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---- per-book broker views (read-only Alpaca) -------------------------------

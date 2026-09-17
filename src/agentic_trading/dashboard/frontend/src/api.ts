@@ -114,6 +114,122 @@ export interface LogicPayload {
   pipeline: [string, string][];
 }
 
+export interface HealthPayload {
+  status: string;
+  message: string;
+  deep: HealthMode;
+  fast: HealthMode;
+  limits: { deep_hours: number; fast_minutes: number };
+}
+
+export interface HealthMode {
+  timestamp: string | null;
+  cycle_id: number | null;
+  age_seconds: number | null;
+  missed_sessions: number | null;
+  stops_covered: number | null;
+  positions: number | null;
+  naked?: boolean;
+  state: string;
+}
+
+export interface IntentRow {
+  symbol: string;
+  created_at: string;
+  not_before: string | null;
+  signal_price: number;
+  quant_score: number | null;
+  combined_score: number | null;
+  reasoning: string | null;
+  ttl_hours: number | null;
+  status: string;
+}
+
+export interface VetoRow {
+  label: string;
+  recent: number;
+  total: number;
+  source: string;
+  kind?: string;
+}
+
+export interface ProgressCard {
+  schema_version?: number;
+  book_id?: string;
+  written_at?: string;
+  round?: { name: string; round_id: string; asof: string; status: string };
+  did?: string[];
+  did_not?: string[];
+  broker?: { equity: number | null; cash: number | null; n_positions: number; n_open_orders: number; degraded: boolean; reason?: string | null };
+  risk?: { exposure_pct: number | null; stops_covered: number | null; stops_total: number | null; locks: string[] };
+  unresolved?: { kind: string; detail: string | null }[];
+  next_job?: { slot: string; when_et: string | null; when: string | null; instruction: string };
+}
+
+export interface TodayPayload {
+  session_date: string;
+  calendar_today: string;
+  weekend: boolean;
+  health: HealthPayload;
+  fills_today: { symbol: string; side: string; qty: number; price: number; transaction_time: string }[];
+  fills_degraded: boolean;
+  fills_reason: string | null;
+  intents: IntentRow[];
+  intent_events: { timestamp: string; symbol: string; kind: string; deferred: number; detail: string | null }[];
+  vetoes: VetoRow[];
+  holdings: (PositionRow & { in_pool: boolean; bucket: string; quant_score: number | null; combined_score: number | null; last_action?: string })[];
+  fail_closed_today: number;
+  outcomes: { action: string; n: number; n_1d?: number; n_5d?: number; n_20d?: number; ret_1d: number | null; ret_5d: number | null; small_sample: boolean }[];
+  notes: Record<string, string>;
+  book_kind?: string;
+  progress?: { present: boolean; card: ProgressCard | null };
+}
+
+export interface LiveSignalRow {
+  symbol: string;
+  score: number | null;
+  combined: number | null;
+  action: string | null;
+  gap_to_buy: number | null;
+  rsi14: number | null;
+  extended: boolean | null;
+  last_price: number | null;
+  live_price: number | null;
+  components: { trend: number; cross: number; momentum: number; macd: number; rsi: number } | null;
+  held: boolean;
+  skip: string | null;
+}
+
+export interface LiveSignalsPayload {
+  regime: { label: string; score: number; vix: number | null; components: Record<string, number>; notes: string[] };
+  buy_threshold: number | null;
+  min_quant_score_to_consider: number | null;
+  weights: Record<string, number>;
+  signals: LiveSignalRow[];
+  holdings: PositionRow[];
+  degraded: boolean;
+  degraded_reasons: string[];
+  cache_asof: string | null;
+  live_prices_ok: boolean;
+  note: string;
+}
+
+export interface LiveMeta {
+  schedule: { next: string | null; kind: string | null; seconds: number | null; next_deep: string | null; next_fast: string | null };
+  clock: { is_open: boolean; timestamp?: string; next_open?: string; next_close?: string } | null;
+  clock_reason: string | null;
+  progress: { running: boolean; analyzed: number; total: number; current_symbol: string | null; stage: string | null; cycle: number | null };
+  pipeline: [string, string][];
+}
+
+export interface LiveEvent {
+  t: string;
+  stage: string;
+  cycle?: number;
+  symbol?: string;
+  [key: string]: unknown;
+}
+
 export interface ComparePayload {
   normalized_equity: { p1: { date: string; value: number | null }[]; p2: { date: string; value: number | null }[] };
   overlap: { date: string; overlap: number; p1_count: number; p2_count: number }[];
@@ -147,6 +263,10 @@ export const api = {
   outcomes: (book: string) => get<{ buckets: Record<string, unknown>[] }>(`/api/books/${book}/signal-outcomes`),
   roster: (book: string) => get<RosterPayload>(`/api/books/${book}/roster`),
   compare: () => get<ComparePayload>("/api/compare"),
+  health: (book: string) => get<HealthPayload>(`/api/books/${book}/health`),
+  today: (book: string) => get<TodayPayload>(`/api/books/${book}/today`),
+  liveSignals: (book: string) => get<LiveSignalsPayload>(`/api/books/${book}/live/signals`),
+  liveStreamUrl: (book: string) => `/api/books/${book}/live/stream`,
 };
 
 export const usd = (v: number | null | undefined, digits = 0): string =>

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -133,6 +134,22 @@ def test_report_generated_with_key_numbers(tmp_path, main_db, p2_db):
     assert "= **50.0%**" in text
     # P2 has no cycles: correlation must say insufficient, not invent a number
     assert "样本不足" in text
+    assert "还没有交班卡" in text
+
+
+def test_report_next_job_from_progress_card(tmp_path, main_db):
+    from agentic_trading.progress import emit_progress
+
+    emit_progress(
+        book_id="p1", round_name="deep", status="ok", did=["cycle complete"],
+        path=Path(main_db).parent / "progress.json",
+        now=NOW,
+    )
+    out = generate_report(main_db, None, tmp_path / "daily", today=TODAY, now_utc=NOW)
+    text = out.read_text(encoding="utf-8")
+    assert "下一班（交班卡）" in text
+    assert "上一轮：**deep**" in text
+    assert "指令：" in text
 
 
 def test_overlap_stats_values(main_db, p2_db):
@@ -283,6 +300,30 @@ def test_missing_db_exits_cleanly(tmp_path, capsys):
     assert excinfo.value.code == 2
     assert "journal not found" in capsys.readouterr().out
     assert not (tmp_path / "out").exists() or not list((tmp_path / "out").iterdir())
+
+
+def test_fills_section_degrades_without_inventing_fills():
+    from agentic_trading.daily_report import _fills_section
+
+    text = "\n".join(_fills_section("2026-09-04", None, "no ALPACA credentials"))
+    assert "无法读取券商成交" in text
+    assert "no ALPACA credentials" in text
+    assert "`fill_price`" in text
+
+
+def test_fills_section_lists_session_fills_and_closed_trips():
+    from agentic_trading.daily_report import _fills_section
+
+    fills = [
+        {"symbol": "XOM", "side": "sell", "qty": 10.0, "price": 156.24,
+         "notional": 1562.4, "transaction_time": "2026-08-27T13:44:00+00:00"},
+        {"symbol": "XOM", "side": "buy", "qty": 10.0, "price": 166.25,
+         "notional": 1662.5, "transaction_time": "2026-08-19T15:00:00+00:00"},
+    ]
+    text = "\n".join(_fills_section("2026-08-27", fills, None))
+    assert "XOM" in text
+    assert "SELL" in text
+    assert "已实现盈亏" in text
 
 
 def test_intent_events_are_counted(tmp_path):

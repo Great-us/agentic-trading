@@ -1,5 +1,5 @@
 {
- "commit": "ba9e4f5",
+ "commit": "b626748",
  "docs": [
   "HANDOFF-DASHBOARD.md"
  ],
@@ -21,9 +21,9 @@
    "anchor_text": "-- Live fills happen at the broker after TradeIntent execution; this column"
   },
   {
-   "citation": "run.py:1026-1136",
+   "citation": "run.py:1034-1144",
    "path": "src/agentic_trading/run.py",
-   "start": 1026,
+   "start": 1034,
    "span": 110,
    "anchor_offset": 0,
    "anchor_text": "for symbol in cycle_symbols:"
@@ -101,17 +101,17 @@
    "anchor_text": "if llm_score is None:"
   },
   {
-   "citation": "run.py:1070-1072",
+   "citation": "run.py:1078-1080",
    "path": "src/agentic_trading/run.py",
-   "start": 1070,
+   "start": 1078,
    "span": 2,
    "anchor_offset": 0,
    "anchor_text": "quant_only = decide("
   },
   {
-   "citation": "run.py:914-922",
+   "citation": "run.py:921-929",
    "path": "src/agentic_trading/run.py",
-   "start": 914,
+   "start": 921,
    "span": 8,
    "anchor_offset": 0,
    "anchor_text": "if fast_mode and asof is None and settings.has_alpaca_credentials:"
@@ -141,9 +141,9 @@
    "anchor_text": "def record_escalation(conn: sqlite3.Connection, symbol: str, timestamp: str, quant_score: float) -> None:"
   },
   {
-   "citation": "run.py:1127",
+   "citation": "run.py:1150",
    "path": "src/agentic_trading/run.py",
-   "start": 1127,
+   "start": 1150,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "_journal_safe(log, record_escalation, conn, symbol, cycle_timestamp, signal.score)"
@@ -157,9 +157,9 @@
    "anchor_text": "def connect_ro(db_path: Path) -> sqlite3.Connection:"
   },
   {
-   "citation": "run.py:883",
+   "citation": "run.py:890",
    "path": "src/agentic_trading/run.py",
-   "start": 883,
+   "start": 890,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "cycle_timestamp = datetime.now(timezone.utc).isoformat()"
@@ -221,17 +221,17 @@
    "anchor_text": "if cursor.weekday() < 5:"
   },
   {
-   "citation": "run.py:1121-1122",
+   "citation": "run.py:1132-1133",
    "path": "src/agentic_trading/run.py",
-   "start": 1121,
+   "start": 1132,
    "span": 1,
    "anchor_offset": 0,
    "anchor_text": "news = feed.news(symbol)"
   },
   {
-   "citation": "run.py:1026",
+   "citation": "run.py:1034",
    "path": "src/agentic_trading/run.py",
-   "start": 1026,
+   "start": 1034,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "for symbol in cycle_symbols:"
@@ -245,17 +245,17 @@
    "anchor_text": "with ThreadPoolExecutor(max_workers=jobs) as executor:"
   },
   {
-   "citation": "run.py:1535-1538",
+   "citation": "run.py:1558-1561",
    "path": "src/agentic_trading/run.py",
-   "start": 1535,
+   "start": 1558,
    "span": 3,
    "anchor_offset": 0,
    "anchor_text": "if args.fast and _near_deep_cycle(datetime.now(ET)):"
   },
   {
-   "citation": "run.py:1506",
+   "citation": "run.py:1529",
    "path": "src/agentic_trading/run.py",
-   "start": 1506,
+   "start": 1529,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "log.info(\"Fast-tier scan complete: %d/%d symbols escalated to full analysis, %d orders placed.\","
@@ -277,9 +277,9 @@
    "anchor_text": "VETO_CATEGORIES: list[tuple[str, str, str]] = ["
   },
   {
-   "citation": "run.py:729",
+   "citation": "run.py:736",
    "path": "src/agentic_trading/run.py",
-   "start": 729,
+   "start": 736,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "if created is None or now_utc - created > TRADE_INTENT_TTL:"
@@ -301,17 +301,17 @@
    "anchor_text": "def outcomes_summary(conn: sqlite3.Connection, min_n: int = 5) -> list[dict]:"
   },
   {
-   "citation": "run.py:248-259",
+   "citation": "run.py:255-266",
    "path": "src/agentic_trading/run.py",
-   "start": 248,
+   "start": 255,
    "span": 11,
    "anchor_offset": 0,
    "anchor_text": "def _journal_safe(log, fn, *args, **kwargs) -> bool:"
   },
   {
-   "citation": "run.py:319",
+   "citation": "run.py:326",
    "path": "src/agentic_trading/run.py",
-   "start": 319,
+   "start": 326,
    "span": 0,
    "anchor_offset": 0,
    "anchor_text": "RUN_TIMES_ET = [(9, 45), (16, 15)]"
@@ -333,20 +333,20 @@
    "anchor_text": "pipeline_steps = ["
   },
   {
-   "citation": "AGENTS.md:186-189",
+   "citation": "AGENTS.md:191-194",
    "path": "AGENTS.md",
-   "start": 186,
+   "start": 191,
    "span": 3,
    "anchor_offset": 0,
    "anchor_text": "刻意设计，`dashboard/broker_read.fills()` + `trades.round_trips()` 已有完整的"
   },
   {
-   "citation": "check_p2_sync.py:42",
+   "citation": "check_p2_sync.py:46-50",
    "path": "check_p2_sync.py",
-   "start": 42,
-   "span": 0,
+   "start": 46,
+   "span": 4,
    "anchor_offset": 0,
-   "anchor_text": "EXPECTED_ONLY_MAIN_PREFIX = (\"dashboard/\",)          # read-only dashboard lives here"
+   "anchor_text": "BOOKS = ("
   },
   {
    "citation": "api.py:5-7",
@@ -381,9 +381,9 @@
    "anchor_text": "if \"paper\" not in base:"
   },
   {
-   "citation": "AGENTS.md:22-24",
+   "citation": "AGENTS.md:23-25",
    "path": "AGENTS.md",
-   "start": 22,
+   "start": 23,
    "span": 2,
    "anchor_offset": 0,
    "anchor_text": "1. **冻结区不碰**：`config/risk.yaml`、`config/watchlist.yaml`、`signals/`、"
@@ -397,9 +397,9 @@
    "anchor_text": "rows = conn.execute("
   },
   {
-   "citation": "run.py:104-118",
+   "citation": "run.py:111-125",
    "path": "src/agentic_trading/run.py",
-   "start": 104,
+   "start": 111,
    "span": 14,
    "anchor_offset": 0,
    "anchor_text": "def _setup_logging() -> None:"

@@ -143,7 +143,7 @@ for item in work:
              decision.combined_score, decision.reasoning)
 ```
 
-工作循环本体（`run.py:1026-1136`）**不打印任何逐标的进度**：没有"正在算 NVDA"，没有"quant 分 = +0.54"，没有"LLM 调用开始/返回"。
+工作循环本体（`run.py:1034-1144`）**不打印任何逐标的进度**：没有"正在算 NVDA"，没有"quant 分 = +0.54"，没有"LLM 调用开始/返回"。
 
 16:15 那个周期形状相同：`16:15:20` 最后一个止损 → `16:18:16` 第一条决策 = **2 分 56 秒静默**。
 
@@ -187,23 +187,23 @@ for item in work:
 
 `signals/macro.py:90-139` 的 `assess_regime(period="1y", *, feed=None, asof=None)`——**传了 `feed` 就完全不碰 `market_data`**（`macro.py:94-97`），彻底沙箱化。需要 11 个 ticker（RSP/SPY/HYG/LQD/IWM/TLT/XLY/XLP + ^VIX），**全部已在 `data/cache/` 里**（`^` → `idx_` 映射见 `market_data.py:39-43`）。实测 **23.8 ms**，重算结果与 2026-08-28 16:15 的日志行**逐位吻合**。
 
-`decision/engine.py:43-52` 的 `decide()` **零 I/O**。`verdict=None` 是**官方支持路径**（`engine.py:56-58`，quant-only），快扫本身就走这条（`run.py:1070-1072`）。四个阈值从 `config/risk.yaml` 读：`min_quant_score_to_consider: 0.15`、`buy_threshold: 0.35`、`sell_threshold: -0.25`、`risk_off_score_penalty: 0.15`。
+`decision/engine.py:43-52` 的 `decide()` **零 I/O**。`verdict=None` 是**官方支持路径**（`engine.py:56-58`，quant-only），快扫本身就走这条（`run.py:1078-1080`）。四个阈值从 `config/risk.yaml` 读：`min_quant_score_to_consider: 0.15`、`buy_threshold: 0.35`、`sell_threshold: -0.25`、`risk_off_score_penalty: 0.15`。
 
 → **dashboard 能在 <100ms CPU 内复现整个 watchlist 的 quant-only 决策，零写入。** 唯一复现不了的是 LLM 那一半（每标的一次 `codex exec` ≈ 10 秒）。
 
 ### 3.2 实时价：用 AlpacaFeed，不要用 yfinance
 
-`data/alpaca_feed.py` 已存在，快扫层在用。`AlpacaFeed(drop_forming=False).prefetch(symbols)` 对**整个 universe 一次批量请求约 1 秒**（`run.py:914-922`、`alpaca_feed.py:83-113`）。已有凭证，纯 GET。
+`data/alpaca_feed.py` 已存在，快扫层在用。`AlpacaFeed(drop_forming=False).prefetch(symbols)` 对**整个 universe 一次批量请求约 1 秒**（`run.py:921-929`、`alpaca_feed.py:83-113`）。已有凭证，纯 GET。
 
 注意 `^VIX` 会回退到 yfinance（Alpaca 对指数符号返回 400，见 `alpaca_feed.py:41-50`）。
 
 ### 3.3 中途进度：`llm_escalations` 是唯一干净的信号
 
-`journal/logger.py:299-307` 的 `record_escalation`，在 `run.py:1127` 被调用——**每个标的的 LLM 调用返回后立刻 commit**。WAL 模式下 `mode=ro` 读者即时可见（`views.py:11-15` 的 `connect_ro`）。
+`journal/logger.py:299-307` 的 `record_escalation`，在 `run.py:1150` 被调用——**每个标的的 LLM 调用返回后立刻 commit**。WAL 模式下 `mode=ro` 读者即时可见（`views.py:11-15` 的 `connect_ro`）。
 
 表是 `symbol PRIMARY KEY` + `last_escalated_at` upsert。**数有多少行带着当前 cycle 的时间戳 → 真实的「已分析 n / 14」进度条，纯只读。**
 
-⚠️ 注意：这些表存的时间戳都是 `cycle_timestamp`（周期**开始**时刻，`run.py:883`），不是"当下"。所以你观察的是**行的变动**，不是进度时钟。
+⚠️ 注意：这些表存的时间戳都是 `cycle_timestamp`（周期**开始**时刻，`run.py:890`），不是"当下"。所以你观察的是**行的变动**，不是进度时钟。
 
 ### 3.4 SSE 而非 WebSocket
 
@@ -239,13 +239,13 @@ dashboard 目前**没有**开市判断。权威源是 `execution/broker.py:128-1
 
 范围 **154–441 秒，近期典型 150–190 秒**（Codex `gpt-5.6-terra`；400s+ 那几天是 Kimi/Claude）。
 
-**LLM 占比的干净测量**：2026-08-24 16:15 那次 CLI 对所有 14 个标的瞬间 exit 1，逐标的循环在"没有可用 LLM"下跑完，错误时间戳给出精确节奏 **~1.9 秒/标的**（yfinance news + fundamentals 的 HTTP，`run.py:1121-1122`），14 个 = 24.4 秒，整周期 30.4 秒。两次 `--dry-run --skip-llm` 深周期均为 **3.4 秒**（18 标的，含 regime、全部 compute_signal、decide、journal 写入、止损对账）。
+**LLM 占比的干净测量**：2026-08-24 16:15 那次 CLI 对所有 14 个标的瞬间 exit 1，逐标的循环在"没有可用 LLM"下跑完，错误时间戳给出精确节奏 **~1.9 秒/标的**（yfinance news + fundamentals 的 HTTP，`run.py:1132-1133`），14 个 = 24.4 秒，整周期 30.4 秒。两次 `--dry-run --skip-llm` 深周期均为 **3.4 秒**（18 标的，含 regime、全部 compute_signal、decide、journal 写入、止损对账）。
 
-→ **150–190 秒的深周期里，LLM 子进程占 80–87% 墙钟，约 8.5–11.7 秒/次 `codex exec`。循环严格串行**（`run.py:1026` → `:1123`），全仓库除 `backtest/audit.py:808` 外无任何线程池。
+→ **150–190 秒的深周期里，LLM 子进程占 80–87% 墙钟，约 8.5–11.7 秒/次 `codex exec`。循环严格串行**（`run.py:1034` → `:1123`），全仓库除 `backtest/audit.py:808` 外无任何线程池。
 
-**快扫**：中位 **5–7 秒**，近期尾部 48 秒；闭市直接跳过 0.9–1.5 秒。每交易日触发 20 次（09:35–16:05 每 20min），08-28 实际 18 次（临近深周期的会让路，`run.py:1535-1538`）。
+**快扫**：中位 **5–7 秒**，近期尾部 48 秒；闭市直接跳过 0.9–1.5 秒。每交易日触发 20 次（09:35–16:05 每 20min），08-28 实际 18 次（临近深周期的会让路，`run.py:1558-1561`）。
 
-⚠️ **快扫的 LLM 升级路径最后一次触发是 2026-08-20**（18 次），08-21 至 08-28 **零次**。且日志里 `Fast-tier scan complete: 4/14 symbols escalated` 是**误标**——`len(rows)` 把 4 个表外持仓也算进去了（`run.py:1506`）。
+⚠️ **快扫的 LLM 升级路径最后一次触发是 2026-08-20**（18 次），08-21 至 08-28 **零次**。且日志里 `Fast-tier scan complete: 4/14 symbols escalated` 是**误标**——`len(rows)` 把 4 个表外持仓也算进去了（`run.py:1529`）。
 
 **动效设计含义**：深周期的"活"窗口是 2.5–3 分钟且几乎全在等 LLM；快扫是 5–7 秒。**开市期间系统平均每 1200 秒里只有约 6 秒是可观测的。** 大屏模式必须在"什么都没跑"的绝大多数时间里依然好看——靠影子计算（3.1）持续刷新，而不是靠等 cycle。
 
@@ -296,7 +296,7 @@ hold 桶 192 条只评了 43 条 +1d，avoid 是 293/326 —— **把两行均�
 **后端** `dashboard/views.py` + `api.py`，三个新 GET：
 
 - `/api/books/{id}/health` —— 读 `Book.root/data/heartbeat.json`，附 `stops_covered`/`positions`（可能缺字段，按可选处理）。**阈值引用 `heartbeat.py:53-54` 常量，不硬编码**。采纳 demo 的 `missed_sessions()` 判据。
-- `/api/books/{id}/intents` —— `trade_intents` + 派生状态（`pending` / `window_open` / `expired`），TTL 用 `run.py:729` 的 `TRADE_INTENT_TTL`。
+- `/api/books/{id}/intents` —— `trade_intents` + 派生状态（`pending` / `window_open` / `expired`），TTL 用 `run.py:736` 的 `TRADE_INTENT_TTL`。
 - `/api/books/{id}/vetoes?days=` —— `intent_events` 聚合（复用 `daily_report.py:319-331` 的 `_count_intent_events`）+ `VETO_CATEGORIES` 计数。
 
 `/signal-outcomes` 端点已存在，只需给 `views.py:109` 的 `outcomes_summary()` 补 per-horizon 的 `n_1d`/`n_5d`/`n_20d`。
@@ -318,11 +318,11 @@ hold 桶 192 条只评了 43 条 +1d，avoid 是 293/326 —— **把两行均�
 
 建议埋点：cycle 开始 / regime 完成 / 每标的进入循环 / compute_signal 完成 / LLM 调用起止 / decide 完成 / sizing 结果 / 订单或否决 / cycle 结束。
 
-⚠️ **写入必须走 `run.py:248-259` 的 `_journal_safe` 那种吃错误的包装**——事件写失败绝不能中断交易。时间戳用 `datetime.now(timezone.utc).isoformat()`（**不要**复用 cycle 起始时间戳，那样就没有进度含义了）。文件要轮转或截断，别让它无限增长。
+⚠️ **写入必须走 `run.py:255-266` 的 `_journal_safe` 那种吃错误的包装**——事件写失败绝不能中断交易。时间戳用 `datetime.now(timezone.utc).isoformat()`（**不要**复用 cycle 起始时间戳，那样就没有进度含义了）。文件要轮转或截断，别让它无限增长。
 
 ⚠️ **`run.py` 是双盘同步文件**：改完必须拷贝到 `C:\Users\helow\Documents\Trading-P2`，`python check_p2_sync.py` 必须 exit 0。
 
-**2b. SSE 端点** —— `GET /api/books/{id}/live/stream`，`async def` + `StreamingResponse`，tail `live_events.jsonl` 并推送。同时推：`llm_escalations` 的「已分析 n/14」进度（3.3）、下一次计划任务倒计时（`run.py:319` 的 `RUN_TIMES_ET` + 20 分钟快扫网格）、Alpaca `/v2/clock` 开闭市（3.5）。
+**2b. SSE 端点** —— `GET /api/books/{id}/live/stream`，`async def` + `StreamingResponse`，tail `live_events.jsonl` 并推送。同时推：`llm_escalations` 的「已分析 n/14」进度（3.3）、下一次计划任务倒计时（`run.py:326` 的 `RUN_TIMES_ET` + 20 分钟快扫网格）、Alpaca `/v2/clock` 开闭市（3.5）。
 
 **2c. 影子计算端点** —— `GET /api/books/{id}/live/signals`，按 3.1 重算整个 watchlist 的 quant 分解（trend .30 / cross .20 / momentum .20 / macd .20 / rsi .10，见 `technical.py:59-61`）+ regime 五分量 + `decide(verdict=None)`，返回距 `buy_threshold: 0.35` 还差多少。
 
@@ -352,9 +352,9 @@ hold 桶 192 条只评了 43 条 +1d，avoid 是 293/326 —— **把两行均�
 
 **4b. round-trip 接进日报 —— 本计划风险最高的一步。**
 
-`AGENTS.md:186-189` 记着这个缺口：回合盈亏核算"只活在手动启动、且只有 P1 有的 dashboard 里，日报/周报够不着"。
+`AGENTS.md:191-194` 记着这个缺口：回合盈亏核算"只活在手动启动、且只有 P1 有的 dashboard 里，日报/周报够不着"。
 
-障碍：`check_p2_sync.py:42` 规定 **`dashboard/` 是 P1 专属**，P2 没这个包；而 `daily_report.py` 是**双盘同步文件**。直接 `from .dashboard.trades import round_trips` 会让 P2 日报 ImportError 崩掉。
+障碍：`check_p2_sync.py:46-50` 的 `BOOKS` 把 `dashboard/` 标成各盘 expected-only（P1/P3/P4 可独有，**P2 没有这个包**）；而 `daily_report.py` 是**共享同步文件**。直接 `from .dashboard.trades import round_trips` 会让 P2 日报 ImportError 崩掉。
 
 正确做法是上提为共享模块：
 - `dashboard/trades.py`（纯计算）→ `src/agentic_trading/round_trips.py`
@@ -372,10 +372,10 @@ hold 桶 192 条只评了 43 条 +1d，avoid 是 293/326 —— **把两行均�
    **本次已放宽的唯一一点**：允许 dashboard 调用 `signals/` 的纯函数做只读影子计算。仍然不下单、不写 journal、不改任何状态。
 2. **双盘同步**：改任何 `src/agentic_trading/**` 里**非 `dashboard/`** 的文件 → 拷贝到 P2 → `python check_p2_sync.py` exit 0。
    Phase 1、3 只碰 `dashboard/`，**豁免**；**Phase 2a（改 `run.py`）和 Phase 4b 不豁免**。
-3. **冻结区**（`AGENTS.md:22-24` 铁律 #1）：`config/risk.yaml`、`config/watchlist.yaml`、`signals/`、`decision/` **只读不改**。影子计算是调用它们，不是修改。
+3. **冻结区**（`AGENTS.md:23-25` 铁律 #1）：`config/risk.yaml`、`config/watchlist.yaml`、`signals/`、`decision/` **只读不改**。影子计算是调用它们，不是修改。
 4. **`equity_series` 必须带 `WHERE mode='paper'`**（`views.py:33-36`）。`dry_run` 报告固定 $100,000 假净值且写同一个 journal，漏掉这个过滤会在曲线中间打出 10x 尖峰。
 5. **路径**用 `Path(__file__).resolve().parents[N]` 锚定，不依赖 cwd。`dashboard/*` 是 `parents[3]`，`run.py`/`config.py`/`heartbeat.py` 是 `parents[2]`。
-6. **编码**：所有文件 IO 带 `encoding="utf-8"`；入口点要 `sys.stdout.reconfigure(encoding="utf-8")`（`run.py:104-118`），否则 Windows 控制台会把中文和破折号打成乱码。
+6. **编码**：所有文件 IO 带 `encoding="utf-8"`；入口点要 `sys.stdout.reconfigure(encoding="utf-8")`（`run.py:111-125`），否则 Windows 控制台会把中文和破折号打成乱码。
 7. **日志**用 `%s` 惰性格式化，不用 f-string。`logging.getLogger(__name__)` 模块级。
 8. **SQLite**：写入端 `logger.py:179-198` 先设 `busy_timeout=10000` **再**切 WAL（顺序有意义，切 WAL 本身要拿写锁）。读取端一律 `mode=ro` URI。
 9. **生成物不进 git**：`.gitignore` 已排除 `dist/`、`node_modules/`、`tmp/`、`logs/daily/`、`data/*.db`。**约定是：派生产物 gitignore，值得留存的文字分析放 `research/` 并 track。**

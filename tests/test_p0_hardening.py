@@ -22,9 +22,10 @@ from agentic_trading.signals.macro import MacroRegime
 from agentic_trading.journal.logger import (
     TradeIntent, clear_trade_intent, connect, load_trade_intents, save_trade_intent,
 )
+from agentic_trading.llm.schema import AnalystVerdict
 from agentic_trading.run import (
-    STOP_REJECTION_RETRY_SECONDS, TRADE_INTENT_TTL, _bar_high, _flush_trade_intents,
-    _reconcile_protective_stops, run_cycle,
+    LLM_FAIL_FAST_STREAK, STOP_REJECTION_RETRY_SECONDS, TRADE_INTENT_TTL, _bar_high,
+    _flush_trade_intents, _reconcile_protective_stops, run_cycle,
 )
 
 import logging
@@ -417,6 +418,111 @@ def test_missing_llm_verdict_fails_closed_for_new_entries(tmp_path, monkeypatch)
     assert broker.buys == []
     assert decision is not None and decision[0] == "wait"
     assert "fail closed" in decision[1]
+
+
+def _bullish_verdict(signal, news, fundamentals, settings):
+    return AnalystVerdict(
+        symbol=signal.symbol, stance="bullish", confidence=0.7,
+        rationale="test", risk_flags=[],
+    )
+
+
+def test_skip_llm_cycle_emits_start_and_end(tmp_path, monkeypatch):
+    from agentic_trading import live_events as le
+    from agentic_trading.live_events import read_tail
+
+    path = tmp_path / "cockpit.jsonl"
+    monkeypatch.setattr(le, "LIVE_EVENTS_PATH", path)
+    settings = _settings()
+    settings.analyst_provider = "cli"
+    settings.analyst_cli_path = str(tmp_path / "missing-cli")
+    feed = HarnessFeed({"AAA": _upward_df()})
+    broker = HarnessBroker()
+    monkeypatch.setattr("agentic_trading.run.fetch_last_price", lambda _s: 100.0)
+    conn = connect(":memory:")
+    try:
+        run_cycle(force_dry_run=True, skip_llm=True, fast_mode=False,
+                  settings=settings, broker=broker, feed=feed, conn=conn,
+                  regime_model=lambda _asof: MacroRegime(score=0.0, label="neutral"))
+    finally:
+        conn.close()
+    stages = [row["stage"] for row in read_tail(path)]
+    assert "cycle_start" in stages
+    assert "cycle_end" in stages
+    assert "regime" in stages
+
+
+def test_consecutive_llm_failures_trip_the_circuit(tmp_path, monkeypatch):
+    # Three Nones in a row skip remaining LLM calls this cycle. The fourth
+    # name still gets a fail-closed WAIT (require_llm_for_entry), but analyze
+    # is not invoked for it — that's what keeps a stdin hang from eating the
+    # 30-minute task budget.
+    analyst_shim = tmp_path / "analyst.cmd"
+    analyst_shim.write_text("@echo off\r\n", encoding="utf-8")
+    settings = _settings()
+    settings.analyst_provider = "cli"
+    settings.analyst_cli_path = str(analyst_shim)
+    settings.watchlist = ["AAA", "BBB", "CCC", "DDD"]
+    settings.core_watchlist = list(settings.watchlist)
+    frames = {s: _upward_df() for s in settings.watchlist}
+    feed = HarnessFeed(frames)
+    broker = HarnessBroker()
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append(args[0].symbol)
+        return None
+
+    monkeypatch.setattr("agentic_trading.run.fetch_last_price", lambda _s: 100.0)
+    monkeypatch.setattr("agentic_trading.run.analyze", boom)
+    conn = connect(":memory:")
+    try:
+        run_cycle(force_dry_run=False, skip_llm=False, fast_mode=False,
+                  settings=settings, broker=broker, feed=feed, conn=conn,
+                  regime_model=lambda _asof: MacroRegime(score=0.0, label="neutral"))
+        actions = conn.execute(
+            "SELECT symbol, action FROM decisions ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert LLM_FAIL_FAST_STREAK == 3
+    assert calls == ["AAA", "BBB", "CCC"], calls
+    by_sym = {row[0]: row[1] for row in actions}
+    assert by_sym["DDD"] == "wait"
+    assert broker.buys == []
+
+
+def test_llm_fail_streak_resets_on_a_success(tmp_path, monkeypatch):
+    # Two failures, one success, two more failures: the circuit must not trip
+    # because the streak is consecutive, not cumulative.
+    analyst_shim = tmp_path / "analyst.cmd"
+    analyst_shim.write_text("@echo off\r\n", encoding="utf-8")
+    settings = _settings()
+    settings.analyst_provider = "cli"
+    settings.analyst_cli_path = str(analyst_shim)
+    settings.watchlist = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+    settings.core_watchlist = list(settings.watchlist)
+    frames = {s: _upward_df() for s in settings.watchlist}
+    feed = HarnessFeed(frames)
+    broker = HarnessBroker()
+    calls = []
+
+    def flaky(signal, news, fundamentals, settings):
+        calls.append(signal.symbol)
+        if signal.symbol == "CCC":
+            return _bullish_verdict(signal, news, fundamentals, settings)
+        return None
+
+    monkeypatch.setattr("agentic_trading.run.fetch_last_price", lambda _s: 100.0)
+    monkeypatch.setattr("agentic_trading.run.analyze", flaky)
+    conn = connect(":memory:")
+    try:
+        run_cycle(force_dry_run=False, skip_llm=False, fast_mode=False,
+                  settings=settings, broker=broker, feed=feed, conn=conn,
+                  regime_model=lambda _asof: MacroRegime(score=0.0, label="neutral"))
+    finally:
+        conn.close()
+    assert calls == ["AAA", "BBB", "CCC", "DDD", "EEE"], calls
 
 
 def test_missing_live_quote_preserves_the_intent(intent_conn, monkeypatch):

@@ -119,10 +119,54 @@ def test_cli_uses_cross_vendor_model_flag_and_shell_lexes_lockdown(monkeypatch, 
     assert "Analyze AAPL now using this complete snapshot." in prompt
     assert captured["argv"][captured["argv"].index("--output-format") + 1] == "json"
     assert "--json-schema" in captured["argv"]
+    # Codex 0.153.x waits on inherited stdin for "additional input" then exits 1.
+    # Close it for every CLI backend; Claude/Kimi ignore a closed stdin.
+    assert captured["kwargs"]["stdin"] is cli_provider.subprocess.DEVNULL
     # No trading credentials may leak into the analyst subprocess environment.
     env = captured["kwargs"]["env"]
     for name in env:
         assert not cli_provider.SECRET_ENV_RE.search(name), name
+
+
+def test_codex_exec_uses_positional_prompt_and_closes_stdin(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, argv, kwargs):
+            self.argv = argv
+            self.kwargs = kwargs
+            self.returncode = 0
+
+        def communicate(self, timeout=None):  # noqa: ARG002
+            (tmp_path / "codex_last_message_AAPL.txt").write_text(
+                json.dumps(VERDICT_JSON), encoding="utf-8",
+            )
+            return "", ""
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc(argv, kwargs)
+
+    monkeypatch.setattr(cli_provider.subprocess, "Popen", fake_popen)
+    verdict = cli_provider.analyze_via_cli(
+        _signal(),
+        [],
+        {},
+        cli_path="codex.exe",
+        cwd=tmp_path,
+        model="gpt-5.6-terra",
+        extra_args="-c model_reasoning_effort=high",
+    )
+    assert verdict is not None and verdict.stance == "bullish"
+    argv = captured["argv"]
+    assert argv[0] == "codex.exe"
+    assert argv[1] == "exec"
+    assert "--skip-git-repo-check" in argv
+    assert "-p" not in argv  # -p is --profile on Codex, not the prompt
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-terra"
+    assert "Analyze AAPL now using this complete snapshot." in argv[-1]
+    assert captured["kwargs"]["stdin"] is cli_provider.subprocess.DEVNULL
 
 
 def test_extract_text_from_stream_json():

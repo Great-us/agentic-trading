@@ -5,8 +5,24 @@ corrupt a live journal, and WAL lets it read while the trading system writes.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from ..daily_report import (
+    INTENT_EVENT_KINDS,
+    REFERENCE_CATEGORIES,
+    VETO_CATEGORIES,
+    _count_category,
+    _count_intent_events,
+)
+from ..heartbeat import DEEP_MAX_AGE_HOURS, FAST_MAX_AGE_MINUTES
+
+ET = ZoneInfo("America/New_York")
+# Keep in lockstep with run.TRADE_INTENT_TTL — dashboard must not import run.py.
+_INTENT_TTL = timedelta(hours=72)
 
 
 def connect_ro(db_path: Path) -> sqlite3.Connection:
@@ -108,9 +124,17 @@ def position_snapshot(conn: sqlite3.Connection) -> list[dict]:
 
 def outcomes_summary(conn: sqlite3.Connection, min_n: int = 5) -> list[dict]:
     """Forward-return averages per action bucket, evaluate-style. Descriptive
-    only — small n is shown as-is, never as a finding."""
+    only — small n is shown as-is, never as a finding.
+
+    n_1d / n_5d / n_20d are the per-horizon evaluated counts. Averaging two
+    buckets that evaluated different horizons is a misread (hold +1d is a
+    much smaller sample than avoid +1d).
+    """
     rows = conn.execute(
         "SELECT d.action, COUNT(*) AS n,"
+        " SUM(CASE WHEN o.ret_1d IS NOT NULL THEN 1 ELSE 0 END) AS n_1d,"
+        " SUM(CASE WHEN o.ret_5d IS NOT NULL THEN 1 ELSE 0 END) AS n_5d,"
+        " SUM(CASE WHEN o.ret_20d IS NOT NULL THEN 1 ELSE 0 END) AS n_20d,"
         " AVG(o.ret_1d)*100 AS ret_1d, AVG(o.ret_5d)*100 AS ret_5d,"
         " AVG(o.ret_20d)*100 AS ret_20d,"
         " AVG(o.mfe_20d)*100 AS mfe_20d, AVG(o.mae_20d)*100 AS mae_20d"
@@ -164,4 +188,295 @@ def logic_payload(book_config_dir: Path) -> dict:
         "watchlist": watchlist,
         "context_symbols": context_symbols,
         "pipeline": pipeline_steps,
+    }
+
+
+def _aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return _aware(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def et_date_of(ts: datetime) -> str:
+    return ts.astimezone(ET).date().isoformat()
+
+
+def missed_sessions(stamp: datetime, now: datetime) -> int:
+    """Weekdays strictly after the stamp's calendar date, up to today.
+
+    Distinguishes "quiet because the market is shut" from "the scheduler died".
+    Copied from research/dashboard-phase0-demo.py — keep the rule identical.
+    """
+    stamp = _aware(stamp).astimezone(ET)
+    now = _aware(now).astimezone(ET)
+    day = stamp.date() + timedelta(days=1)
+    missed = 0
+    while day <= now.date():
+        if day.weekday() < 5:
+            missed += 1
+        day += timedelta(days=1)
+    return missed
+
+
+def _in_entry_window(et_now: datetime, start: str = "10:00", end: str = "15:30") -> bool:
+    try:
+        sh, sm = (int(p) for p in start.split(":"))
+        eh, em = (int(p) for p in end.split(":"))
+    except ValueError:
+        sh, sm, eh, em = 10, 0, 15, 30
+    minutes = et_now.hour * 60 + et_now.minute
+    return (sh * 60 + sm) <= minutes <= (eh * 60 + em)
+
+
+def book_health(heartbeat_path: Path, *, now: datetime | None = None,
+                deep_only: bool = False) -> dict:
+    now = _aware(now or datetime.now(timezone.utc))
+    empty = {"timestamp": None, "cycle_id": None, "age_seconds": None,
+             "missed_sessions": None, "stops_covered": None, "positions": None,
+             "state": "missing"}
+    if not heartbeat_path.exists():
+        return {
+            "status": "missing",
+            "message": "无心跳文件",
+            "deep": dict(empty),
+            "fast": dict(empty),
+            "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},
+            "deep_only": deep_only,
+        }
+    try:
+        payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "corrupt",
+            "message": f"心跳无法解析：{exc}",
+            "deep": dict(empty),
+            "fast": dict(empty),
+            "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},
+            "deep_only": deep_only,
+        }
+
+    modes: dict[str, dict] = {}
+    overall = "ok"
+    checks = [("deep", timedelta(hours=DEEP_MAX_AGE_HOURS))]
+    if not deep_only:
+        checks.append(("fast", timedelta(minutes=FAST_MAX_AGE_MINUTES)))
+    for mode, max_age in checks:
+        entry = payload.get(mode) or {}
+        stamp = parse_iso(entry.get("timestamp"))
+        if stamp is None:
+            modes[mode] = dict(empty)
+            if overall == "ok":
+                overall = "missing"
+            continue
+        missed = missed_sessions(stamp, now)
+        raw_stale = (now - stamp) > max_age
+        if missed == 0:
+            state = "ok" if not raw_stale else "weekend"
+        else:
+            state = "stale"
+            overall = "stale"
+        covered, total = entry.get("stops_covered"), entry.get("positions")
+        modes[mode] = {
+            "timestamp": entry.get("timestamp"),
+            "cycle_id": entry.get("cycle_id"),
+            "age_seconds": round((now - stamp).total_seconds()),
+            "missed_sessions": missed,
+            "stops_covered": covered,
+            "positions": total,
+            "naked": (
+                total is not None and covered is not None and int(total) > int(covered)
+            ),
+            "state": state,
+        }
+    if overall == "ok" and any(m.get("state") == "weekend" for m in modes.values()):
+        overall = "weekend"
+    stale_msg = "停摆：漏掉了交易日的深周期" if deep_only else "停摆：漏掉了交易日的深/快周期"
+    if deep_only:
+        modes.setdefault("fast", dict(empty))
+    return {
+        "status": overall,
+        "message": {
+            "ok": "周期在跑",
+            "weekend": "休市中（心跳超时但未漏交易日）",
+            "stale": stale_msg,
+            "missing": "没有可用心跳",
+            "corrupt": "心跳损坏",
+        }.get(overall, overall),
+        "deep": modes.get("deep", dict(empty)),
+        "fast": modes.get("fast", dict(empty)),
+        "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},
+        "deep_only": deep_only,
+    }
+
+
+def list_intents(conn: sqlite3.Connection, *, now: datetime | None = None) -> list[dict]:
+    now = _aware(now or datetime.now(timezone.utc))
+    try:
+        rows = conn.execute(
+            "SELECT symbol, created_at, signal_price, atr14, quant_score, "
+            "combined_score, reasoning, not_before FROM trade_intents ORDER BY created_at"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    for row in rows:
+        created = parse_iso(row["created_at"])
+        not_before = parse_iso(row["not_before"])
+        ttl_hours = None
+        status = "pending"
+        if created is not None:
+            remaining = (created + _INTENT_TTL) - now
+            ttl_hours = round(remaining.total_seconds() / 3600, 1)
+            if remaining.total_seconds() <= 0:
+                status = "expired"
+        if status != "expired":
+            if not_before is not None and now < not_before:
+                status = "waiting"
+            elif _in_entry_window(now.astimezone(ET)):
+                status = "window_open"
+            else:
+                status = "pending"
+        out.append({
+            "symbol": row["symbol"],
+            "created_at": row["created_at"],
+            "not_before": row["not_before"],
+            "signal_price": row["signal_price"],
+            "quant_score": row["quant_score"],
+            "combined_score": row["combined_score"],
+            "reasoning": row["reasoning"],
+            "ttl_hours": ttl_hours,
+            "status": status,
+        })
+    return out
+
+
+def veto_counts(conn: sqlite3.Connection, *, days: int = 7,
+                now: datetime | None = None) -> list[dict]:
+    now = _aware(now or datetime.now(timezone.utc))
+    cutoff = (now - timedelta(days=max(1, days))).isoformat()
+    out = []
+    for label, condition, source in [*VETO_CATEGORIES, *REFERENCE_CATEGORIES]:
+        recent, total = _count_category(conn, condition, cutoff)
+        out.append({"label": label, "recent": recent, "total": total, "source": source})
+    for kind, label in INTENT_EVENT_KINDS:
+        recent, total = _count_intent_events(conn, kind, cutoff)
+        out.append({"label": label, "recent": recent, "total": total,
+                    "source": "intent_events", "kind": kind})
+    return out
+
+
+def recent_intent_events(conn: sqlite3.Connection, *, limit: int = 20) -> list[dict]:
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, symbol, kind, deferred, detail "
+            "FROM intent_events ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(row) for row in rows]
+
+
+def session_date(conn: sqlite3.Connection, now: datetime) -> str:
+    """ET calendar date of the latest paper cycle, else ET today.
+
+    Weekend visitors still see Friday's story instead of an empty 'today'.
+    """
+    row = conn.execute(
+        "SELECT timestamp FROM cycles WHERE mode = 'paper' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row and row[0]:
+        ts = parse_iso(row[0])
+        if ts is not None:
+            return et_date_of(ts)
+    return et_date_of(now)
+
+
+def _fill_session_date(fill: dict) -> str | None:
+    ts = parse_iso(fill.get("transaction_time"))
+    return et_date_of(ts) if ts is not None else None
+
+
+def latest_scores(conn: sqlite3.Connection) -> dict[str, dict]:
+    rows = conn.execute(
+        "SELECT d.symbol, d.quant_score, d.combined_score, d.action, d.reasoning, c.timestamp "
+        "FROM decisions d JOIN cycles c ON c.id = d.cycle_id "
+        "WHERE c.id = (SELECT MAX(id) FROM cycles WHERE mode = 'paper') "
+        "ORDER BY d.symbol"
+    ).fetchall()
+    return {row["symbol"]: dict(row) for row in rows}
+
+
+def fail_closed_count(conn: sqlite3.Connection, day: str) -> int:
+    rows = conn.execute(
+        "SELECT c.timestamp FROM decisions d JOIN cycles c ON c.id = d.cycle_id "
+        "WHERE d.reasoning LIKE '%new entries fail closed%'"
+    ).fetchall()
+    n = 0
+    for row in rows:
+        ts = parse_iso(row["timestamp"])
+        if ts is not None and et_date_of(ts) == day:
+            n += 1
+    return n
+
+
+def today_payload(
+    conn: sqlite3.Connection,
+    *,
+    heartbeat_path: Path,
+    watchlist: list[str],
+    fills: list[dict] | None,
+    fill_reason: str | None,
+    positions: list[dict] | None,
+    now: datetime | None = None,
+    deep_only: bool = False,
+) -> dict:
+    now = _aware(now or datetime.now(timezone.utc))
+    day = session_date(conn, now)
+    calendar_today = et_date_of(now)
+    pool = {s.upper() for s in watchlist}
+    scores = latest_scores(conn)
+    session_fills = [f for f in (fills or []) if _fill_session_date(f) == day]
+    holdings = []
+    for pos in positions or []:
+        symbol = str(pos.get("symbol") or "").upper()
+        score = scores.get(symbol) or scores.get(pos.get("symbol")) or {}
+        in_pool = symbol in pool
+        holdings.append({
+            **pos,
+            "symbol": symbol,
+            "in_pool": in_pool,
+            "bucket": "pool" if in_pool else "legacy",
+            "quant_score": score.get("quant_score"),
+            "combined_score": score.get("combined_score"),
+            "last_action": score.get("action"),
+        })
+    return {
+        "session_date": day,
+        "calendar_today": calendar_today,
+        "weekend": datetime.fromisoformat(calendar_today).weekday() >= 5,
+        "health": book_health(heartbeat_path, now=now, deep_only=deep_only),
+        "fills_today": session_fills,
+        "fills_degraded": fills is None,
+        "fills_reason": fill_reason,
+        "intents": list_intents(conn, now=now),
+        "intent_events": recent_intent_events(conn),
+        "vetoes": veto_counts(conn, now=now),
+        "holdings": holdings,
+        "fail_closed_today": fail_closed_count(conn, day),
+        "outcomes": outcomes_summary(conn),
+        "notes": {
+            "fills": "成交来自券商 fills，不是 journal.fill_price（该列故意为空）。",
+            "intents": "intent_events 自 2026-08-30 才落库；更早的拦截只在 logs/ 里。",
+            "legacy": "不在当前 watchlist.symbols 里的持仓是遗留仓，走 legacy_sell_threshold。",
+        },
     }

@@ -140,9 +140,11 @@ corr_penalty_threshold: 0.75
 corr_size_multiplier: 0.5
 
 # Book-level invested / equity cap by regime. Applied to NEW entries every cycle.
-# TRIM of names already held runs for labels in trim_regimes, so a tape that
-# degrades to neutral automatically sells the book down toward its target —
-# exposure follows the environment instead of only ratcheting in.
+# TRIM of names already held runs only for labels in trim_regimes (currently
+# risk_off — not neutral). A tape that sits in neutral does not sell the book
+# back toward 65%; exposure can only fall via stops, signal sells, or the
+# off-watchlist legacy_sell_threshold. Do not read this table as "neutral
+# auto-trims" — that mismatch produced the 08-29 cash-visibility misdiagnosis.
 #
 # risk_on 0.85 / neutral 0.65 (was 1.00 / 0.80): full exposure is a privilege of
 # a strongly risk-on tape, and even then the cash buffer below binds first.

@@ -6,6 +6,7 @@ touched.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -40,8 +41,12 @@ def _fill(symbol: str, side: str, qty: float, price: float, ts: str) -> dict:
 @pytest.fixture()
 def book_env(tmp_path: Path) -> Path:
     """Two fake book roots, each with data/journal.db (seeded) and config/."""
-    from agentic_trading.journal.logger import connect, record_cycle
-    from agentic_trading.journal.logger import DecisionRow
+    from datetime import datetime, timezone
+
+    from agentic_trading.journal.logger import (
+        DecisionRow, TradeIntent, connect, record_cycle, record_intent_event,
+        record_position_state, save_trade_intent, update_position_peak,
+    )
 
     roots = []
     for i, name in enumerate(("p1", "p2")):
@@ -61,6 +66,35 @@ def book_env(tmp_path: Path) -> Path:
                      rows, regime_score=0.1, regime_label="neutral")
         record_cycle(conn, "2026-08-21T14:00:00+00:00", "paper", 10100.0 + i, 400.0,
                      rows[:1], regime_score=0.15, regime_label="neutral")
+        wait_row = DecisionRow(
+            symbol="ANET", quant_score=0.4, llm_stance=None, llm_confidence=None,
+            llm_rationale=None, combined_score=0.4, action="WAIT",
+            reasoning="Skipped: the analyst produced no verdict for this symbol "
+                      "(LLM failed mid-cycle) and require_llm_for_entry is on — "
+                      "new entries fail closed.",
+        )
+        record_cycle(conn, "2026-08-21T20:15:00+00:00", "paper", 10120.0 + i, 400.0,
+                     [wait_row], regime_score=0.0, regime_label="neutral")
+        save_trade_intent(conn, TradeIntent(
+            symbol="ANET", created_at="2026-08-21T13:45:00+00:00",
+            signal_price=140.0, atr14=4.0, quant_score=0.39, combined_score=0.53,
+            reasoning="queued", not_before="2026-08-21T14:00:00+00:00",
+        ))
+        record_intent_event(
+            conn, "2026-08-21T14:04:00+00:00", "ANET", "sizing",
+            deferred=True,
+            detail="only $0 available (limited by the exposure cap — invested 65.2% of a 65% ceiling)",
+        )
+        record_position_state(conn, "MSFT", 2.0, 920.0, "2026-08-21T20:15:00+00:00")
+        update_position_peak(conn, "MSFT", 470.0, "2026-08-21T20:15:00+00:00")
+        stamp = datetime.now(timezone.utc).isoformat()
+        (root / "data" / "heartbeat.json").write_text(
+            json.dumps({
+                "deep": {"timestamp": stamp, "cycle_id": 3, "stops_covered": 1, "positions": 1},
+                "fast": {"timestamp": stamp, "cycle_id": 3, "stops_covered": 1, "positions": 1},
+            }),
+            encoding="utf-8",
+        )
         conn.close()
 
         with open(root / "config" / "risk.yaml", "w", encoding="utf-8") as f:
@@ -104,6 +138,9 @@ def client(book_env: Path, monkeypatch):
                 _fill("AAPL", "sell", 1.0, 190.0, "2026-08-20T15:00:00Z"),
                 _fill("AAPL", "buy", 1.0, 180.0, "2026-08-19T15:00:00Z"),
             ], None
+        def clock(self):
+            return {"is_open": False, "timestamp": "2026-08-21T20:00:00Z",
+                    "next_open": None, "next_close": None}, None
 
     monkeypatch.setattr(api_mod, "_READERS", {})
     monkeypatch.setattr(api_mod, "_reader", lambda book: FakeReader())
@@ -195,6 +232,96 @@ def test_registry_rejects_duplicate_ids(tmp_path: Path):
         registry.load_books(reg)
 
 
+def test_missed_sessions_ignores_weekends():
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from agentic_trading.dashboard.views import book_health, missed_sessions
+
+    et = ZoneInfo("America/New_York")
+    friday = datetime(2026, 8, 28, 20, 15, tzinfo=timezone.utc)
+    saturday = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+    sunday_night_et = datetime(2026, 8, 30, 21, 0, tzinfo=et)
+    monday = datetime(2026, 8, 31, 13, 45, tzinfo=timezone.utc)
+    assert missed_sessions(friday, saturday) == 0
+    assert missed_sessions(friday, sunday_night_et) == 0
+    assert missed_sessions(friday, monday) == 1  # Monday is a session after Friday
+
+
+def test_book_health_weekend_is_not_ok(tmp_path):
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    stamp = datetime(2026, 8, 28, 20, 15, tzinfo=timezone.utc).isoformat()
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": stamp, "cycle_id": 1, "stops_covered": 5, "positions": 5},
+            "fast": {"timestamp": stamp, "cycle_id": 1, "stops_covered": 5, "positions": 5},
+        }),
+        encoding="utf-8",
+    )
+    sunday = datetime(2026, 8, 30, 18, 0, tzinfo=timezone.utc)
+    health = book_health(path, now=sunday)
+    assert health["status"] == "weekend"
+    assert health["message"] != "周期在跑"
+
+
+def test_book_health_missing_file_keeps_deep_only_flag(tmp_path):
+    from agentic_trading.dashboard.views import book_health
+
+    health = book_health(tmp_path / "nope.json", deep_only=True)
+    assert health["status"] == "missing"
+    assert health["deep_only"] is True
+
+
+def test_book_health_deep_only_ignores_missing_fast(tmp_path):
+    from datetime import datetime, timezone, timedelta
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import DEEP_MAX_AGE_HOURS
+
+    now = datetime(2026, 9, 9, 18, 0, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    with_fast = book_health(path, now=now)
+    assert with_fast["status"] == "missing"  # no fast stamp
+    deep_only = book_health(path, now=now, deep_only=True)
+    assert deep_only["status"] == "ok"
+    assert deep_only["deep_only"] is True
+    stale = book_health(
+        path,
+        now=now + timedelta(hours=DEEP_MAX_AGE_HOURS + 1),
+        deep_only=True,
+    )
+    assert stale["status"] == "stale"
+    assert "快" not in stale["message"]
+
+
+def test_analyzed_progress_running_without_cycle_start_in_tail():
+    import sqlite3
+
+    from agentic_trading.dashboard.live import analyzed_progress
+
+    events = [{"stage": "quant", "symbol": f"S{i}", "cycle": 9} for i in range(90)]
+    events[-1] = {"stage": "decide", "symbol": "ZZZ", "cycle": 9, "action": "hold"}
+    conn = sqlite3.connect(":memory:")
+    try:
+        progress = analyzed_progress(conn, ["AAA"], events)
+    finally:
+        conn.close()
+    assert progress["running"] is True
+    assert progress["cycle"] == 9
+    assert progress["stage"] == "decide"
+
+
 # ---- HTTP layer -----------------------------------------------------------------
 
 class TestApi:
@@ -246,3 +373,72 @@ class TestApi:
     def test_compare_endpoint(self, client: TestClient):
         body = client.get("/api/compare").json()
         assert set(body.keys()) >= {"normalized_equity", "overlap", "rolling_correlation"}
+
+    def test_health_reads_heartbeat(self, client: TestClient):
+        body = client.get("/api/books/p1/health").json()
+        assert body["status"] in {"ok", "weekend"}
+        assert body["deep"]["stops_covered"] == 1
+        assert body["limits"]["deep_hours"] == 26
+
+    def test_intents_and_vetoes(self, client: TestClient):
+        intents = client.get("/api/books/p1/intents").json()["intents"]
+        assert intents and intents[0]["symbol"] == "ANET"
+        assert intents[0]["status"] in {"pending", "waiting", "window_open", "expired"}
+        vetoes = client.get("/api/books/p1/vetoes").json()["vetoes"]
+        labels = [v["label"] for v in vetoes]
+        assert any("fail closed" in v["label"] or "缺 LLM" in v["label"] for v in vetoes)
+        sizing = next(v for v in vetoes if v.get("kind") == "sizing")
+        assert sizing["total"] >= 1
+        assert any("intent" in lab.lower() or "排队" in lab for lab in labels)
+
+    def test_live_signals_does_not_fetch_prices(self, client: TestClient, monkeypatch):
+        def boom(*_a, **_k):
+            raise AssertionError("fetch_price_history must not run from the dashboard")
+        monkeypatch.setattr("agentic_trading.data.market_data.fetch_price_history", boom)
+        body = client.get("/api/books/p1/live/signals").json()
+        assert "signals" in body
+        assert body["note"]
+
+    def test_live_stream_once_replays(self, client: TestClient):
+        response = client.get("/api/books/p1/live/stream?once=1")
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert "event: replay" in response.text
+        assert "event: meta" in response.text
+
+    def test_today_uses_broker_fills_and_splits_pool(self, client: TestClient):
+        body = client.get("/api/books/p1/today").json()
+        assert body["session_date"] == "2026-08-21"
+        assert body["fail_closed_today"] >= 1
+        assert any(f["symbol"] == "MSFT" and f["side"] == "buy" for f in body["fills_today"])
+        msft = next(h for h in body["holdings"] if h["symbol"] == "MSFT")
+        assert msft["bucket"] == "pool"
+        assert msft["in_pool"] is True
+        anet = next(i for i in body["intents"] if i["symbol"] == "ANET")
+        assert anet["quant_score"] == pytest.approx(0.39)
+        buckets = {b["action"]: b for b in body["outcomes"]}
+        # per-horizon counts are present even when zero
+        assert "n_1d" in next(iter(buckets.values()), {"n_1d": 0}) or body["outcomes"] == []
+        assert body["progress"]["present"] is False
+        missing = client.get("/api/books/p1/progress").json()
+        assert missing["present"] is False
+
+
+    def test_today_includes_handoff_card(self, client: TestClient, book_env: Path):
+        from datetime import datetime, timezone
+
+        from agentic_trading.dashboard.registry import load_books
+        from agentic_trading.progress import emit_progress
+
+        books = load_books(book_env)
+        p1 = books[0]
+        emit_progress(
+            book_id="p1", round_name="fast", status="ok",
+            did=["no orders"], path=p1.root / "data" / "progress.json",
+            now=datetime(2026, 9, 9, 14, 0, tzinfo=timezone.utc),
+        )
+        body = client.get("/api/books/p1/today").json()
+        assert body["progress"]["present"] is True
+        assert body["progress"]["card"]["round"]["name"] == "fast"
+        assert body["progress"]["card"]["next_job"]["instruction"]
+        assert client.get("/api/books/p1/progress").json()["present"] is True

@@ -14,6 +14,8 @@ from __future__ import annotations
 import pytest
 
 from agentic_trading import heartbeat as heartbeat_mod
+from agentic_trading import live_events as live_events_mod
+from agentic_trading import progress as progress_mod
 
 
 @pytest.fixture(autouse=True)
@@ -24,3 +26,5 @@ def isolate_heartbeat(tmp_path, monkeypatch):
     module attribute is enough; tests that pass an explicit path are unaffected.
     """
     monkeypatch.setattr(heartbeat_mod, "HEARTBEAT_PATH", tmp_path / "heartbeat.json")
+    monkeypatch.setattr(live_events_mod, "LIVE_EVENTS_PATH", tmp_path / "live_events.jsonl")
+    monkeypatch.setattr(progress_mod, "PROGRESS_PATH", tmp_path / "progress.json")

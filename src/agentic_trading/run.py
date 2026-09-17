@@ -26,6 +26,7 @@ from .data.market_data import average_dollar_volume, fetch_last_price
 from .decision.engine import Action, Decision, decide
 from .execution.broker import AlpacaBroker, Broker, DryRunBroker, OrderIdMinter, Position
 from .heartbeat import _notify_toast, write_heartbeat
+from .live_events import emit as _emit_live_event
 from .journal.logger import (
     DecisionRow, TradeIntent, bump_intraday_confirmation, clear_intraday_confirmation,
     clear_position_peak, clear_position_state, clear_trade_intent, connect,
@@ -64,6 +65,13 @@ CLEAN_SPLIT_FACTORS = (2.0, 3.0, 4.0, 5.0, 10.0)
 # wash-trade rejection (403) when the stop lands seconds after the entry buy —
 # the buy is still settling, and by the time the retry runs it usually isn't.
 STOP_REJECTION_RETRY_SECONDS = 20.0
+
+# Same-cycle analyst circuit: after this many consecutive CLI/API failures
+# (None from analyze()), skip remaining LLM calls this cycle. Exits, stops,
+# and fail-closed WAIT on new entries are unchanged. Stops a 14 × timeout
+# hang from blowing the 30-minute Task Scheduler limit and holding cycle.lock
+# (2026-09-04 09:45: Codex stdin wait, journal never written, next cycle 12:15).
+LLM_FAIL_FAST_STREAK = 3
 
 
 def _detect_and_reset_splits(conn, peaks, positions, log, cycle_timestamp: str) -> None:
@@ -257,6 +265,98 @@ def _journal_safe(log, fn, *args, **kwargs) -> bool:
         log.exception("Journal write %s failed — continuing without it.",
                       getattr(fn, "__name__", fn))
         return False
+
+
+def _emit_live(asof, stage: str, **fields) -> None:
+    """Best-effort cockpit JSONL. Backtests (asof set) stay silent; never raises."""
+    if asof is not None:
+        return
+    try:
+        _emit_live_event(stage, **fields)
+    except Exception:
+        logging.getLogger("run_cycle").exception(
+            "live_events emit %s failed — continuing without it.", stage,
+        )
+
+
+def _stamp_cycle_progress(
+    *,
+    asof,
+    fast_mode: bool,
+    cycle_no: int | None,
+    account,
+    positions,
+    rows: list | None = None,
+    orders_this_cycle: int = 0,
+    stop_coverage: tuple[int, int] | None = None,
+    status: str = "ok",
+    did: list[str] | None = None,
+    did_not: list[str] | None = None,
+    unresolved: list | None = None,
+    skipped: str | None = None,
+) -> None:
+    """Live wakeups only — same gate as write_heartbeat. Never raises."""
+    if asof is not None:
+        return
+    from .progress import emit_progress, infer_book_id
+
+    did = list(did or [])
+    did_not = list(did_not or [])
+    unresolved = list(unresolved or [])
+    if skipped:
+        did_not.append(skipped)
+    if orders_this_cycle:
+        did.append(f"{orders_this_cycle} orders placed")
+    elif not did and not skipped:
+        did.append("no orders")
+    for row in rows or []:
+        reason = getattr(row, "sizing_reason", None) or ""
+        if "exposure cap" in reason.lower() or "exposure" in reason.lower() and "ceiling" in reason.lower():
+            unresolved.append({"kind": "exposure_cap", "detail": reason})
+        reasoning = getattr(row, "reasoning", None) or ""
+        if "fail closed" in reasoning.lower() or "LLM failed" in reasoning:
+            unresolved.append({"kind": "llm_fail_closed", "detail": getattr(row, "symbol", "")})
+    equity = float(getattr(account, "equity", 0) or 0) if account is not None else None
+    cash = float(getattr(account, "cash", 0) or 0) if account is not None else None
+    exposure = None
+    if equity and equity > 0 and cash is not None:
+        exposure = round(max(0.0, 1.0 - cash / equity), 4)
+    covered = total = None
+    if stop_coverage is not None:
+        covered, total = stop_coverage
+        if total and covered is not None and int(total) > int(covered):
+            unresolved.append({
+                "kind": "naked_stops",
+                "detail": f"{int(total) - int(covered)}/{int(total)} uncovered",
+            })
+            if status == "ok":
+                status = "incomplete"
+    locks = []
+    for item in unresolved:
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if kind and kind not in locks and kind in {"exposure_cap", "stop_risk"}:
+            locks.append(kind)
+    emit_progress(
+        book_id=infer_book_id(),
+        round_name="fast" if fast_mode else "deep",
+        round_id="" if cycle_no is None else str(cycle_no),
+        status=status,
+        did=did,
+        did_not=did_not,
+        unresolved=unresolved,
+        broker={
+            "equity": equity,
+            "cash": cash,
+            "n_positions": len(positions or {}),
+            "degraded": account is None,
+        },
+        risk={
+            "exposure_pct": exposure,
+            "stops_covered": covered,
+            "stops_total": total,
+            "locks": locks,
+        },
+    )
 
 
 def _restore_protective_stop(broker, log, *, symbol: str, qty: float,
@@ -735,6 +835,8 @@ def _flush_trade_intents(
             _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
                           intent.symbol, "ttl", deferred=False, detail=age)
             _journal_safe(log, clear_trade_intent, conn, intent.symbol)
+            _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
+                       kind="ttl", reason=age)
             continue
         not_before = _intent_created_at(intent.not_before) if intent.not_before else None
         if not_before is not None and now_utc < not_before:
@@ -763,6 +865,8 @@ def _flush_trade_intents(
                                      f"signal {intent.signal_price:.2f} "
                                      f"(cap {settings.risk.max_entry_gap_atr})")
                 _journal_safe(log, clear_trade_intent, conn, intent.symbol)
+                _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
+                           kind="gap")
                 continue
         # Chase guards: the signal-relative gate always runs; the open-relative
         # gate runs when today's open is available. An intent that would buy
@@ -777,6 +881,8 @@ def _flush_trade_intents(
                           intent.symbol, "chase_signal", deferred=True,
                           detail=f"live {live_price:.2f} is {vs_signal * 100:+.1f}% above signal "
                                  f"(cap {settings.risk.max_chase_vs_signal_pct * 100:.1f}%)")
+            _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="deferred",
+                       kind="chase_signal")
             continue
         today_open = None
         open_price_of = getattr(broker, "get_today_open", None)
@@ -795,6 +901,8 @@ def _flush_trade_intents(
                           detail=f"live {live_price:.2f} is "
                                  f"{(live_price / today_open - 1) * 100:+.1f}% above open "
                                  f"(cap {settings.risk.max_chase_vs_open_pct * 100:.1f}%)")
+            _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="deferred",
+                       kind="chase_open")
             continue
         stop_pct, book_risk, corr_mult, room = _entry_sizing_inputs(
             symbol=intent.symbol, atr14=intent.atr14, live_price=live_price,
@@ -812,6 +920,8 @@ def _flush_trade_intents(
             existing_stop_risk=book_risk, corr_multiplier=corr_mult,
             sector_room=room,
         )
+        _emit_live(asof, "sizing", symbol=intent.symbol, approved=sizing.approved,
+                   notional=round(sizing.notional, 2), reason=sizing.reason)
         if not sizing.approved:
             # Book-level and transient: exposure, book stop-risk and sector room
             # all move as positions come and go, so the same intent can size
@@ -821,6 +931,8 @@ def _flush_trade_intents(
                      intent.symbol, sizing.reason)
             _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
                           intent.symbol, "sizing", deferred=True, detail=sizing.reason)
+            _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
+                       kind="sizing", reason=sizing.reason)
             continue
         order = broker.submit_notional_buy(
             intent.symbol, sizing.notional, atr14=intent.atr14,
@@ -828,6 +940,8 @@ def _flush_trade_intents(
         )
         if order is None:
             log.warning("%s: TradeIntent order rejected.", intent.symbol)
+            _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="rejected",
+                       kind="intent-buy")
             continue
         cash_remaining -= sizing.notional
         invested_value += sizing.notional
@@ -845,6 +959,8 @@ def _flush_trade_intents(
         _journal_safe(log, clear_trade_intent, conn, intent.symbol)
         log.info("%s: TradeIntent filled $%.0f @ ~%.2f — %s",
                  intent.symbol, sizing.notional, live_price, sizing.reason)
+        _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="filled",
+                   kind="intent-buy", notional=round(sizing.notional, 2))
     return filled, cash_remaining, invested_value, open_position_count, orders_this_cycle
 
 
@@ -884,6 +1000,12 @@ def run_cycle(
     ids = OrderIdMinter(cycle_timestamp)
     live_session = asof is None
     owns_conn = conn is None
+    cycle_no: int | None = None
+
+    def _live(stage: str, **fields) -> None:
+        if cycle_no is not None:
+            fields.setdefault("cycle", cycle_no)
+        _emit_live(asof, stage, **fields)
 
     if broker is None:
         use_dry_run = force_dry_run or not settings.has_alpaca_credentials
@@ -959,9 +1081,26 @@ def run_cycle(
         # Observability: prove the scheduler woke up even though there was
         # nothing to scan. Live runs only — backtests/tests (asof set, often
         # with throwaway journals) must not freshen the watchdog stamp.
+        _live("cycle_start", n_symbols=len(cycle_symbols), fast=True,
+              skip_llm=skip_llm, dry_run=use_dry_run, skipped="market_closed")
+        _live("cycle_end", skipped="market_closed", n_evaluated=0, n_orders=0)
         if asof is None:
             write_heartbeat(conn, "fast")
+        _stamp_cycle_progress(
+            asof=asof, fast_mode=True, cycle_no=cycle_no, account=account,
+            positions=positions, status="no_trade", skipped="market closed",
+        )
         return
+
+    if owns_conn:
+        conn = connect()
+    if conn is not None:
+        try:
+            cycle_no = int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM cycles").fetchone()[0])
+        except Exception:
+            cycle_no = None
+    _live("cycle_start", n_symbols=len(cycle_symbols), fast=fast_mode,
+          skip_llm=skip_llm, dry_run=use_dry_run, market_open=market_open)
 
     # Market regime is assessed once per cycle and applies to every symbol: it
     # decides how much size each entry gets and how high the entry bar sits.
@@ -973,10 +1112,9 @@ def run_cycle(
              f", VIX {regime.vix:.1f}" if regime.vix else "")
     for note in regime.notes:
         log.info("  regime | %s", note)
+    _live("regime", label=regime.label, score=round(regime.score, 4), vix=regime.vix)
     regime_multiplier = settings.risk.risk_off_size_multiplier if regime.is_risk_off else 1.0
 
-    if owns_conn:
-        conn = connect()
     peaks = load_position_peaks(conn)
     # Positions closed outside this loop (manual sale, broker-side fill) should
     # not leave a stale peak behind to poison a later re-entry.
@@ -1012,6 +1150,7 @@ def run_cycle(
     atrs: dict[str, float] = {}  # fed to the protective-stop reconciliation below
     work: list[_Work] = []
     decide_kw = _decide_kwargs(settings, regime)
+    llm_fail_streak = 0
 
     # Re-protect everything FIRST. A previous cycle can have died between
     # cancelling a protective stop and re-placing it (Task Scheduler execution
@@ -1024,12 +1163,16 @@ def run_cycle(
                                 live=live_session, ids=ids)
 
     for symbol in cycle_symbols:
+        _live("symbol_enter", symbol=symbol)
         df = feed.price_history(symbol, asof=asof)
         signal = compute(symbol, df, weights=signal_weights)
         if signal is None:
             log.warning("Skipping %s — insufficient price history.", symbol)
+            _live("quant", symbol=symbol, error="insufficient_history")
             continue
         atrs[symbol] = signal.atr14
+        _live("quant", symbol=symbol, score=round(signal.score, 4),
+              rsi=round(signal.rsi14, 2), extended=bool(signal.extended))
         cached_adv = getattr(signal_model, "average_dollar_volume", None)
         adv = cached_adv(symbol, df) if callable(cached_adv) else average_dollar_volume(df)
         held = positions.get(symbol)
@@ -1044,6 +1187,8 @@ def run_cycle(
             )
             if exit_signal:
                 item.forced_exit = exit_signal
+                _live("decide", symbol=symbol, action="sell", forced=True,
+                      trigger=exit_signal.trigger)
                 work.append(item)
                 continue
 
@@ -1058,6 +1203,8 @@ def run_cycle(
                     f"${settings.risk.min_adv_usd:,.0f} liquidity floor; not a new-entry candidate."
                 ),
             )
+            _live("decide", symbol=symbol, action="avoid", combined=round(signal.score, 4),
+                  reason="adv_floor")
             work.append(item)
             continue
 
@@ -1118,13 +1265,34 @@ def run_cycle(
 
         verdict = None
         if use_llm:
-            news = feed.news(symbol)
-            fundamentals = feed.fundamentals(symbol)
-            verdict = analyze(signal, news, fundamentals, settings)
-            # Recorded for BOTH modes: a symbol the twice-daily deep cycle just
-            # analyzed shouldn't be immediately re-analyzed by the next
-            # fast-tier scan a few minutes later either.
-            _journal_safe(log, record_escalation, conn, symbol, cycle_timestamp, signal.score)
+            if llm_fail_streak >= LLM_FAIL_FAST_STREAK:
+                log.info("%s: analyst circuit open — skipping LLM this cycle.", symbol)
+            else:
+                news = feed.news(symbol)
+                fundamentals = feed.fundamentals(symbol)
+                _live("llm_call_start", symbol=symbol)
+                _t0 = time.perf_counter()
+                verdict = analyze(signal, news, fundamentals, settings)
+                _ms = int((time.perf_counter() - _t0) * 1000)
+                if verdict is None:
+                    llm_fail_streak += 1
+                    _live("llm_call_done", symbol=symbol, ms=_ms, error="none")
+                    if llm_fail_streak >= LLM_FAIL_FAST_STREAK:
+                        log.error(
+                            "Analyst CLI/API failed %d symbols in a row — skipping remaining "
+                            "LLM calls this cycle (fail-closed: new entries WAIT). Exits and "
+                            "stops still run.",
+                            LLM_FAIL_FAST_STREAK,
+                        )
+                        _live("llm_circuit_open", streak=LLM_FAIL_FAST_STREAK)
+                else:
+                    llm_fail_streak = 0
+                    _live("llm_call_done", symbol=symbol, ms=_ms, stance=verdict.stance)
+                # Recorded for BOTH modes: a symbol the twice-daily deep cycle just
+                # analyzed shouldn't be immediately re-analyzed by the next
+                # fast-tier scan a few minutes later either. Skipped-circuit
+                # names are not recorded — they were never analyzed.
+                _journal_safe(log, record_escalation, conn, symbol, cycle_timestamp, signal.score)
         item.verdict = verdict
 
         item.decision = decide(
@@ -1133,6 +1301,9 @@ def run_cycle(
             has_open_position=held is not None,
             **decide_kw,
         )
+        _live("decide", symbol=symbol, action=item.decision.action.value,
+              combined=round(item.decision.combined_score, 4),
+              quant=round(item.decision.quant_score, 4))
         work.append(item)
 
     # Holdings no longer on any list still get full protection: their peaks
@@ -1142,13 +1313,18 @@ def run_cycle(
     for symbol, held in positions.items():
         if symbol in cycle_symbols:
             continue
+        _live("symbol_enter", symbol=symbol, off_watchlist=True)
         df = feed.price_history(symbol, asof=asof)
         signal = compute(symbol, df, weights=signal_weights)
         if signal is None:
             log.warning("Held %s is off-watchlist with no usable history — "
                         "cannot refresh its peak or exit checks.", symbol)
+            _live("quant", symbol=symbol, error="insufficient_history", off_watchlist=True)
             continue
         atrs[symbol] = signal.atr14
+        _live("quant", symbol=symbol, score=round(signal.score, 4),
+              rsi=round(signal.rsi14, 2), extended=bool(signal.extended),
+              off_watchlist=True)
         item = _Work(symbol=symbol, signal=signal, held=held, adv=average_dollar_volume(df))
         item.forced_exit = _refresh_peak_and_check_exit(
             conn, peaks, cycle_timestamp, settings.risk,
@@ -1174,6 +1350,9 @@ def run_cycle(
             signal=signal, verdict=None, has_open_position=True,
             **{**decide_kw, "sell_threshold": settings.risk.legacy_sell_threshold},
         )
+        _live("decide", symbol=symbol, action=item.decision.action.value,
+              combined=round(item.decision.combined_score, 4),
+              quant=round(item.decision.quant_score, 4), off_watchlist=True)
         work.append(item)
 
     # Exits first so they free shares (and, on a sim broker, cash) before buys.
@@ -1337,6 +1516,7 @@ def run_cycle(
                 "new entries fail closed."
             )
             log.info("%s: BUY downgraded to WAIT — no LLM verdict available.", item.symbol)
+            _live("order_or_veto", symbol=item.symbol, status="veto", kind="fail_closed")
             continue
         if unknown_regime:
             decision.reasoning += " Skipped: macro regime UNKNOWN — no new entries."
@@ -1357,6 +1537,7 @@ def run_cycle(
                     " Skipped: a dry run never queues TradeIntents — re-decide in a real cycle."
                 )
                 log.info("%s: dry run — BUY not queued as TradeIntent.", item.symbol)
+                _live("order_or_veto", symbol=item.symbol, status="dry_run", kind="buy")
                 continue
             intent = TradeIntent(
                 symbol=item.symbol, created_at=cycle_timestamp,
@@ -1381,6 +1562,8 @@ def run_cycle(
             )
             log.info("%s: BUY queued as TradeIntent @ %.2f, not before %s.",
                      item.symbol, signal.last_price, intent.not_before)
+            _live("order_or_veto", symbol=item.symbol, status="intent", kind="buy",
+                  price=round(signal.last_price, 4))
             continue
 
         # Backtest/sim path only (asof set): live entries never reach here —
@@ -1414,6 +1597,8 @@ def run_cycle(
             sector_room=room,
         )
         item.sizing_reason = sizing.reason
+        _live("sizing", symbol=item.symbol, approved=sizing.approved,
+              notional=round(sizing.notional, 2), reason=sizing.reason)
         if sizing.approved:
             if not fast_mode:
                 _grok_confirm(settings, item, "buy", log)
@@ -1424,6 +1609,7 @@ def run_cycle(
             if order is None:
                 item.order_status = "rejected"
                 decision.reasoning += f" {sizing.reason}, but the order was REJECTED (notional orders need regular market hours)."
+                _live("order_or_veto", symbol=item.symbol, status="rejected", kind="buy")
             else:
                 item.order_status, item.order_qty = order.status, order.qty
                 item.notional = sizing.notional
@@ -1440,8 +1626,12 @@ def run_cycle(
                 _journal_safe(log, clear_intraday_confirmation, conn, item.symbol)
                 _journal_safe(log, clear_trade_intent, conn, item.symbol)
                 decision.reasoning += f" {sizing.reason}."
+                _live("order_or_veto", symbol=item.symbol, status=item.order_status or "filled",
+                      kind="buy", notional=round(sizing.notional, 2))
         else:
             decision.reasoning += f" Risk manager vetoed buy: {sizing.reason}."
+            _live("order_or_veto", symbol=item.symbol, status="veto", kind="sizing",
+                  reason=sizing.reason)
 
     for item in work:
         decision = item.decision
@@ -1500,6 +1690,11 @@ def run_cycle(
     # timestamps would falsely freshen the watchdog stamp.
     if asof is None:
         write_heartbeat(conn, "fast" if fast_mode else "deep", stop_coverage=stop_coverage)
+    _stamp_cycle_progress(
+        asof=asof, fast_mode=fast_mode, cycle_no=cycle_no, account=account,
+        positions=final_positions, rows=rows, orders_this_cycle=orders_this_cycle,
+        stop_coverage=stop_coverage, status="ok",
+    )
     if owns_conn:
         conn.close()
     if fast_mode:
@@ -1507,6 +1702,8 @@ def run_cycle(
                  len(rows), len(settings.watchlist), orders_this_cycle)
     else:
         log.info("Cycle complete: %d symbols evaluated, %d orders placed.", len(rows), orders_this_cycle)
+    _live("cycle_end", n_evaluated=len(rows), n_orders=orders_this_cycle,
+          fast=fast_mode, mode="fast" if fast_mode else "deep")
 
 
 def main() -> None:
@@ -1535,6 +1732,10 @@ def main() -> None:
     if args.fast and _near_deep_cycle(datetime.now(ET)):
         log.info("Fast-tier scan yielding — within %d min of a deep cycle (%s ET); "
                  "the deep cycle takes the lock.", DEEP_CYCLE_YIELD_MINUTES, RUN_TIMES_ET)
+        _stamp_cycle_progress(
+            asof=None, fast_mode=True, cycle_no=None, account=None, positions=None,
+            status="no_trade", skipped="yielded to deep cycle",
+        )
         return
 
     lock = CycleLock()
@@ -1555,9 +1756,19 @@ def main() -> None:
                 wait, lock.path,
             )
             _notify_toast("Deep cycle skipped: could not acquire the cycle lock.")
+        _stamp_cycle_progress(
+            asof=None, fast_mode=args.fast, cycle_no=None, account=None, positions=None,
+            status="failed", skipped="cycle lock not acquired",
+        )
         return
     try:
         run_cycle(force_dry_run=args.dry_run, skip_llm=args.skip_llm, fast_mode=args.fast)
+    except Exception:
+        _stamp_cycle_progress(
+            asof=None, fast_mode=args.fast, cycle_no=None, account=None, positions=None,
+            status="failed", skipped="cycle raised",
+        )
+        raise
     finally:
         lock.release()
 

@@ -9,6 +9,10 @@ so generating a report can never migrate or mutate a live database. Usage:
 
 Writes <out-dir>/YYYY-MM-DD.md (today's local date) and, when matplotlib is
 installed, an equity-curve PNG next to it.
+
+Fills and closed round-trip P&L come from a GET-only Alpaca reader (never from
+journal.fill_price, which stays NULL by design). Missing credentials degrade
+the fills section instead of failing the rest of the report.
 """
 from __future__ import annotations
 
@@ -19,8 +23,13 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
+from .broker_read import BookBrokerReader, BrokerError
 from .journal.logger import DEFAULT_DB_PATH
+from .round_trips import round_trips
+
+ET = ZoneInfo("America/New_York")
 
 CYCLE_WINDOW = 20          # equity/cash timeline length
 # 60 daily-return observations, per the pre-registered incremental-information
@@ -274,6 +283,190 @@ def _short_ts(ts: str) -> str:
     return ts.replace("T", " ")[:16]
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _et_date(ts: datetime) -> str:
+    return ts.astimezone(ET).date().isoformat()
+
+
+def _short_et(ts_raw: str | None) -> str:
+    ts = _parse_iso(ts_raw)
+    if ts is None:
+        return (ts_raw or "")[:16]
+    return ts.astimezone(ET).strftime("%Y-%m-%d %H:%M")
+
+
+def _infer_book_root(db_path: Path | str) -> Path:
+    """<root>/data/journal.db → <root>; otherwise the db's parent directory."""
+    path = Path(db_path).resolve()
+    if path.parent.name.lower() == "data":
+        return path.parent.parent
+    return path.parent
+
+
+def _progress_lines(book_root: Path) -> list[str]:
+    """Five-line 下一班 block from progress.json; missing file is honest."""
+    from .progress import read_progress
+
+    lines = ["", "### 下一班（交班卡）", ""]
+    card = None
+    for candidate in (book_root / "data" / "progress.json", book_root / "progress.json"):
+        card = read_progress(candidate)
+        if card:
+            break
+    if not card:
+        lines.append("还没有交班卡（`data/progress.json`）。")
+        return lines
+    rnd = card.get("round") or {}
+    job = card.get("next_job") or {}
+    lines.append(f"- 上一轮：**{rnd.get('name') or '—'}** · {rnd.get('status') or '—'} @ {rnd.get('asof') or '—'}")
+    when = job.get("when_et") or ""
+    lines.append(f"- 下一班：**{job.get('slot') or '—'}** {when}".rstrip())
+    if job.get("instruction"):
+        lines.append(f"- 指令：{job['instruction']}")
+    unresolved = card.get("unresolved") or []
+    if unresolved:
+        bits = []
+        for item in unresolved:
+            if isinstance(item, dict):
+                bits.append(f"{item.get('kind')}{(' — ' + item['detail']) if item.get('detail') else ''}")
+            else:
+                bits.append(str(item))
+        lines.append("- 未决：" + "；".join(bits))
+    else:
+        lines.append("- 未决：无")
+    return lines
+
+
+def session_et_date(conn: sqlite3.Connection, now_utc: datetime) -> str:
+    """ET calendar date of the latest paper cycle, else ET now.
+
+    Weekend / after-close reports still show the last session instead of empty.
+    """
+    row = conn.execute(
+        "SELECT timestamp FROM cycles WHERE mode = 'paper' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row and row[0]:
+        ts = _parse_iso(row[0])
+        if ts is not None:
+            return _et_date(ts)
+    return _et_date(now_utc)
+
+
+def load_broker_fills(book_root: Path | str) -> tuple[list[dict] | None, str | None]:
+    """GET-only fill history. Never writes. Degrades to (None, reason)."""
+    try:
+        fills, reason = BookBrokerReader(Path(book_root)).fills()
+    except BrokerError as exc:
+        return None, str(exc)
+    except Exception as exc:  # noqa: BLE001 — network / parse / missing .env
+        return None, f"{type(exc).__name__}: {exc}"
+    if fills is None:
+        return None, reason or "broker unavailable"
+    return fills, None
+
+
+def _fills_on_session(fills: list[dict], session_day: str) -> list[dict]:
+    matched = []
+    for fill in fills:
+        ts = _parse_iso(fill.get("transaction_time"))
+        if ts is not None and _et_date(ts) == session_day:
+            matched.append(fill)
+    matched.sort(key=lambda f: f.get("transaction_time") or "")
+    return matched
+
+
+def _closed_trips_on_session(fills: list[dict], session_day: str) -> list[dict]:
+    closed = []
+    for trip in round_trips(fills):
+        if trip.get("open"):
+            continue
+        ts = _parse_iso(trip.get("closed_at"))
+        if ts is not None and _et_date(ts) == session_day:
+            closed.append(trip)
+    closed.sort(key=lambda t: t.get("closed_at") or "")
+    return closed
+
+
+def _fills_table(rows: list[dict]) -> str:
+    lines = [
+        "| 时间(ET) | 符号 | 方向 | 股数 | 价格 | 名义 |",
+        "|---|---|---|---:|---:|---:|",
+    ]
+    for f in rows:
+        side = str(f.get("side") or "").upper()
+        lines.append(
+            f"| {_short_et(f.get('transaction_time'))} | {f.get('symbol')} | {side} "
+            f"| {float(f.get('qty') or 0.0):.4g} | {_money(f.get('price'))} "
+            f"| {_money(f.get('notional'))} |"
+        )
+    return "\n".join(lines)
+
+
+def _closed_trips_table(rows: list[dict]) -> str:
+    lines = [
+        "| 符号 | 开仓时间(ET) | 平仓时间(ET) | 股数 | 实现盈亏 |",
+        "|---|---|---|---:|---:|",
+    ]
+    for t in rows:
+        lines.append(
+            f"| {t.get('symbol')} | {_short_et(t.get('opened_at'))} "
+            f"| {_short_et(t.get('closed_at'))} | {float(t.get('qty') or 0.0):.4g} "
+            f"| {_money(t.get('realized_pnl'))} |"
+        )
+    return "\n".join(lines)
+
+
+def _fills_section(
+    session_day: str,
+    fills: list[dict] | None,
+    reason: str | None,
+) -> list[str]:
+    lines = [
+        "",
+        "## 三、成交与回合盈亏",
+        "",
+        (
+            f"- 会话日期（ET）：**{session_day}**"
+            "（最近一次 paper 周期的 ET 日；周末/盘后沿用上一交易日）"
+        ),
+        "",
+        (
+            "> 成交来自券商 fills（GET-only Alpaca paper）。**不是** journal"
+            " `fill_price`——该列故意为空，本报告不把成交写回 journal。"
+        ),
+    ]
+    if fills is None:
+        lines += ["", f"无法读取券商成交，本栏降级：**{reason or 'broker unavailable'}**。"]
+        return lines
+
+    session_fills = _fills_on_session(fills, session_day)
+    closed = _closed_trips_on_session(fills, session_day)
+    lines += ["", "### 本会话成交", ""]
+    if session_fills:
+        lines.append(_fills_table(session_fills))
+    else:
+        lines.append("本会话无成交。")
+    lines += ["", "### 本会话已平仓回合", ""]
+    if closed:
+        lines.append(_closed_trips_table(closed))
+        total = sum(float(t.get("realized_pnl") or 0.0) for t in closed)
+        lines += ["", f"- 本会话已实现盈亏合计：**{_money(total)}**"]
+    else:
+        lines.append("本会话无已平仓回合。")
+    return lines
+
+
 def _timeline_table(rows: list[sqlite3.Row]) -> str:
     lines = [
         "| # | 时间(UTC) | mode | equity | cash | 敞口% | regime |",
@@ -445,6 +638,7 @@ def generate_report(
                 " `position_state` 最新市值÷股数（每周期刷新的 broker 快照），其次取最近一次"
                 " `fill_price`，再次用 `notional÷order_qty` 推算；每行的口径已在表中注明。"
             )
+        lines += _progress_lines(_infer_book_root(db_path))
 
         # (b) veto stats --------------------------------------------------------
         lines += ["", "## 二、veto / 拒单统计", "",
@@ -459,9 +653,15 @@ def generate_report(
         for item in NOT_JOURNALED:
             lines.append(f"- {item}")
 
+        # (b2) broker fills / closed round-trips --------------------------------
+        session_day = session_et_date(main_conn, now_utc)
+        book_root = _infer_book_root(db_path)
+        fills, fill_reason = load_broker_fills(book_root)
+        lines += _fills_section(session_day, fills, fill_reason)
+
         # (c) P2 comparison ------------------------------------------------------
         if p2_conn is not None:
-            lines += ["", "## 三、双盘对照（--p2-db）", "",
+            lines += ["", "## 四、双盘对照（--p2-db）", "",
                       f"- 二号盘数据库：`{Path(p2_db_path)}`"]
             a, b, inter, ratio = overlap_stats(main_conn, p2_conn)
             lines.append(
@@ -499,8 +699,8 @@ def generate_report(
         if p2_conn is not None:
             series.append(("二号盘", _daily_equity(p2_conn)))
         has_any_point = any(pts for _, pts in series)
-        # The cross-book section is numbered 三 only when it exists.
-        chart_no = "四" if p2_conn is not None else "三"
+        # 一 overview, 二 veto, 三 fills, 四 p2 (optional), last = equity.
+        chart_no = "五" if p2_conn is not None else "四"
         if not has_any_point:
             lines += ["", f"## {chart_no}、Equity 曲线", "", "无 equity 数据，跳过绘图。"]
         else:
