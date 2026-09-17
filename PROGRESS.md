@@ -180,3 +180,11 @@ P0-B-3 周期时效
 ## 6. 执行日志（按时间追加，最新在下）
 
 - **2026-09-17 11:40 ET（Claude Opus 5，领导）**：读完全部一方文本 + ChatGPT 四个 C2C 输出；跑 P1 测试 462 绿；`check_p2_sync.py` exit 0；GET-only 读四盘券商状态；隔离复现 Codex 故障拿到完整 stderr（额度耗尽）；真实 fills 复现 avg_entry=0；发现 VEEV 持仓消失且系统未察觉。**零代码改动，零下单，零 commit。** 产出本文件。下一步：用户开员工 A / B chat，粘贴 §5 任务书。
+- **2026-09-17 12:10 ET（Claude，领导）**：用户拍板四项（§4）。**基线 commit `72431f0`**——员工在途的 6 个共享文件（round_trips / broker_read / daily_report / run / cli_provider / heartbeat）按 Trading-P2 副本（动手前版本）入库，员工新建的 `tests/test_round_trips.py` `tests/test_broker_read.py` 未入库；`.gitignore` 补 `data/*.jsonl`。commit 后工作树只剩员工改动。已给员工 A / B / C 发协作消息（A 继续 P0-A-2→A-3；B 做完 B-1 停下汇报、B-2 方案先审后改；C 只读拆包，不动代码）。Alpaca 申诉稿已存 Gmail 草稿（见 §7），等用户发送。
+
+## 7. Alpaca 申诉（F1 VEEV）
+
+- 状态：**Gmail 草稿已建**（收件人 support@alpaca.markets，主题 "Paper account PA369LRIBAYU: VEEV position (5.831337174 sh) vanished overnight…"），用户过目后自行发送或让领导发。
+- 内容要点：账户 PA369LRIBAYU；买入 order `8e69bd52` 09-16 19:15Z 成交 5.831337174 @ 263.84；23:19Z 仍有 5 持仓 equity $9,751.83；止损 `3030b51d` 09-17 08:00:03Z 被 rejected；09-17 13:35Z 只剩 4 持仓，cash 不变；全类型 activities / 全状态 orders 均无 VEEV 卖出或调整；同登录下另一 paper 账户 VEEV 仍在。请求：解释机制、恢复股份或等值净值、确认是否可复发。
+- 回复到达后：把 Alpaca 的答复摘要追加到本节，并决定 P0-A-3 对账逻辑是否需要针对"平台侧删除"加特殊分类。
+
