@@ -57,13 +57,19 @@ export default function Trades({ bookId }: { bookId: string }) {
             {trips.map((t, i) => (
               <tr key={`${t.symbol}-${i}`} style={{ cursor: "pointer" }} onClick={() => openTrade(t.symbol)}>
                 <td>{t.symbol}</td>
-                <td>{t.open ? <span className="badge hold">持仓中</span> : <span className="badge sell">已平仓</span>}</td>
+                <td>
+                  {t.open ? <span className="badge hold">持仓中</span> : <span className="badge sell">已平仓</span>}
+                  {t.incomplete && <span className="badge bad" title="fills 窗口缺期初买入，或卖出数量超出已知持仓">不完整</span>}
+                  {t.ambiguous && <span className="badge idle" title="同一时刻多笔买卖，顺序无法从数据判定">顺序存疑</span>}
+                </td>
                 <td className="muted">{shortTime(t.opened_at)}</td>
                 <td className="muted">{shortTime(t.closed_at)}</td>
                 <td className="mono">{Math.round(t.qty * 1000) / 1000}</td>
                 <td className="mono">${t.avg_entry?.toFixed(2) ?? "—"}</td>
                 <td className="mono">{t.avg_exit ? `$${t.avg_exit.toFixed(2)}` : "—"}</td>
-                <td className={`mono ${t.realized_pnl >= 0 ? "pos" : "neg"}`}>{usd(t.realized_pnl, 2)}</td>
+                <td className={`mono ${t.realized_pnl == null ? "muted" : t.realized_pnl >= 0 ? "pos" : "neg"}`}>
+                  {t.realized_pnl != null ? usd(t.realized_pnl, 2) : "—"}
+                </td>
                 <td className={`mono ${(t.unrealized_pnl ?? 0) >= 0 ? "pos" : "neg"}`}>
                   {t.unrealized_pnl != null ? usd(t.unrealized_pnl, 2) : "—"}
                 </td>
@@ -71,7 +77,10 @@ export default function Trades({ bookId }: { bookId: string }) {
             ))}
           </tbody>
         </table>
-        <div className="note">数据源：Alpaca 成交流水（只读 GET），均价为平均成本法；journal 只记录下单意图不记录成交。</div>
+        <div className="note">
+          数据源：Alpaca 成交流水（只读 GET），均价为平均成本法；journal 只记录下单意图不记录成交。
+          标"不完整"的回合没有真实已实现盈亏，「累计已实现盈亏」图表已经把它们排除在外，不计入合计。
+        </div>
       </div>
 
       {detail && (

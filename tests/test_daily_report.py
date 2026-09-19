@@ -326,6 +326,162 @@ def test_fills_section_lists_session_fills_and_closed_trips():
     assert "已实现盈亏" in text
 
 
+def test_fills_section_notes_truncation():
+    from agentic_trading.daily_report import _fills_section
+
+    text = "\n".join(_fills_section("2026-08-27", [], None, truncated=True))
+    assert "成交历史可能不完整" in text
+
+
+def test_closed_trips_table_marks_incomplete_trips():
+    from agentic_trading.daily_report import _closed_trips_table
+
+    rows = [
+        {"symbol": "AVGO", "opened_at": None, "closed_at": "2026-06-15T15:00:00Z",
+         "qty": 3.0, "avg_entry": None, "realized_pnl": None, "incomplete": True},
+    ]
+    text = _closed_trips_table(rows)
+    assert "不完整" in text
+    assert "n/a" in text  # realized_pnl shows n/a, not $0.00
+
+
+def test_closed_trips_table_marks_ambiguous_trips():
+    from agentic_trading.daily_report import _closed_trips_table
+
+    rows = [
+        {"symbol": "X", "opened_at": "2026-01-02T15:00:00Z", "closed_at": "2026-01-02T15:00:00Z",
+         "qty": 1.0, "avg_entry": 100.0, "realized_pnl": 10.0, "ambiguous": True},
+    ]
+    text = _closed_trips_table(rows)
+    assert "顺序无法确定" in text
+
+
+def test_fills_section_excludes_ambiguous_from_realized_total():
+    """R5: an ambiguous trip's realized_pnl must not enter the confident
+    total, and the footnote must say so (separately from "incomplete")."""
+    from agentic_trading.daily_report import _fills_section
+
+    fills = [
+        {"symbol": "A", "side": "buy", "qty": 1.0, "price": 10.0,
+         "notional": 10.0, "transaction_time": "2026-08-27T14:00:00+00:00"},
+        {"symbol": "A", "side": "sell", "qty": 1.0, "price": 12.0,
+         "notional": 12.0, "transaction_time": "2026-08-27T15:00:00+00:00"},
+        # Same timestamp, no id — ambiguous, has a real (non-None) pnl.
+        {"symbol": "B", "side": "buy", "qty": 1.0, "price": 50.0,
+         "notional": 50.0, "transaction_time": "2026-08-27T16:00:00+00:00"},
+        {"symbol": "B", "side": "sell", "qty": 1.0, "price": 55.0,
+         "notional": 55.0, "transaction_time": "2026-08-27T16:00:00+00:00"},
+    ]
+    text = "\n".join(_fills_section("2026-08-27", fills, None))
+    assert "本会话已实现盈亏合计：**$2.00**" in text  # only A's +2, not B's +5
+    assert "1 笔顺序无法确定" in text
+
+
+def test_fills_section_excludes_partial_prefix_ambiguous_from_total():
+    """R5 follow-up (ChatGPT review, PROGRESS.md §11): a same-timestamp
+    buy/sell pair where only ONE side has a parseable id prefix must be
+    excluded the same way a fully-prefix-less or same-prefix tie is."""
+    from agentic_trading.daily_report import _fills_section
+
+    fills = [
+        {"symbol": "A", "side": "buy", "qty": 1.0, "price": 10.0,
+         "notional": 10.0, "transaction_time": "2026-08-27T14:00:00+00:00"},
+        {"symbol": "A", "side": "sell", "qty": 1.0, "price": 12.0,
+         "notional": 12.0, "transaction_time": "2026-08-27T15:00:00+00:00"},
+        # Same timestamp; only the buy has an id — B's +5 must still be
+        # excluded, not silently summed just because a prefix exists.
+        {"symbol": "B", "side": "buy", "qty": 1.0, "price": 50.0,
+         "notional": 50.0, "transaction_time": "2026-08-27T16:00:00+00:00"},
+        {"symbol": "B", "side": "sell", "qty": 1.0, "price": 55.0,
+         "notional": 55.0, "transaction_time": "2026-08-27T16:00:00+00:00",
+         "id": "20260827160000000::cccccccc-0000-0000-0000-000000000003"},
+    ]
+    text = "\n".join(_fills_section("2026-08-27", fills, None))
+    assert "本会话已实现盈亏合计：**$2.00**" in text  # only A's +2, not B's +5
+    assert "1 笔顺序无法确定" in text
+
+
+def test_reconciliation_section_agrees_when_positions_match():
+    from agentic_trading.daily_report import _reconciliation_section
+
+    fills = [
+        {"symbol": "MSFT", "side": "buy", "qty": 2.0, "price": 450.0,
+         "notional": 900.0, "transaction_time": "2026-08-20T15:00:00+00:00"},
+    ]
+    positions = [{"symbol": "MSFT", "qty": 2.0}]
+    text = "\n".join(_reconciliation_section(fills, positions, None))
+    assert "一致" in text
+
+
+def test_reconciliation_section_flags_broker_only_symbol():
+    """少一只（fills 侧）：券商有持仓，fills 派生记录里没有。"""
+    from agentic_trading.daily_report import _reconciliation_section
+
+    text = "\n".join(_reconciliation_section([], [{"symbol": "NVDA", "qty": 8.0}], None))
+    assert "NVDA" in text
+    assert "未解释" in text
+
+
+def test_reconciliation_section_flags_fills_only_symbol():
+    """多一只（fills 侧）：这是 F1 的真实 VEEV 场景——fills 说仍持有，券商没有。"""
+    from agentic_trading.daily_report import _reconciliation_section
+
+    fills = [
+        {"symbol": "VEEV", "side": "buy", "qty": 5.831337, "price": 263.84,
+         "notional": 1538.55, "transaction_time": "2026-09-16T15:15:00+00:00"},
+    ]
+    text = "\n".join(_reconciliation_section(fills, [], None))
+    assert "VEEV" in text
+    assert "未解释" in text
+
+
+def test_reconciliation_section_shows_undetermined_not_a_confirmed_diff():
+    """R5: a symbol touched by an ambiguous same-timestamp fill group must
+    read as "无法确定" (undetermined), never as "一致" (agrees) and never
+    labeled the same way as a confirmed "未解释" diff — even when the
+    computed qty happens to match the broker's."""
+    from agentic_trading.daily_report import _reconciliation_section
+
+    fills = [
+        {"symbol": "X", "side": "buy", "qty": 1.0, "price": 100.0,
+         "transaction_time": "2026-08-27T15:00:00+00:00"},
+        {"symbol": "X", "side": "buy", "qty": 1.0, "price": 105.0,
+         "transaction_time": "2026-08-27T16:00:00+00:00"},
+        # A same-timestamp, no-id sell/buy pair against the still-open lot
+        # above makes X's open trip ambiguous.
+        {"symbol": "X", "side": "sell", "qty": 1.0, "price": 110.0,
+         "transaction_time": "2026-08-27T17:00:00+00:00"},
+        {"symbol": "X", "side": "buy", "qty": 1.0, "price": 108.0,
+         "transaction_time": "2026-08-27T17:00:00+00:00"},
+    ]
+    positions = [{"symbol": "X", "qty": 2.0}]
+    text = "\n".join(_reconciliation_section(fills, positions, None))
+    assert "一致" not in text
+    assert "❓ 无法确定" in text
+    assert "⚠️ 未解释" not in text
+
+
+def test_reconciliation_section_flags_qty_mismatch():
+    from agentic_trading.daily_report import _reconciliation_section
+
+    fills = [
+        {"symbol": "IQV", "side": "buy", "qty": 2.0, "price": 248.61,
+         "notional": 497.22, "transaction_time": "2026-08-20T15:00:00+00:00"},
+    ]
+    positions = [{"symbol": "IQV", "qty": 2.5}]
+    text = "\n".join(_reconciliation_section(fills, positions, None))
+    assert "IQV" in text
+    assert "未解释" in text
+
+
+def test_reconciliation_section_degrades_when_positions_unavailable():
+    from agentic_trading.daily_report import _reconciliation_section
+
+    text = "\n".join(_reconciliation_section([], None, "no ALPACA credentials"))
+    assert "无法核对" in text
+    assert "no ALPACA credentials" in text
+
+
 def test_intent_events_are_counted(tmp_path):
     """Flush outcomes reach the veto table instead of only the run log."""
     from agentic_trading.journal.logger import record_intent_event
@@ -346,3 +502,207 @@ def test_intent_events_are_counted(tmp_path):
     assert "| Flush 阶段 sizing 否决（敞口 / book 风险 / sector cap）— intent 保留 | 2 | 2 |" in text
     # The gap event is outside the 7-day window: recent 0, total 1.
     assert "intent 丢弃 | 0 | 1 |" in text
+
+
+# ---- P1-B-3: evaluate.py per-horizon counts + heartbeat llm_status --------------
+
+def _insert_outcome(conn, decision_id, *, ret_1d=None, ret_5d=None, ret_20d=None):
+    conn.execute(
+        """INSERT INTO signal_outcomes (decision_id, asof, ret_1d, ret_5d, ret_20d,
+               mfe_20d, mae_20d, evaluated_at)
+           VALUES (?, '2026-08-20', ?, ?, ?, NULL, NULL, '2026-08-25T00:00:00+00:00')""",
+        (decision_id, ret_1d, ret_5d, ret_20d),
+    )
+
+
+def test_outcomes_summary_reports_per_horizon_matured_counts(tmp_path):
+    from agentic_trading.daily_report import _outcomes_summary
+
+    import sqlite3
+
+    path = tmp_path / "m.db"
+    conn = connect(path)
+    conn.row_factory = sqlite3.Row  # matches _connect_ro's setting in production
+    try:
+        record_cycle(conn, _ts(20), "paper", 100_000, 50_000, [
+            _row("AAA", action="buy"), _row("BBB", action="buy"), _row("CCC", action="avoid"),
+        ])
+        ids = {r["symbol"]: r["id"] for r in conn.execute(
+            "SELECT id, symbol FROM decisions"
+        ).fetchall()}
+        # AAA: all three horizons matured. BBB: only 1d matured (5d/20d still open).
+        # CCC (avoid): evaluated but nothing matured yet — every horizon is None.
+        _insert_outcome(conn, ids["AAA"], ret_1d=0.01, ret_5d=0.02, ret_20d=0.03)
+        _insert_outcome(conn, ids["BBB"], ret_1d=-0.01)
+        _insert_outcome(conn, ids["CCC"])
+        rows = _outcomes_summary(conn)
+        buy = next(r for r in rows if r["action"] == "buy")
+        assert buy["n"] == 2  # both buy decisions, regardless of maturity
+        assert buy["n_1d"] == 2 and buy["n_5d"] == 1 and buy["n_20d"] == 1
+        # min_n=5: every horizon's matured count (2, 1, 1) is below it here.
+        assert buy["n_1d_small"] is True
+        assert buy["n_5d_small"] is True
+        assert buy["n_20d_small"] is True
+        avoid = next(r for r in rows if r["action"] == "avoid")
+        assert avoid["n"] == 1 and avoid["n_1d"] == 0  # evaluated, nothing matured
+    finally:
+        conn.close()
+
+
+def test_outcomes_summary_defaults_to_paper_mode_only(tmp_path):
+    """R6: dry_run/backtest outcomes must not leak into the default
+    paper-forward evaluation-quality view."""
+    from agentic_trading.daily_report import _outcomes_summary
+
+    import sqlite3
+
+    path = tmp_path / "m.db"
+    conn = connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        record_cycle(conn, _ts(20), "paper", 100_000, 50_000, [_row("AAA", action="buy")])
+        record_cycle(conn, _ts(21), "dry_run", 100_000, 50_000, [_row("BBB", action="buy")])
+        record_cycle(conn, _ts(22), "backtest", 100_000, 50_000, [_row("CCC", action="buy")])
+        ids = {r["symbol"]: r["id"] for r in conn.execute(
+            "SELECT id, symbol FROM decisions"
+        ).fetchall()}
+        _insert_outcome(conn, ids["AAA"], ret_1d=0.01)
+        _insert_outcome(conn, ids["BBB"], ret_1d=0.02)
+        _insert_outcome(conn, ids["CCC"], ret_1d=0.03)
+
+        paper_only = _outcomes_summary(conn)
+        buy = next(r for r in paper_only if r["action"] == "buy")
+        assert buy["n"] == 1  # only AAA (paper) — dry_run/backtest excluded by default
+
+        everything = _outcomes_summary(conn, mode=None)
+        buy_all = next(r for r in everything if r["action"] == "buy")
+        assert buy_all["n"] == 3  # explicit mode=None keeps the audit escape hatch
+    finally:
+        conn.close()
+
+
+def test_outcomes_summary_flags_thin_horizon_despite_large_bucket(tmp_path):
+    """R6: small_sample must be judged per horizon, not by the bucket's total
+    decision count — 40 decisions with only 1 matured 20d return is thin on
+    the 20d horizon even though 40 >= MIN_REPORT_N."""
+    from agentic_trading.daily_report import _outcomes_summary
+
+    import sqlite3
+
+    path = tmp_path / "m.db"
+    conn = connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        record_cycle(
+            conn, _ts(20), "paper", 100_000, 50_000,
+            [_row(f"S{i}", action="buy") for i in range(40)],
+        )
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM decisions ORDER BY id"
+        ).fetchall()]
+        for i, decision_id in enumerate(ids):
+            # All 40 mature at 1d and 5d; only the first one matures at 20d.
+            _insert_outcome(
+                conn, decision_id,
+                ret_1d=0.01, ret_5d=0.02,
+                ret_20d=0.03 if i == 0 else None,
+            )
+
+        rows = _outcomes_summary(conn)
+        buy = next(r for r in rows if r["action"] == "buy")
+        assert buy["n"] == 40
+        assert buy["n_1d"] == 40 and buy["n_1d_small"] is False
+        assert buy["n_5d"] == 40 and buy["n_5d_small"] is False
+        assert buy["n_20d"] == 1 and buy["n_20d_small"] is True
+
+        from agentic_trading.daily_report import _outcomes_table
+        table = _outcomes_table(rows)
+        buy_line = next(line for line in table.splitlines() if line.startswith("| buy "))
+        # The 20d column (matured=1, thin) carries the warning mark; the 1d
+        # and 5d columns (matured=40 each, not thin) must not.
+        assert "40 |" in buy_line
+        assert "1 ⚠️" in buy_line
+    finally:
+        conn.close()
+
+
+def test_evaluation_quality_lines_no_data_is_honest(tmp_path):
+    from agentic_trading.daily_report import _evaluation_quality_lines
+
+    path = tmp_path / "m.db"
+    conn = connect(path)
+    try:
+        record_cycle(conn, _ts(20), "paper", 100_000, 50_000, [])
+        text = "\n".join(_evaluation_quality_lines(conn))
+    finally:
+        conn.close()
+    assert "暂无数据" in text
+    assert "不跑评估、不写库" in text
+
+
+def test_evaluation_quality_lines_renders_table_with_matured_counts(tmp_path):
+    import sqlite3
+
+    from agentic_trading.daily_report import _evaluation_quality_lines
+
+    path = tmp_path / "m.db"
+    conn = connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        record_cycle(conn, _ts(20), "paper", 100_000, 50_000, [_row("AAA", action="buy")])
+        decision_id = conn.execute("SELECT id FROM decisions").fetchone()["id"]
+        _insert_outcome(conn, decision_id, ret_1d=0.05)
+        text = "\n".join(_evaluation_quality_lines(conn))
+    finally:
+        conn.close()
+    assert "buy" in text
+    assert "+5.00%" in text
+    assert "成熟" in text
+
+
+def test_llm_status_lines_missing_heartbeat_is_honest(tmp_path):
+    from agentic_trading.daily_report import _llm_status_lines
+
+    text = "\n".join(_llm_status_lines(tmp_path))
+    assert "没有心跳文件" in text
+
+
+def test_llm_status_lines_no_llm_status_field(tmp_path):
+    import json
+
+    from agentic_trading.daily_report import _llm_status_lines
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "heartbeat.json").write_text(
+        json.dumps({"deep": {"timestamp": "2026-08-25T00:00:00+00:00"}}),
+        encoding="utf-8",
+    )
+    text = "\n".join(_llm_status_lines(tmp_path))
+    assert "没有" in text and "llm_status" in text
+
+
+def test_llm_status_lines_reads_circuit_open_state(tmp_path):
+    import json
+
+    from agentic_trading.daily_report import _llm_status_lines
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "heartbeat.json").write_text(
+        json.dumps({
+            "deep": {
+                "timestamp": "2026-09-16T23:19:00+00:00",
+                "llm_status": {
+                    "state": "circuit_open", "calls": 3, "failures": 3,
+                    "category": "quota",
+                    "retry_hint": "try again at Sep 20th, 2026 4:00 PM",
+                },
+            },
+            "fast": {"timestamp": "2026-09-17T09:35:00+00:00",
+                      "llm_status": {"state": "off", "reason": "quant-only"}},
+        }),
+        encoding="utf-8",
+    )
+    text = "\n".join(_llm_status_lines(tmp_path))
+    assert "深周期" in text and "circuit_open" in text and "quota" in text
+    assert "try again at Sep 20th, 2026 4:00 PM" in text
+    assert "快扫" in text and "off" in text

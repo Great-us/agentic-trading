@@ -81,9 +81,14 @@ export interface TradeTrip {
   qty: number;
   avg_entry: number | null;
   avg_exit: number | null;
-  realized_pnl: number;
+  // Null for an incomplete/orphaned trip (round_trips.py: a sell with no
+  // matching buy in the fills window, or the oversold remainder of one) —
+  // there is no real P&L to report, not a $0 result.
+  realized_pnl: number | null;
   unrealized_pnl?: number | null;
   open: boolean;
+  incomplete?: boolean;
+  ambiguous?: boolean;
 }
 
 export interface RosterPayload {
@@ -117,9 +122,27 @@ export interface LogicPayload {
 export interface HealthPayload {
   status: string;
   message: string;
+  note?: string | null;
+  // The most recent cycle that actually reconciled stops (whichever mode),
+  // per heartbeat.latest_stop_check — this is what `overall`/`status` bases
+  // its stops_unknown alert on, so it's the one to display; the per-mode
+  // stops_covered/stops_unknown below are each mode's own last check and no
+  // longer drive `overall` (P0-B-2/R2 follow-up).
+  stop_check?: StopCheck | null;
   deep: HealthMode;
   fast: HealthMode;
   limits: { deep_hours: number; fast_minutes: number };
+}
+
+export interface StopCheck {
+  checked_at: string | null;
+  mode: string | null;
+  cycle_id: number | null;
+  stops_covered: number | null;
+  positions: number | null;
+  unknown: boolean;
+  reason: string | null;
+  naked: boolean;
 }
 
 export interface HealthMode {
@@ -130,6 +153,12 @@ export interface HealthMode {
   stops_covered: number | null;
   positions: number | null;
   naked?: boolean;
+  stops_unknown?: boolean;
+  stops_unknown_reason?: string | null;
+  late_minutes?: number | null;
+  missed_slots?: number | null;
+  late?: boolean;
+  note?: string | null;
   state: string;
 }
 

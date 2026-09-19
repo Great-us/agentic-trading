@@ -305,6 +305,450 @@ def test_book_health_deep_only_ignores_missing_fast(tmp_path):
     assert "快" not in stale["message"]
 
 
+# P1-B-4: book_health now distinguishes a live-scanner failure (fast hasn't
+# ticked during market hours) from the market simply being shut, instead of
+# lumping both under state="weekend" (P1-B-3's finding). Six scenarios below:
+# intraday timeout, intraday normal, after-hours normal, weekend, a whole
+# weekday with no heartbeat at all, and pre-P0-B-3 stamps without the new
+# lateness fields.
+
+def test_book_health_intraday_fast_stall_is_a_real_alert(tmp_path):
+    """Fast hasn't ticked in over FAST_MAX_AGE_MINUTES while we're squarely
+    inside the trading-hours window — that's the scanner itself stalling,
+    not the market being closed, and must read as an alert."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import FAST_MAX_AGE_MINUTES
+
+    wednesday = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)  # 13:00 ET, mid-session
+    fast_stamp = wednesday - timedelta(minutes=FAST_MAX_AGE_MINUTES + 25)  # same day, over limit
+    deep_stamp = wednesday - timedelta(minutes=10)  # fresh
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": deep_stamp.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+            "fast": {"timestamp": fast_stamp.isoformat(), "cycle_id": 5,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=wednesday)
+    assert health["deep"]["state"] == "ok"
+    assert health["fast"]["missed_sessions"] == 0  # not a missed trading day
+    assert health["fast"]["age_seconds"] >= (FAST_MAX_AGE_MINUTES + 25) * 60
+    assert health["fast"]["state"] == "stale_intraday"
+    assert health["status"] == "stale_intraday"
+
+
+def test_book_health_intraday_normal(tmp_path):
+    """Same trading-hours window, but fast is well within budget: ok, not
+    conflated with any of the other states."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    wednesday = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)  # 13:00 ET
+    fast_stamp = wednesday - timedelta(minutes=5)
+    deep_stamp = wednesday - timedelta(minutes=10)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": deep_stamp.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+            "fast": {"timestamp": fast_stamp.isoformat(), "cycle_id": 5,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=wednesday)
+    assert health["deep"]["state"] == "ok"
+    assert health["fast"]["state"] == "ok"
+    assert health["status"] == "ok"
+
+
+def test_book_health_after_hours_is_not_an_alert(tmp_path):
+    """Weekday evening, well outside the 09:35-16:05 ET window: fast being
+    old is expected (it doesn't run outside the window at all) and must not
+    be reported as an alert as long as deep itself is still fresh."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    wednesday_evening = datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)  # 19:00 ET
+    deep_stamp = wednesday_evening - timedelta(hours=3)  # this afternoon's deep cycle
+    fast_stamp = wednesday_evening - timedelta(hours=7)  # last fast tick before the window closed
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": deep_stamp.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+            "fast": {"timestamp": fast_stamp.isoformat(), "cycle_id": 20,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=wednesday_evening)
+    assert health["deep"]["state"] == "after_hours"
+    assert health["fast"]["state"] == "after_hours"
+    assert health["status"] == "after_hours"
+
+
+def test_book_health_weekday_dark_all_day_is_ambiguous_not_a_hard_alert(tmp_path):
+    """A weekday with zero heartbeat activity (holiday, or a real failure —
+    without a market-holiday calendar there is no way to tell) must read as
+    closed_or_holiday with a note, not silently as "ok" and not as a hard
+    "stale" alert — deep is still under DEEP_MAX_AGE_HOURS old, so this is
+    the ambiguous case, not the "actually broken" one."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import DEEP_MAX_AGE_HOURS
+
+    # Monday 20:00 UTC deep stamp; Tuesday 16:00 UTC (12:00 ET, well inside
+    # the fast window — this is not a "before today's first slot" case) "now"
+    # — 20h elapsed (< DEEP_MAX_AGE_HOURS), but the calendar date rolled over
+    # a weekday.
+    assert DEEP_MAX_AGE_HOURS > 20
+    monday_stamp = datetime(2026, 9, 7, 20, 0, tzinfo=timezone.utc)
+    tuesday_now = datetime(2026, 9, 8, 16, 0, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": monday_stamp.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+            "fast": {"timestamp": monday_stamp.isoformat(), "cycle_id": 5,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=tuesday_now)
+    assert health["deep"]["missed_sessions"] == 1
+    assert health["deep"]["state"] == "closed_or_holiday"
+    assert health["fast"]["state"] == "closed_or_holiday"
+    assert health["status"] == "closed_or_holiday"
+    assert health["note"] == "无交易所日历，可能是假日也可能是漏跑"
+
+
+def test_book_health_weekday_dark_all_day_escalates_once_deep_is_truly_overdue(tmp_path):
+    """Same missed-weekday shape, but now deep itself has also blown past
+    DEEP_MAX_AGE_HOURS — that's not ambiguous anymore, it's stale."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import DEEP_MAX_AGE_HOURS
+
+    # +6h beyond the bare DEEP_MAX_AGE_HOURS threshold specifically to land
+    # after today's first scheduled slot (09:35 ET) — otherwise "today hasn't
+    # started yet" would (correctly, per the fix above) suppress the missed
+    # count and this test would stop meaning what it says.
+    monday_stamp = datetime(2026, 9, 7, 8, 0, tzinfo=timezone.utc)
+    tuesday_now = monday_stamp + timedelta(hours=DEEP_MAX_AGE_HOURS + 6)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": monday_stamp.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=tuesday_now, deep_only=True)
+    assert health["deep"]["missed_sessions"] >= 1
+    assert health["deep"]["state"] == "stale"
+    assert health["status"] == "stale"
+
+
+# ---- R7 (ChatGPT review, PROGRESS.md §9): a fresh deep stamp today must not
+# ---- mask a genuine same-day fast stall as "maybe a holiday", and a quiet
+# ---- pre-market morning must not be misread as a missed trading day. -----
+
+def test_book_health_fresh_deep_today_unmasks_stale_fast_from_yesterday(tmp_path):
+    """deep already ran today (so today is demonstrably live, not a
+    holiday); fast's last tick is still dated yesterday and we're squarely
+    inside the fast window right now. That combination must read as
+    stale_intraday — a real live-scanner alert — not closed_or_holiday."""
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    yesterday_fast = datetime(2026, 9, 17, 19, 0, tzinfo=timezone.utc)   # Thu 15:00 ET
+    today_deep = datetime(2026, 9, 18, 13, 45, tzinfo=timezone.utc)      # Fri 09:45 ET
+    now = datetime(2026, 9, 18, 17, 0, tzinfo=timezone.utc)              # Fri 13:00 ET, in window
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": today_deep.isoformat(), "cycle_id": 10,
+                     "stops_covered": 4, "positions": 4},
+            "fast": {"timestamp": yesterday_fast.isoformat(), "cycle_id": 40,
+                     "stops_covered": 4, "positions": 4},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now)
+    assert health["deep"]["state"] == "ok"
+    assert health["fast"]["state"] == "stale_intraday"
+    assert health["status"] == "stale_intraday"
+
+
+def test_book_health_before_todays_first_slot_is_not_a_missed_day(tmp_path):
+    """Quiet pre-market morning: yesterday's stamps are still under their
+    max-age budgets, and today's first scheduled slot (09:35 ET) hasn't
+    happened yet. This must not be reported as a missed trading day."""
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    yesterday_evening = datetime(2026, 9, 17, 21, 0, tzinfo=timezone.utc)  # Thu 17:00 ET
+    pre_market = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)         # Fri 08:00 ET, before 09:35
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": yesterday_evening.isoformat(), "cycle_id": 1,
+                     "stops_covered": 4, "positions": 4},
+            "fast": {"timestamp": yesterday_evening.isoformat(), "cycle_id": 30,
+                     "stops_covered": 4, "positions": 4},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=pre_market)
+    assert health["deep"]["missed_sessions"] == 0
+    assert health["fast"]["missed_sessions"] == 0
+    assert health["deep"]["state"] != "closed_or_holiday"
+    assert health["fast"]["state"] != "closed_or_holiday"
+    assert health["status"] not in {"closed_or_holiday", "stale"}
+
+
+def test_book_health_surfaces_stops_unknown(tmp_path):
+    """P0-B-2/R2: a cycle that couldn't read open orders writes
+    stops_covered=None + stops_unknown=True instead of pretending coverage
+    was fine. book_health must surface that explicitly, not just leave
+    stops_covered blank the same way an old pre-P0-B-2 stamp would."""
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)  # Wed 13:00 ET
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": None, "positions": 4,
+                     "stops_unknown": True, "stops_unknown_reason": "open orders unreadable"},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now, deep_only=True)
+    assert health["deep"]["stops_unknown"] is True
+    assert health["deep"]["stops_unknown_reason"] == "open orders unreadable"
+    assert health["deep"]["naked"] is False  # not misread as "0 uncovered"
+    # Not knowing whether stops are covered is itself an alert — it must move
+    # `overall`, not just sit as a quiet per-mode footnote (B's R7 follow-up).
+    assert health["status"] == "stops_unknown"
+    assert health["note"] == "止损覆盖未核验：open orders unreadable"
+
+
+def test_book_health_stops_unknown_overrides_an_otherwise_calm_state(tmp_path):
+    """Same idea, but proving it specifically: a stamp that is perfectly
+    fresh and well inside its trading window — which alone would read
+    "ok" — must still surface as the stops_unknown alert once that flag is
+    set, not be swallowed by the calm time-based state."""
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)  # Wed 13:00 ET, in window
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": None, "positions": 4,
+                     "stops_unknown": True, "stops_unknown_reason": "open orders unreadable"},
+            "fast": {"timestamp": now.isoformat(), "cycle_id": 40,
+                     "stops_covered": 4, "positions": 4},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now)
+    assert health["fast"]["state"] == "ok"  # fast itself has nothing wrong
+    assert health["status"] == "stops_unknown"  # but overall still alerts
+
+
+def test_book_health_stops_unknown_absent_on_normal_stamps(tmp_path):
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": 4, "positions": 4},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now, deep_only=True)
+    assert health["deep"]["stops_unknown"] is False
+    assert health["deep"]["stops_unknown_reason"] is None
+
+
+# --- dashboard and watchdog must agree on "the most recent actual check" (round 2, R2)
+
+def _health_after(tmp_path, steps, *, now):
+    """Write a real heartbeat sequence through write_heartbeat and read it back
+    with book_health, so the dashboard sees exactly what the watchdog sees."""
+    from datetime import timedelta
+
+    import agentic_trading.heartbeat as hb
+    from agentic_trading.dashboard.views import book_health
+
+    path = tmp_path / "heartbeat.json"
+    real_now = hb._utcnow
+    try:
+        for minutes, mode, kwargs in steps:
+            hb._utcnow = lambda m=minutes: now - timedelta(minutes=60 - m)
+            hb.write_heartbeat(None, mode, path=path, **kwargs)
+    finally:
+        hb._utcnow = real_now
+    return book_health(path, now=now), hb.check_heartbeat(now=now, path=path)
+
+
+def test_book_health_clears_stops_unknown_after_a_later_successful_check(tmp_path):
+    # deep's read failed at 09:45; the 10:15 fast scan re-checked and found
+    # 3/3. Both readers must report the latest check — not "any mode still
+    # carries a stale unknown flag".
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)  # Wed 13:00 ET
+    health, problem = _health_after(tmp_path, [
+        (0, "deep", {"stop_coverage_unknown": "open orders unreadable", "positions": 3}),
+        (30, "fast", {"stop_coverage": (3, 3)}),
+    ], now=now)
+    assert health["status"] == "ok", health
+    assert health["stop_check"]["unknown"] is False
+    assert health["stop_check"]["mode"] == "fast" and health["stop_check"]["stops_covered"] == 3
+    assert health["note"] is None
+    assert problem is None  # watchdog agrees
+
+
+def test_book_health_keeps_stops_unknown_across_a_skipped_scan(tmp_path):
+    # fast's read failed at 09:55; the 10:15 fast scan ran no check (yielded /
+    # market closed). The failure is still the most recent check: dashboard
+    # and watchdog both stay on stops_unknown.
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)
+    health, problem = _health_after(tmp_path, [
+        (0, "deep", {"stop_coverage": (4, 4)}),
+        (10, "fast", {"stop_coverage_unknown": "open orders unreadable", "positions": 4}),
+        (30, "fast", {}),
+    ], now=now)
+    assert health["status"] == "stops_unknown", health
+    assert health["stop_check"]["unknown"] is True
+    assert health["note"] == "止损覆盖未核验：open orders unreadable"
+    assert problem is not None and "没能核验止损覆盖" in problem
+
+
+def test_book_health_failure_then_other_mode_success_then_skip_stays_clear(tmp_path):
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)
+    health, problem = _health_after(tmp_path, [
+        (0, "fast", {"stop_coverage_unknown": "open orders unreadable", "positions": 3}),
+        (10, "deep", {"stop_coverage": (3, 3)}),
+        (30, "fast", {}),
+    ], now=now)
+    assert health["status"] == "ok", health
+    assert health["stop_check"]["mode"] == "deep"
+    assert problem is None
+
+
+def test_book_health_naked_positions_come_from_the_latest_check(tmp_path):
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 9, 17, 0, tzinfo=timezone.utc)
+    health, problem = _health_after(tmp_path, [
+        (0, "deep", {"stop_coverage": (4, 4)}),
+        (30, "fast", {"stop_coverage": (3, 4)}),
+    ], now=now)
+    assert health["stop_check"]["naked"] is True
+    assert health["stop_check"]["stops_covered"] == 3 and health["stop_check"]["positions"] == 4
+    assert problem is not None and "1/4" in problem
+
+
+def test_book_health_surfaces_late_start_flag(tmp_path):
+    """P0-B-3 wrote late_minutes/missed_slots into heartbeat entries; a late
+    (but not yet stale) cycle start must be visible in the health payload so
+    the dashboard can flag it without waiting for FAST/DEEP_MAX_AGE to trip."""
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import LATE_MAX_MINUTES
+
+    now = datetime(2026, 9, 16, 23, 19, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {
+                "timestamp": now.isoformat(), "cycle_id": 9,
+                "stops_covered": 4, "positions": 5,
+                "started_at": now.isoformat(),
+                "scheduled_slot": (now - timedelta(minutes=184)).isoformat(),
+                "late_minutes": 184.0, "missed_slots": 0,
+            },
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now, deep_only=True)
+    assert health["deep"]["late_minutes"] == 184.0
+    assert health["deep"]["missed_slots"] == 0
+    assert health["deep"]["late"] is True
+    assert LATE_MAX_MINUTES < 184.0
+
+
+def test_book_health_late_minutes_absent_on_older_stamps(tmp_path):
+    """Stamps written before P0-B-3 (or by a book whose schedule isn't in
+    BOOK_SCHEDULES, e.g. P3/P4) have no late_minutes at all — must not crash
+    and must not be misreported as late."""
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+
+    now = datetime(2026, 9, 9, 18, 0, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now, deep_only=True)
+    assert health["deep"]["late_minutes"] is None
+    assert health["deep"]["late"] is False
+
+
+def test_book_health_late_within_threshold_is_not_flagged(tmp_path):
+    from datetime import datetime, timezone
+
+    from agentic_trading.dashboard.views import book_health
+    from agentic_trading.heartbeat import LATE_MAX_MINUTES
+
+    now = datetime(2026, 9, 9, 18, 0, tzinfo=timezone.utc)
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps({
+            "deep": {"timestamp": now.isoformat(), "cycle_id": 1,
+                     "stops_covered": 2, "positions": 2,
+                     "late_minutes": LATE_MAX_MINUTES - 5},
+        }),
+        encoding="utf-8",
+    )
+    health = book_health(path, now=now, deep_only=True)
+    assert health["deep"]["late"] is False
+
+
 def test_analyzed_progress_running_without_cycle_start_in_tail():
     import sqlite3
 
@@ -376,7 +820,11 @@ class TestApi:
 
     def test_health_reads_heartbeat(self, client: TestClient):
         body = client.get("/api/books/p1/health").json()
-        assert body["status"] in {"ok", "weekend"}
+        # Heartbeat is stamped with real wall-clock "now" and read back with
+        # real wall-clock "now" too — both stamps are fresh either way, so
+        # the only thing that varies is which calendar/clock bucket the
+        # actual moment this test runs in falls into (P1-B-4).
+        assert body["status"] in {"ok", "after_hours", "weekend"}
         assert body["deep"]["stops_covered"] == 1
         assert body["limits"]["deep_hours"] == 26
 
@@ -442,3 +890,88 @@ class TestApi:
         assert body["progress"]["card"]["round"]["name"] == "fast"
         assert body["progress"]["card"]["next_job"]["instruction"]
         assert client.get("/api/books/p1/progress").json()["present"] is True
+
+
+# ---- R6: outcomes_summary mode filter + per-horizon small_sample ------------
+
+def _insert_outcome_row(conn, decision_id, *, ret_1d=None, ret_5d=None, ret_20d=None):
+    conn.execute(
+        """INSERT INTO signal_outcomes (decision_id, asof, ret_1d, ret_5d, ret_20d,
+               mfe_20d, mae_20d, evaluated_at)
+           VALUES (?, '2026-08-20', ?, ?, ?, NULL, NULL, '2026-08-25T00:00:00+00:00')""",
+        (decision_id, ret_1d, ret_5d, ret_20d),
+    )
+
+
+def _outcome_decision(symbol: str, *, action: str = "buy"):
+    from agentic_trading.journal.logger import DecisionRow
+
+    return DecisionRow(
+        symbol=symbol, quant_score=0.5, llm_stance="bullish", llm_confidence=0.8,
+        llm_rationale=None, combined_score=0.6, action=action, reasoning="",
+    )
+
+
+def test_outcomes_summary_defaults_to_paper_mode_only():
+    import sqlite3
+
+    from agentic_trading.dashboard.views import outcomes_summary
+    from agentic_trading.journal.logger import connect, record_cycle
+
+    conn = connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        record_cycle(conn, "2026-08-20T14:00:00+00:00", "paper", 100_000, 50_000,
+                     [_outcome_decision("AAA")])
+        record_cycle(conn, "2026-08-21T14:00:00+00:00", "dry_run", 100_000, 50_000,
+                     [_outcome_decision("BBB")])
+        record_cycle(conn, "2026-08-22T14:00:00+00:00", "backtest", 100_000, 50_000,
+                     [_outcome_decision("CCC")])
+        ids = {r[1]: r[0] for r in conn.execute("SELECT id, symbol FROM decisions")}
+        _insert_outcome_row(conn, ids["AAA"], ret_1d=0.01)
+        _insert_outcome_row(conn, ids["BBB"], ret_1d=0.02)
+        _insert_outcome_row(conn, ids["CCC"], ret_1d=0.03)
+
+        paper_only = outcomes_summary(conn)
+        buy = next(r for r in paper_only if r["action"] == "buy")
+        assert buy["n"] == 1  # only the paper-mode decision counts by default
+
+        everything = outcomes_summary(conn, mode=None)
+        buy_all = next(r for r in everything if r["action"] == "buy")
+        assert buy_all["n"] == 3  # explicit mode=None keeps the audit escape hatch
+    finally:
+        conn.close()
+
+
+def test_outcomes_summary_flags_thin_horizon_despite_large_bucket():
+    import sqlite3
+
+    from agentic_trading.dashboard.views import outcomes_summary
+    from agentic_trading.journal.logger import DecisionRow, connect, record_cycle
+
+    conn = connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [
+            DecisionRow(
+                symbol=f"S{i}", quant_score=0.5, llm_stance="bullish", llm_confidence=0.8,
+                llm_rationale=None, combined_score=0.6, action="buy", reasoning="",
+            )
+            for i in range(40)
+        ]
+        record_cycle(conn, "2026-08-20T14:00:00+00:00", "paper", 100_000, 50_000, rows)
+        ids = [r[0] for r in conn.execute("SELECT id FROM decisions ORDER BY id")]
+        for i, decision_id in enumerate(ids):
+            # All 40 mature at 1d; only the first one matures at 20d.
+            _insert_outcome_row(
+                conn, decision_id,
+                ret_1d=0.01, ret_20d=0.03 if i == 0 else None,
+            )
+
+        result = outcomes_summary(conn)
+        buy = next(r for r in result if r["action"] == "buy")
+        assert buy["n"] == 40
+        assert buy["n_1d"] == 40 and buy["n_1d_small"] is False
+        assert buy["n_20d"] == 1 and buy["n_20d_small"] is True
+    finally:
+        conn.close()

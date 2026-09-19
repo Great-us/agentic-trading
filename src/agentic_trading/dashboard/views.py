@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,7 +19,15 @@ from ..daily_report import (
     _count_category,
     _count_intent_events,
 )
-from ..heartbeat import DEEP_MAX_AGE_HOURS, FAST_MAX_AGE_MINUTES
+from ..heartbeat import (
+    BOOK_SCHEDULES,
+    DEEP_MAX_AGE_HOURS,
+    FAST_MAX_AGE_MINUTES,
+    LATE_MAX_MINUTES,
+    latest_stop_check,
+)
+from ..journal.evaluate import DEFAULT_MODE as OUTCOMES_DEFAULT_MODE
+from ..journal.evaluate import MIN_REPORT_N
 
 ET = ZoneInfo("America/New_York")
 # Keep in lockstep with run.TRADE_INTENT_TTL — dashboard must not import run.py.
@@ -122,15 +131,27 @@ def position_snapshot(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
-def outcomes_summary(conn: sqlite3.Connection, min_n: int = 5) -> list[dict]:
+def outcomes_summary(
+    conn: sqlite3.Connection,
+    *,
+    mode: str | None = OUTCOMES_DEFAULT_MODE,
+    min_n: int = MIN_REPORT_N,
+) -> list[dict]:
     """Forward-return averages per action bucket, evaluate-style. Descriptive
     only — small n is shown as-is, never as a finding.
 
     n_1d / n_5d / n_20d are the per-horizon evaluated counts. Averaging two
     buckets that evaluated different horizons is a misread (hold +1d is a
-    much smaller sample than avoid +1d).
+    much smaller sample than avoid +1d). `n_1d_small`/`n_5d_small`/
+    `n_20d_small` flag each horizon independently against `min_n`: a bucket
+    with 40 decisions and 40 matured 1d returns but only 1 matured 20d return
+    is small on the 20d horizon regardless of its decision-count total.
+
+    `mode='paper'` by default — dry_run and backtest cycles have no real
+    fills and must not count as paper-forward evaluation evidence. Pass
+    `mode=None` for the full journal across every mode (audit/debugging only).
     """
-    rows = conn.execute(
+    query = (
         "SELECT d.action, COUNT(*) AS n,"
         " SUM(CASE WHEN o.ret_1d IS NOT NULL THEN 1 ELSE 0 END) AS n_1d,"
         " SUM(CASE WHEN o.ret_5d IS NOT NULL THEN 1 ELSE 0 END) AS n_5d,"
@@ -138,16 +159,25 @@ def outcomes_summary(conn: sqlite3.Connection, min_n: int = 5) -> list[dict]:
         " AVG(o.ret_1d)*100 AS ret_1d, AVG(o.ret_5d)*100 AS ret_5d,"
         " AVG(o.ret_20d)*100 AS ret_20d,"
         " AVG(o.mfe_20d)*100 AS mfe_20d, AVG(o.mae_20d)*100 AS mae_20d"
-        " FROM signal_outcomes o JOIN decisions d ON d.id = o.decision_id"
-        " GROUP BY d.action ORDER BY n DESC"
-    ).fetchall()
+        " FROM signal_outcomes o"
+        " JOIN decisions d ON d.id = o.decision_id"
+        " JOIN cycles c ON c.id = d.cycle_id"
+    )
+    params: list = []
+    if mode is not None:
+        query += " WHERE c.mode = ?"
+        params.append(mode)
+    query += " GROUP BY d.action ORDER BY n DESC"
+    rows = conn.execute(query, params).fetchall()
     out = []
     for row in rows:
         item = dict(row)
         for key in ("ret_1d", "ret_5d", "ret_20d", "mfe_20d", "mae_20d"):
             value = item[key]
             item[key] = round(value, 2) if value is not None else None
-        item["small_sample"] = bool(item["n"] < min_n)
+        item["n_1d_small"] = item["n_1d"] < min_n
+        item["n_5d_small"] = item["n_5d"] < min_n
+        item["n_20d_small"] = item["n_20d"] < min_n
         out.append(item)
     return out
 
@@ -227,6 +257,21 @@ def missed_sessions(stamp: datetime, now: datetime) -> int:
     return missed
 
 
+def _effective_missed_sessions(stamp: datetime, now: datetime, *, today_not_started: bool) -> int:
+    """`missed_sessions()`, but today itself is never counted before today's
+    own first scheduled slot has arrived — a quiet pre-market morning is not
+    "a whole trading day went by with no heartbeat" (P1-B-4 review, R7).
+    `missed_sessions()` itself stays untouched (it's a frozen copy of the
+    Phase-0 rule); this only adjusts how `book_health` reads its result."""
+    missed = missed_sessions(stamp, now)
+    if today_not_started and missed > 0:
+        now_et = _aware(now).astimezone(ET)
+        stamp_et = _aware(stamp).astimezone(ET)
+        if now_et.date() > stamp_et.date():
+            missed -= 1
+    return missed
+
+
 def _in_entry_window(et_now: datetime, start: str = "10:00", end: str = "15:30") -> bool:
     try:
         sh, sm = (int(p) for p in start.split(":"))
@@ -237,18 +282,90 @@ def _in_entry_window(et_now: datetime, start: str = "10:00", end: str = "15:30")
     return (sh * 60 + sm) <= minutes <= (eh * 60 + em)
 
 
+# P1-B-4: the weekday fast-scan window, derived from P1's own Task Scheduler
+# grid (heartbeat.BOOK_SCHEDULES) rather than a hardcoded literal — this is
+# the "should there be a heartbeat right now" reference for every book this
+# dashboard package serves (P1/P3/P4). It works out to 09:35-16:05 ET.
+def _fast_window() -> tuple[dt_time, dt_time]:
+    (h, m), _interval, span = BOOK_SCHEDULES["p1"]["fast"]
+    start = dt_time(h, m)
+    end_total = h * 60 + m + span
+    end = dt_time((end_total // 60) % 24, end_total % 60)
+    return start, end
+
+
+_FAST_WINDOW_START, _FAST_WINDOW_END = _fast_window()
+
+# Priority order for combining per-mode states into one overall status —
+# earlier entries win. "stale"/"stale_intraday" are real alerts; the rest are
+# expected/benign states that just say *why* a stamp looks old right now.
+_STATUS_PRIORITY = (
+    "stale", "stale_intraday", "stops_unknown", "missing", "closed_or_holiday", "after_hours",
+    "weekend", "ok",
+)
+
+
+def _mode_state(mode: str, *, missed: int, raw_stale: bool, deep_raw_stale: bool,
+                is_weekend: bool, in_fast_window: bool, today_has_run_evidence: bool) -> str:
+    """One mode's health label for `now`'s calendar/clock context.
+
+    `today_has_run_evidence` (some mode already stamped earlier today) takes
+    priority for fast specifically: if we're squarely inside the trading
+    window right now and something has demonstrably already run today, a
+    stale fast stamp is a live scanner stall — full stop, not "maybe a
+    holiday" — no matter what `missed` says about the gap since fast's own
+    last tick (which may be dated yesterday even though today is plainly a
+    live session; R7, PROGRESS.md §9).
+
+    A missed weekday (`missed > 0`) can only mean the schedule actually
+    skipped a trading day — real trouble if `deep` is also badly overdue
+    (`stale`), otherwise ambiguous without a market-holiday calendar
+    (`closed_or_holiday`: could be a holiday, could be a quiet failure).
+    `deep_raw_stale` (not this mode's own raw_stale) is what decides that
+    escalation for BOTH modes: fast's own 35-minute budget is trivially blown
+    by any full missed day, so using fast's own staleness there would call
+    every missed day "stale" and defeat the point of the softer label — deep's
+    26-hour budget is the one actually calibrated to tell "a day slipped by"
+    from "the whole book has gone dark".
+
+    Below that, plain calendar/clock context decides: weekend, the fast
+    window during a weekday (`stale_intraday` if fast itself is overdue right
+    now), or after-hours on a weekday.
+    """
+    if mode == "fast" and in_fast_window and today_has_run_evidence and raw_stale:
+        return "stale_intraday"
+    if missed > 0:
+        return "stale" if deep_raw_stale else "closed_or_holiday"
+    if is_weekend:
+        return "weekend"
+    if mode == "fast":
+        if in_fast_window:
+            return "stale_intraday" if raw_stale else "ok"
+        return "after_hours"
+    # deep, weekday, no missed session
+    if in_fast_window:
+        return "ok"
+    return "stale" if raw_stale else "after_hours"
+
+
 def book_health(heartbeat_path: Path, *, now: datetime | None = None,
                 deep_only: bool = False) -> dict:
     now = _aware(now or datetime.now(timezone.utc))
+    now_et = now.astimezone(ET)
+    is_weekend = now_et.weekday() >= 5
+    in_fast_window = (not is_weekend) and (_FAST_WINDOW_START <= now_et.time() < _FAST_WINDOW_END)
     empty = {"timestamp": None, "cycle_id": None, "age_seconds": None,
              "missed_sessions": None, "stops_covered": None, "positions": None,
-             "state": "missing"}
+             "late_minutes": None, "missed_slots": None, "late": False,
+             "stops_unknown": False, "stops_unknown_reason": None,
+             "note": None, "state": "missing"}
     if not heartbeat_path.exists():
         return {
             "status": "missing",
             "message": "无心跳文件",
             "deep": dict(empty),
             "fast": dict(empty),
+            "stop_check": None,
             "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},
             "deep_only": deep_only,
         }
@@ -260,31 +377,55 @@ def book_health(heartbeat_path: Path, *, now: datetime | None = None,
             "message": f"心跳无法解析：{exc}",
             "deep": dict(empty),
             "fast": dict(empty),
+            "stop_check": None,
             "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},
             "deep_only": deep_only,
         }
+    if not isinstance(payload, dict):
+        payload = {}
 
     modes: dict[str, dict] = {}
-    overall = "ok"
+    seen_states: list[str] = []
     checks = [("deep", timedelta(hours=DEEP_MAX_AGE_HOURS))]
     if not deep_only:
         checks.append(("fast", timedelta(minutes=FAST_MAX_AGE_MINUTES)))
+    deep_stamp = parse_iso((payload.get("deep") or {}).get("timestamp"))
+    deep_raw_stale = (
+        deep_stamp is not None and (now - deep_stamp) > timedelta(hours=DEEP_MAX_AGE_HOURS)
+    )
+    # Evidence this calendar day (ET) is a live session, independent of
+    # which mode is being evaluated — a fresh deep OR fast stamp from today
+    # rules out "maybe today just hasn't started" for the other mode's stale
+    # reading (R7).
+    today_has_run_evidence = any(
+        (s := parse_iso((payload.get(m) or {}).get("timestamp"))) is not None
+        and s.astimezone(ET).date() == now_et.date()
+        for m in ("deep", "fast")
+    )
+    today_not_started = (not is_weekend) and (now_et.time() < _FAST_WINDOW_START)
     for mode, max_age in checks:
         entry = payload.get(mode) or {}
         stamp = parse_iso(entry.get("timestamp"))
         if stamp is None:
             modes[mode] = dict(empty)
-            if overall == "ok":
-                overall = "missing"
+            seen_states.append("missing")
             continue
-        missed = missed_sessions(stamp, now)
+        missed = _effective_missed_sessions(stamp, now, today_not_started=today_not_started)
         raw_stale = (now - stamp) > max_age
-        if missed == 0:
-            state = "ok" if not raw_stale else "weekend"
-        else:
-            state = "stale"
-            overall = "stale"
+        state = _mode_state(mode, missed=missed, raw_stale=raw_stale, deep_raw_stale=deep_raw_stale,
+                            is_weekend=is_weekend, in_fast_window=in_fast_window,
+                            today_has_run_evidence=today_has_run_evidence)
+        seen_states.append(state)
         covered, total = entry.get("stops_covered"), entry.get("positions")
+        late_minutes = entry.get("late_minutes")
+        # Per-mode coverage fields describe what THAT mode's own last check
+        # said (None when that cycle ran no check). Whether the book is in a
+        # stops_unknown state is decided once, below, from the most recent
+        # actual check across both modes (`latest_stop_check`) — the same
+        # reading the watchdog uses — so a stale per-mode flag can neither
+        # keep the dashboard red after a later successful re-check, nor hide
+        # a failed check behind a later skipped scan (review round 2, R2).
+        stops_unknown = bool(entry.get("stops_unknown"))
         modes[mode] = {
             "timestamp": entry.get("timestamp"),
             "cycle_id": entry.get("cycle_id"),
@@ -295,22 +436,60 @@ def book_health(heartbeat_path: Path, *, now: datetime | None = None,
             "naked": (
                 total is not None and covered is not None and int(total) > int(covered)
             ),
+            "stops_unknown": stops_unknown,
+            "stops_unknown_reason": entry.get("stops_unknown_reason") if stops_unknown else None,
+            # From heartbeat's P0-B-3 timeliness block (started_at vs the
+            # Task Scheduler slot) — optional, so older stamps without it
+            # just carry None/False here rather than breaking the payload.
+            "late_minutes": late_minutes,
+            "missed_slots": entry.get("missed_slots"),
+            "late": late_minutes is not None and float(late_minutes) > LATE_MAX_MINUTES,
+            "note": "无交易所日历，可能是假日也可能是漏跑" if state == "closed_or_holiday" else None,
             "state": state,
         }
-    if overall == "ok" and any(m.get("state") == "weekend" for m in modes.values()):
-        overall = "weekend"
+    # One reading of "is stop coverage verified right now", shared with
+    # `heartbeat --check`: the most recent cycle that actually reconciled,
+    # whichever mode it was. Not knowing whether stops are covered is itself
+    # an alert (moves `overall`), not a footnote next to a calm status.
+    check = latest_stop_check(payload)
+    stop_check = None
+    if check is not None:
+        stop_check = {
+            "checked_at": check["checked_at"],
+            "mode": check["mode"],
+            "cycle_id": check["cycle_id"],
+            "stops_covered": check["stops_covered"],
+            "positions": check["positions"],
+            "unknown": check["unknown"],
+            "reason": check["reason"],
+            "naked": check["naked"] > 0,
+        }
+        if check["unknown"]:
+            seen_states.append("stops_unknown")
+    overall = next((s for s in _STATUS_PRIORITY if s in seen_states), "ok")
+    note = None
+    if stop_check is not None and stop_check["unknown"]:
+        note = f"止损覆盖未核验：{stop_check['reason'] or '券商挂单读取失败'}"
+    if note is None:
+        note = next((modes[m]["note"] for m in modes if modes[m].get("note")), None)
     stale_msg = "停摆：漏掉了交易日的深周期" if deep_only else "停摆：漏掉了交易日的深/快周期"
     if deep_only:
         modes.setdefault("fast", dict(empty))
     return {
         "status": overall,
+        "stop_check": stop_check,
         "message": {
             "ok": "周期在跑",
-            "weekend": "休市中（心跳超时但未漏交易日）",
+            "stale_intraday": "盘中扫描停摆（快扫可能挂了）",
+            "stops_unknown": "止损覆盖未核验（券商挂单读取失败）",
+            "after_hours": "盘后 / 非交易时段（正常）",
+            "weekend": "休市中（周末）",
+            "closed_or_holiday": "工作日无心跳（可能是假日，也可能漏跑——无交易所日历，无法区分）",
             "stale": stale_msg,
             "missing": "没有可用心跳",
             "corrupt": "心跳损坏",
         }.get(overall, overall),
+        "note": note,
         "deep": modes.get("deep", dict(empty)),
         "fast": modes.get("fast", dict(empty)),
         "limits": {"deep_hours": DEEP_MAX_AGE_HOURS, "fast_minutes": FAST_MAX_AGE_MINUTES},

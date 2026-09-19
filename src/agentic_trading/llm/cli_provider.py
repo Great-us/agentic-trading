@@ -14,6 +14,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from ..data.market_data import NewsItem
@@ -53,6 +55,137 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
         )
     else:  # pragma: no cover - non-Windows development fallback
         proc.kill()
+
+
+# --- failure diagnostics -----------------------------------------------------
+#
+# A CLI that exits non-zero used to be logged as its first 500 characters of
+# stderr, which for Codex is the harmless "Reading additional input from
+# stdin..." preamble — the real cause ("You've hit your usage limit ... try
+# again at Sep 20th") sits at the END of stderr and never reached the log
+# (2026-09-16/17: three deep cycles fail-closed to quant-only and nobody could
+# tell why). Failures are now classified and the last one is kept on the module
+# so run.py can put "why the LLM is unavailable" into the heartbeat/progress.
+
+FAILURE_CATEGORIES = ("quota", "auth", "timeout", "parse", "not_found", "unknown")
+
+# Matched case-insensitively against stderr + stdout of a failed invocation;
+# quota is checked before auth because some CLIs phrase a spent plan as a 403.
+_QUOTA_RE = re.compile(
+    r"usage limit|rate[ _-]?limit|quota|too many requests|\b429\b|insufficient[ _]credits|"
+    r"out of credits|billing", re.IGNORECASE,
+)
+_AUTH_RE = re.compile(
+    r"unauthori[sz]ed|\b401\b|\b403\b|not logged in|please (?:log|sign) in|login required|"
+    r"authenticat|invalid (?:api[ _-]?key|token|credential)|expired (?:token|session)|"
+    r"permission denied", re.IGNORECASE,
+)
+# "try again at Sep 20th, 2026 4:00 PM" / "resets in 3 hours" — kept verbatim
+# in the detail so the operator sees when the analyst is expected back.
+_RETRY_HINT_RE = re.compile(
+    r"((?:try again|retry|resets?|available again)[^.\n]{0,80})", re.IGNORECASE,
+)
+
+# Anything resembling a credential is masked before it reaches a log line or
+# the progress card. Long opaque tokens (32+ url-safe chars) are almost never
+# meaningful in an error message and almost always a key.
+_REDACT_RES = (
+    re.compile(r"(?i)\bbearer\s+\S+"),
+    re.compile(r"(?i)((?:api[_-]?key|secret(?:[_-]?key)?|token|password|authorization)\s*[:=]\s*)\S+"),
+    re.compile(r"\b(?:sk|pk|xoxb|ghp|gho)[-_][A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"\b[A-Za-z0-9_\-]{32,}\b"),
+)
+
+HEAD_CHARS = 200
+TAIL_CHARS = 600
+
+
+@dataclass
+class CliFailure:
+    """One failed analyst invocation, already redacted and truncated."""
+
+    category: str
+    symbol: str
+    exit_code: int | None
+    elapsed_s: float
+    detail: str
+    retry_hint: str | None = None
+
+    def summary(self) -> str:
+        """One line for the operator: the category, then the most useful bit
+        (the retry hint when there is one, else the last line of the error)."""
+        tail = self.retry_hint
+        if not tail and self.detail.strip():
+            tail = self.detail.strip().splitlines()[-1][:160]
+        return f"{self.category}: {tail}" if tail else self.category
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# The most recent failure (None after any success). run.py reads this after
+# analyze() returns None so the heartbeat/progress can say WHY, not just that
+# the circuit opened. Module-level on purpose: analyze_via_cli's return
+# contract (verdict | None) is shared with the API provider and stays as is.
+last_failure: CliFailure | None = None
+
+
+def redact_secrets(text: str) -> str:
+    for pattern in _REDACT_RES:
+        text = pattern.sub(
+            lambda m: (m.group(1) + "[REDACTED]") if m.lastindex else "[REDACTED]", text,
+        )
+    return text
+
+
+def head_tail(text: str, head: int = HEAD_CHARS, tail: int = TAIL_CHARS) -> str:
+    """First `head` + last `tail` characters — the error is almost always at
+    the end, the context at the start. Short text is returned whole."""
+    text = text.strip()
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]} …[{len(text) - head - tail} chars omitted]… {text[-tail:]}"
+
+
+def classify_failure(stderr: str, stdout: str = "", *, timed_out: bool = False) -> str:
+    """Bucket a failed invocation. Quota/auth are matched on message text
+    because every CLI exits 1 for everything; timeout/parse/not_found come
+    from the caller, who knows what actually happened."""
+    if timed_out:
+        return "timeout"
+    text = f"{stderr or ''}\n{stdout or ''}"
+    if _QUOTA_RE.search(text):
+        return "quota"
+    if _AUTH_RE.search(text):
+        return "auth"
+    return "unknown"
+
+
+def _retry_hint(text: str) -> str | None:
+    match = _RETRY_HINT_RE.search(text or "")
+    return match.group(1).strip() if match else None
+
+
+def _record_failure(category: str, symbol: str, *, exit_code: int | None,
+                    elapsed_s: float, raw: str) -> CliFailure:
+    global last_failure
+    clean = redact_secrets(raw or "")
+    failure = CliFailure(
+        category=category if category in FAILURE_CATEGORIES else "unknown",
+        symbol=symbol,
+        exit_code=exit_code,
+        elapsed_s=round(elapsed_s, 1),
+        detail=head_tail(clean),
+        retry_hint=_retry_hint(clean),
+    )
+    last_failure = failure
+    return failure
+
+
+def _clear_failure() -> None:
+    global last_failure
+    last_failure = None
+
 
 _FIELDS_BLOCK = "\n".join(f'  "{key}": {doc}' for key, doc in FIELD_DOC.items())
 
@@ -243,6 +376,7 @@ def analyze_via_cli(
     if sys.platform == "win32":
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
+    started = time.perf_counter()
     try:
         # DEVNULL stdin is load-bearing for Codex (and harmless for Claude/Kimi):
         # `codex exec` takes the prompt as a positional argument, but 0.153.x
@@ -262,9 +396,13 @@ def analyze_via_cli(
             creationflags=creation_flags,
         )
     except FileNotFoundError:
+        _record_failure("not_found", signal.symbol, exit_code=None, elapsed_s=0.0,
+                        raw=f"Analyst CLI not found at {cli_path}")
         logger.error("Analyst CLI not found at %s", cli_path)
         return None
-    except Exception:
+    except Exception as exc:
+        _record_failure("unknown", signal.symbol, exit_code=None, elapsed_s=0.0,
+                        raw=f"{type(exc).__name__}: {exc}")
         logger.exception("Analyst CLI invocation failed for %s", signal.symbol)
         return None
 
@@ -273,15 +411,29 @@ def analyze_via_cli(
     except subprocess.TimeoutExpired:
         kill_process_tree(proc)
         stdout, stderr = proc.communicate()
+        elapsed = time.perf_counter() - started
+        failure = _record_failure("timeout", signal.symbol, exit_code=proc.returncode,
+                                  elapsed_s=elapsed, raw=stderr or stdout or "")
         logger.error(
-            "Analyst CLI timed out after %ss for %s — process tree killed (partial stderr: %r)",
-            timeout, signal.symbol, (stderr or "")[:300],
+            "Analyst CLI timed out after %ss for %s — process tree killed "
+            "(category=%s, elapsed=%.1fs, stderr head/tail: %s)",
+            timeout, signal.symbol, failure.category, elapsed, failure.detail,
         )
         return None
 
+    elapsed = time.perf_counter() - started
     if proc.returncode != 0:
-        detail = (stderr or stdout or "").strip()[:500]
-        logger.error("Analyst CLI exited %s for %s: %s", proc.returncode, signal.symbol, detail)
+        # Head AND tail of stderr: Codex prints a harmless stdin notice first
+        # and the real error ("You've hit your usage limit ... try again at
+        # ...") last, so a head-only excerpt hid the cause for two days.
+        category = classify_failure(stderr or "", stdout or "")
+        failure = _record_failure(category, signal.symbol, exit_code=proc.returncode,
+                                  elapsed_s=elapsed, raw=(stderr or "") + ("\n" + stdout if stdout else ""))
+        logger.error(
+            "Analyst CLI exited %s for %s (category=%s, elapsed=%.1fs%s): %s",
+            proc.returncode, signal.symbol, category, elapsed,
+            f", {failure.retry_hint}" if failure.retry_hint else "", failure.detail,
+        )
         return None
 
     analyst_output = stdout or ""
@@ -293,8 +445,16 @@ def analyze_via_cli(
                              signal.symbol)
     payload = _extract_payload(analyst_output)
     if payload is None:
-        logger.error("No structured JSON object in analyst CLI output for %s: %r",
-                     signal.symbol, analyst_output.strip()[:500])
+        failure = _record_failure("parse", signal.symbol, exit_code=proc.returncode,
+                                  elapsed_s=elapsed, raw=analyst_output)
+        logger.error("No structured JSON object in analyst CLI output for %s (elapsed=%.1fs): %s",
+                     signal.symbol, elapsed, failure.detail)
         return None
 
-    return parse_verdict(payload, signal.symbol)
+    verdict = parse_verdict(payload, signal.symbol)
+    if verdict is None:
+        _record_failure("parse", signal.symbol, exit_code=proc.returncode,
+                        elapsed_s=elapsed, raw=json.dumps(payload)[:800])
+        return None
+    _clear_failure()
+    return verdict

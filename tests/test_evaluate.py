@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from agentic_trading.journal.evaluate import evaluate_journal, format_report, forward_stats
+from agentic_trading.journal.evaluate import (
+    evaluate_journal,
+    format_report,
+    forward_stats,
+    load_decision_rows,
+)
 from agentic_trading.journal.logger import DecisionRow, connect, record_cycle
 from agentic_trading.llm.schema import news_age_hours
 
@@ -43,7 +48,7 @@ def test_evaluate_journal_writes_outcomes_for_a_buy():
     conn = connect(":memory:")
     asof = df.index[10]
     record_cycle(
-        conn, asof.isoformat(), "backtest", 100_000, 100_000,
+        conn, asof.isoformat(), "paper", 100_000, 100_000,
         [DecisionRow(symbol="AAA", quant_score=0.5, llm_stance="bullish",
                      llm_confidence=0.8, llm_rationale="t", combined_score=0.5,
                      action="buy", reasoning="t", llm_risk_flags="earnings in 3 days")],
@@ -88,7 +93,7 @@ def test_avoid_and_hold_decisions_get_the_same_forward_outcomes():
     asof = up.index[10]
     conn = connect(":memory:")
     record_cycle(
-        conn, asof.isoformat(), "live", 100_000, 100_000,
+        conn, asof.isoformat(), "paper", 100_000, 100_000,
         [
             _decision("ROSE", "avoid"),    # avoided a name that ran: bad avoid
             _decision("FELL", "avoid"),    # avoided a name that fell: good avoid
@@ -156,3 +161,127 @@ def test_format_report_source_buckets():
     # No sources provided -> no breakdown section at all
     plain = format_report(rows)
     assert "source=" not in plain
+
+
+# --- P1-B-1: mode filtering, per-horizon maturity, idempotency, tz boundary ---
+
+def _record(conn, asof_iso, mode, symbol):
+    record_cycle(
+        conn, asof_iso, mode, 100_000, 100_000,
+        [_decision(symbol, "buy")],
+    )
+
+
+def test_load_decision_rows_defaults_to_paper_only():
+    df = _bars(30)
+    conn = connect(":memory:")
+    asof = df.index[10].isoformat()
+    _record(conn, asof, "paper", "PPP")
+    _record(conn, asof, "dry_run", "DRY")
+    _record(conn, asof, "backtest", "BT")
+
+    paper_only = load_decision_rows(conn)
+    assert {r["symbol"] for r in paper_only} == {"PPP"}
+
+    everything = load_decision_rows(conn, mode=None)
+    assert {r["symbol"] for r in everything} == {"PPP", "DRY", "BT"}
+
+    dry_only = load_decision_rows(conn, mode="dry_run")
+    assert {r["symbol"] for r in dry_only} == {"DRY"}
+
+
+def test_evaluate_journal_excludes_dry_run_by_default():
+    df = _bars(30)
+    conn = connect(":memory:")
+    asof = df.index[10].isoformat()
+    _record(conn, asof, "paper", "PPP")
+    _record(conn, asof, "dry_run", "DRY")
+
+    rows = evaluate_journal(conn, bars={"PPP": df, "DRY": df})
+    assert {r.symbol for r in rows} == {"PPP"}
+
+    all_rows = evaluate_journal(conn, bars={"PPP": df, "DRY": df}, mode=None)
+    assert {r.symbol for r in all_rows} == {"PPP", "DRY"}
+
+
+def test_forward_stats_mfe_mae_immature_before_full_20d_window():
+    # Only 8 future sessions available past the decision day — ret_20d can't
+    # exist, and mfe/mae must not silently report the partial 8-day extreme
+    # as if it were the mature 20-day figure.
+    df = _bars(19)
+    stats = forward_stats(df, df.index[10])
+    assert stats["ret_1d"] is not None
+    assert stats["ret_5d"] is not None
+    assert stats["ret_20d"] is None
+    assert stats["mfe_20d"] is None
+    assert stats["mae_20d"] is None
+
+
+def test_forward_stats_mfe_mae_mature_exactly_at_20d_window():
+    df = _bars(31)  # asof at index 10 leaves exactly 20 future sessions
+    stats = forward_stats(df, df.index[10])
+    assert stats["ret_20d"] is not None
+    assert stats["mfe_20d"] is not None
+    assert stats["mae_20d"] is not None
+
+
+def test_format_report_matures_each_horizon_independently():
+    # 6 decisions mature for +1d/+5d (n>=MIN_REPORT_N), only 2 mature for +20d.
+    rows = []
+    for i in range(6):
+        rows.append(_outcome20("buy", ret_1d=0.01, ret_5d=0.02,
+                                ret_20d=(0.03 if i < 2 else None),
+                                mfe_20d=(0.05 if i < 2 else None),
+                                mae_20d=(-0.01 if i < 2 else None)))
+    text = format_report(rows)
+    lines = [l for l in text.splitlines() if l.startswith("all ")]
+    assert len(lines) == 1
+    cells = lines[0].split()
+    # bucket ndec n1d +1d n5d +5d n20d +20d MFE20 MAE20
+    assert cells[0] == "all"
+    assert cells[1] == "6"     # ndec
+    assert cells[2] == "6"     # n1d — matured for all 6
+    assert cells[4] == "6"     # n5d
+    assert cells[6] == "2"     # n20d — only 2 matured
+    assert cells[7] == f"n<5"  # +20d average withheld: 2 < MIN_REPORT_N
+
+
+def _outcome20(action, *, ret_1d, ret_5d, ret_20d, mfe_20d, mae_20d):
+    from agentic_trading.journal.evaluate import OutcomeRow
+    return OutcomeRow(
+        decision_id=1, symbol="AAA", action=action, quant_score=0.2,
+        llm_stance=None, llm_confidence=None, llm_risk_flags=None,
+        asof="2026-01-05", ret_1d=ret_1d, ret_5d=ret_5d, ret_20d=ret_20d,
+        mfe_20d=mfe_20d, mae_20d=mae_20d,
+    )
+
+
+def test_evaluate_journal_is_idempotent_on_rerun():
+    df = _bars(40)
+    conn = connect(":memory:")
+    asof = df.index[10].isoformat()
+    _record(conn, asof, "paper", "AAA")
+
+    first = evaluate_journal(conn, bars={"AAA": df})
+    count_after_first = conn.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0]
+    second = evaluate_journal(conn, bars={"AAA": df})
+    count_after_second = conn.execute("SELECT COUNT(*) FROM signal_outcomes").fetchone()[0]
+
+    assert count_after_first == count_after_second == 1
+    assert [r.ret_1d for r in first] == [r.ret_1d for r in second]
+    assert [r.ret_20d for r in first] == [r.ret_20d for r in second]
+
+
+def test_cycle_asof_uses_et_session_date_not_utc_calendar_date():
+    # A deep cycle stamped 2026-09-17T02:30:00+00:00 UTC is still the ET
+    # evening of 2026-09-16 (22:30 EDT) — a late-running deep cycle like the
+    # documented 09-16 3-hour-delayed run (AGENTS.md F5) must not be filed
+    # under the next UTC calendar day.
+    df = _bars(40, start="2026-08-01")
+    conn = connect(":memory:")
+    late_utc_iso = "2026-09-17T02:30:00+00:00"
+    _record(conn, late_utc_iso, "paper", "AAA")
+
+    rows = evaluate_journal(conn, bars={"AAA": df})
+    assert len(rows) == 1
+    assert rows[0].asof == "2026-09-16"

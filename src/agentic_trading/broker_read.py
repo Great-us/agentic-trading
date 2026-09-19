@@ -53,10 +53,19 @@ class BookBrokerReader:
     """Cached read-only view of one book's Alpaca paper account."""
 
     TTL_SECONDS = 60.0
+    # fills()'s page budget — a hard stop against a paginating endpoint that
+    # never naturally terminates (repeats the same page_token or keeps
+    # returning already-seen ids). See AGENTS.md R4: without this, a broken
+    # feed spun _stamp_cycle_progress's reconciliation forever, before the
+    # cycle lock was ever released.
+    MAX_FILLS_PAGES = 20
 
     def __init__(self, book_root: Path):
         self._book_root = Path(book_root)
         self._cache: dict[str, tuple[float, object]] = {}
+        # Set by fills() on its most recent (non-cached-hit) call: True when
+        # max_records was reached, meaning older fills exist beyond the cap.
+        self.last_fills_truncated: bool = False
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> object:
         key, secret, base = _load_credentials(self._book_root)
@@ -131,7 +140,11 @@ class BookBrokerReader:
 
     def open_stop_orders(self) -> tuple[list[dict] | None, str | None]:
         """Open sell stops — the resting protective orders placed by cycle
-        reconciliation. Used to show each position's live stop distance."""
+        reconciliation. Used to show each position's live stop distance.
+
+        `qty` and `status` are what let a reader judge coverage the way
+        run.py now does (live status AND qty >= position) instead of by
+        symbol presence; `order_id` ties a row back to the broker's order."""
 
         def produce() -> list[dict]:
             raw = self._get("/v2/orders", {"status": "open", "limit": "500"})
@@ -142,7 +155,10 @@ class BookBrokerReader:
                 if o.get("type") == "stop" and o.get("side") == "sell":
                     out.append(
                         {
+                            "order_id": o.get("id"),
                             "symbol": o.get("symbol"),
+                            "qty": float(o.get("qty") or 0.0),
+                            "status": o.get("status"),
                             "stop_price": float(o.get("stop_price") or 0.0),
                             "submitted_at": o.get("submitted_at"),
                         }
@@ -152,23 +168,50 @@ class BookBrokerReader:
         return self._cached("stops", produce)
 
     def fills(self, max_records: int = 1000) -> tuple[list[dict] | None, str | None]:
-        """Fill history, newest first, oldest-last capped at max_records."""
+        """Fill history, newest first, oldest-last capped at max_records.
+
+        Each fill carries the activity's own "id" and its "order_id"; entries
+        are deduped by id across pages. Sets self.last_fills_truncated when
+        the cap was hit before the activity feed ran out — meaning older
+        fills exist beyond what was fetched (see AGENTS.md F6).
+        """
 
         def produce() -> list[dict]:
             out: list[dict] = []
+            seen_ids: set[str] = set()
+            seen_tokens: set[str] = set()
             page_token: str | None = None
-            while len(out) < max_records:
+            truncated = False
+            for _page in range(self.MAX_FILLS_PAGES):
                 params = {"direction": "desc", "page_size": "100"}
                 if page_token:
                     params["page_token"] = page_token
                 raw = self._get("/v2/account/activities/FILL", params)
                 if not isinstance(raw, list):
                     raise BrokerError("unexpected activities payload")
+                if not raw:
+                    # An empty page is the feed's normal "nothing more"
+                    # signal — a fresh account, or the page right after the
+                    # last full one landed exactly on a page boundary. This
+                    # must not be confused with the "non-empty page, zero
+                    # new rows" stuck-loop case below (R4, PROGRESS.md §10):
+                    # treating it as truncation made a clean, complete fetch
+                    # look incomplete and made the downstream reconciliation
+                    # skip the very check it exists to run.
+                    break
+                added = 0
                 for a in raw:
+                    fill_id = a.get("id")
+                    if fill_id is not None:
+                        if fill_id in seen_ids:
+                            continue
+                        seen_ids.add(fill_id)
                     qty = float(a.get("qty") or 0.0)
                     price = float(a.get("price") or 0.0)
                     out.append(
                         {
+                            "id": fill_id,
+                            "order_id": a.get("order_id"),
                             "symbol": a.get("symbol"),
                             "side": a.get("side"),  # "buy" | "sell"
                             "qty": qty,
@@ -178,14 +221,37 @@ class BookBrokerReader:
                             "order_status": a.get("order_status"),
                         }
                     )
-                next_token = None
-                if isinstance(raw, list) and raw:
-                    # The Activities endpoint paginates via the last id when
-                    # using page_token; Alpaca returns up to page_size items.
-                    next_token = raw[-1].get("id")
-                if not raw or not next_token or len(raw) < 100:
+                    added += 1
+                    if len(out) >= max_records:
+                        truncated = True
+                        break
+                if len(out) >= max_records:
                     break
-                page_token = str(next_token)
+                if added == 0:
+                    # Every row on this page was already in `out` — the feed
+                    # is repeating itself rather than advancing. Stop instead
+                    # of re-requesting the same dead page forever.
+                    truncated = True
+                    break
+                # The Activities endpoint paginates via the last id when
+                # using page_token; Alpaca returns up to page_size items.
+                # `raw` is non-empty here (the empty-page check above
+                # already returned), so indexing it is safe.
+                next_token = raw[-1].get("id")
+                if not next_token or len(raw) < 100:
+                    break
+                next_token = str(next_token)
+                if next_token in seen_tokens:
+                    # A page_token we've already used came back — a genuine
+                    # pagination loop, not just repeated ids on one page.
+                    truncated = True
+                    break
+                seen_tokens.add(next_token)
+                page_token = next_token
+            else:
+                # Ran out of page budget before the feed naturally ended.
+                truncated = True
+            self.last_fills_truncated = truncated
             return out[:max_records]
 
         return self._cached("fills", produce)

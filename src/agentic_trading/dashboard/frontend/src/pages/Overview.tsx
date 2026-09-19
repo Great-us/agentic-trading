@@ -22,7 +22,11 @@ export default function Overview({ bookId }: { bookId: string }) {
   const exposure = book && book.equity ? 1 - (book.cash ?? 0) / book.equity : null;
 
   const healthCls = health
-    ? { ok: "ok", weekend: "idle", stale: "bad", missing: "bad", corrupt: "bad" }[health.status] ?? "idle"
+    ? {
+        ok: "ok", weekend: "idle", stale: "bad", missing: "bad", corrupt: "bad",
+        stale_intraday: "bad", after_hours: "idle", closed_or_holiday: "idle",
+        stops_unknown: "bad",
+      }[health.status] ?? "idle"
     : "idle";
 
   return (

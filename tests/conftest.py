@@ -16,6 +16,7 @@ import pytest
 from agentic_trading import heartbeat as heartbeat_mod
 from agentic_trading import live_events as live_events_mod
 from agentic_trading import progress as progress_mod
+from agentic_trading import run as run_mod
 
 
 @pytest.fixture(autouse=True)
@@ -28,3 +29,22 @@ def isolate_heartbeat(tmp_path, monkeypatch):
     monkeypatch.setattr(heartbeat_mod, "HEARTBEAT_PATH", tmp_path / "heartbeat.json")
     monkeypatch.setattr(live_events_mod, "LIVE_EVENTS_PATH", tmp_path / "live_events.jsonl")
     monkeypatch.setattr(progress_mod, "PROGRESS_PATH", tmp_path / "progress.json")
+
+
+class _NoNetworkBrokerReader:
+    """Stand-in for BookBrokerReader so the fills-vs-positions reconciliation
+    added to _stamp_cycle_progress (PROGRESS.md P0-A-3) never reaches the real
+    Alpaca paper API from a test. Any test exercising that reconciliation
+    specifically should monkeypatch agentic_trading.run.BookBrokerReader
+    itself, which simply overrides this fixture's patch."""
+
+    def __init__(self, _book_root):
+        pass
+
+    def fills(self):
+        return None, "network disabled in tests"
+
+
+@pytest.fixture(autouse=True)
+def isolate_broker_reads(monkeypatch):
+    monkeypatch.setattr(run_mod, "BookBrokerReader", _NoNetworkBrokerReader)

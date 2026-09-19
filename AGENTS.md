@@ -28,8 +28,9 @@
    一切波动按噪音处理；旧 12 只书的回测数字不得引用为新书预期。
 4. `backtest/factor_ic.py` / `backtest/overfit.py` 是纯测量工具，
    `run.py`/`decision/`/`risk/` 不得 import 它们。
-5. 改共享文件后：同步 P2 → `check_p2_sync.py` exit 0 → 两盘测试全绿
-   （当前基线 P1 424 / P2 405）。
+5. 改共享文件后：同步 P2/P3/P4（只 cp，兄弟盘永远不跑 git checkout/reset/stash）→
+   `check_p2_sync.py` exit 0 → 四盘测试全绿（2026-09-18 基线 P1 678 / P2 581+1 skip /
+   P3 850 / P4 814；旧的 424/405 已过期）。
 6. 测试/回测不得污染 live 状态：`run_cycle(asof=...)` 不得写 heartbeat/journal
    到真实路径（2026-08-27 已修 heartbeat 一处，守住）。
 7. 改 markdown 表格后自检列数与表头对齐；新测量工具上线后必须把输出复跑
@@ -280,6 +281,18 @@
   ② **LLM 故障根因是 Codex 用量额度耗尽（至 09-20 16:00 ET），不是 stdin**——日志截前 500 字
   把真实错误藏住了；③ `round_trips.py` 已平仓 avg_entry=0 用真实数据复现。测试基线 **P1 462**
   全绿（424 已过期），四盘 sync exit 0。零代码改动。工作包与员工任务书见 `PROGRESS.md` §3/§5。
+
+- 2026-09-18（Claude 领导 + 员工 A/B/C + ChatGPT 6 Pro 复审）：**P0 五包 + P1-B 六包完成并经六轮
+  C2C 复审 APPROVED**（`PROGRESS.md` §9–§13）。关键机制变化：① 成交核算 `round_trips.py`
+  已平仓均价修复、孤儿/超卖/同时间戳歧义标记；② `broker_read.fills()` 带 id、去重、分页三层
+  防死循环、截断标记；③ 账实对账进日报与 progress（VEEV 类差异、`position_undetermined`、
+  `positions_unavailable`）；④ 止损保护链按券商回查状态 + 数量判定，filled 后刷新持仓且不重复
+  卖出，未核验快照不写成已核验；⑤ 心跳 `stop_check` 与存活戳分离、旧格式迁移、
+  `late_minutes`/`missed_slots`、LLM 熔断 `--check` exit 1；⑥ CLI 故障分类（quota/auth/timeout/
+  parse）——**09-16 起的 LLM 故障根因是 Codex 额度耗尽，不是 stdin**；⑦ evaluate 默认 paper、
+  per-horizon 成熟计数；⑧ `book_health` 区分 stale_intraday / after_hours / weekend /
+  closed_or_holiday；⑨ 只读诊断 `journal/p1_diagnostics.py`。**VEEV 持仓 09-16 夜间从 P1 券商
+  账户消失**（无成交无现金变动，P2 的 VEEV 仍在），已向 Alpaca 申诉。冻结区零改动。
 
 ## 运维速查
 

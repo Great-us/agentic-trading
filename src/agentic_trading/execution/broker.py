@@ -37,10 +37,34 @@ class OrderResult:
     order_id: str | None
 
 
+# Alpaca order statuses that mean "this order is resting and will trigger".
+# Anything else on a protective stop — rejected / expired / canceled, or the
+# transitional pending_cancel / pending_replace — is not protection. VEEV
+# (2026-09-16 19:19 → 09-17 04:00 ET): the stop was `accepted` at submit,
+# logged as "placed", and flipped to `rejected` in the overnight queue while
+# the log and heartbeat kept saying the position was covered.
+RESTING_STOP_STATUSES = frozenset({
+    "new", "accepted", "held", "partially_filled", "pending_new", "accepted_for_bidding",
+})
+DEAD_ORDER_STATUSES = frozenset({
+    "rejected", "expired", "canceled", "cancelled", "replaced", "stopped", "suspended", "done_for_day",
+})
+
+
 def _enum_str(value) -> str:
     """Alpaca returns enums whose str() is 'OrderStatus.ACCEPTED'; the bare
     value ('accepted') is what belongs in logs and the journal."""
     return str(getattr(value, "value", value))
+
+
+def stop_is_resting(status: str | None) -> bool:
+    """Whether an order status counts as live protection.
+
+    None means the adapter did not report a status (older Broker implementations
+    and test fakes). Alpaca's open-orders query only returns live orders, so a
+    missing status on one of them is treated as resting rather than unknown —
+    the alternative would cancel/replace every adequate stop each cycle."""
+    return status is None or str(status).lower() in RESTING_STOP_STATUSES
 
 
 def _is_not_found(exc: Exception) -> bool:
@@ -83,6 +107,7 @@ class OpenOrder:
     order_type: str
     qty: float
     stop_price: float | None
+    status: str | None = None  # bare Alpaca status ('accepted', 'held', ...) when known
 
 
 class Broker(Protocol):
@@ -207,6 +232,7 @@ class AlpacaBroker:
                 order_type=_enum_str(o.type),
                 qty=float(o.qty) if o.qty else 0.0,
                 stop_price=float(o.stop_price) if o.stop_price else None,
+                status=_enum_str(o.status) if getattr(o, "status", None) is not None else None,
             )
             for o in orders
         ]
@@ -234,8 +260,48 @@ class AlpacaBroker:
         except Exception:
             logger.exception("Protective stop rejected for %s (qty=%s, stop=%.2f)", symbol, qty, stop_price)
             return None
-        logger.info("Protective stop placed: %s x%s @ %.2f (id=%s)", symbol, qty, stop_price, order.id)
-        return OrderResult(symbol=symbol, side="sell", qty=qty, status=_enum_str(order.status), order_id=str(order.id))
+        # "Submitted" is not "resting". Alpaca acknowledges with `accepted`
+        # and can still reject a moment later (wash-trade rule, buying-power,
+        # queue processing), so re-read the order once before claiming the
+        # position is protected. A failed re-read falls back to the submit
+        # response — that is what we had before, not a reason to give up.
+        status = _enum_str(order.status)
+        try:
+            refreshed = self._client.get_order_by_id(order.id)
+            status = _enum_str(refreshed.status)
+        except Exception:
+            logger.warning("Could not re-read protective stop %s for %s after submit; "
+                           "trusting the submit response (%s).", order.id, symbol, status, exc_info=True)
+        # Three outcomes, and the caller decides on `status`, not on None-ness:
+        #   DEAD (rejected/expired/...)   -> None: nothing rests, caller may re-place.
+        #   resting (stop_is_resting)     -> OrderResult: the position is covered.
+        #   anything else                 -> OrderResult with that status, and the
+        #       caller must NOT count it as covered nor place a second order:
+        #       `filled` means the stop fired instantly and the shares are being
+        #       sold; pending_cancel / pending_replace / an unknown value means
+        #       the broker has not settled what this order is yet.
+        if status.lower() in DEAD_ORDER_STATUSES:
+            logger.warning(
+                "Protective stop for %s x%s @ %.2f was NOT accepted: status=%s (id=%s) — "
+                "the position is not protected by this order.",
+                symbol, qty, stop_price, status, order.id,
+            )
+            return None
+        if stop_is_resting(status):
+            logger.info("Protective stop placed: %s x%s @ %.2f (id=%s, status=%s)", symbol, qty, stop_price, order.id, status)
+        elif status.lower() == "filled":
+            logger.warning(
+                "Protective stop for %s x%s @ %.2f FILLED on submit (id=%s) — the position is "
+                "being sold at the stop, not protected by a resting order.",
+                symbol, qty, stop_price, order.id,
+            )
+        else:
+            logger.warning(
+                "Protective stop for %s x%s @ %.2f is in an undetermined state after submit: "
+                "status=%s (id=%s) — not counted as protection until the next reconciliation.",
+                symbol, qty, stop_price, status, order.id,
+            )
+        return OrderResult(symbol=symbol, side="sell", qty=qty, status=status, order_id=str(order.id))
 
     def cancel_order(self, order_id: str) -> bool:
         try:

@@ -19,12 +19,15 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from .broker_read import BookBrokerReader, BrokerError
 from .cycle_lock import DEEP_LOCK_WAIT_SECONDS, CycleLock
 from .config import Settings, load_settings
 from .data.feed import DataFeed, YFinanceFeed
 from .data.market_data import average_dollar_volume, fetch_last_price
 from .decision.engine import Action, Decision, decide
-from .execution.broker import AlpacaBroker, Broker, DryRunBroker, OrderIdMinter, Position
+from .execution.broker import (
+    AlpacaBroker, Broker, DryRunBroker, OrderIdMinter, Position, stop_is_resting,
+)
 from .heartbeat import _notify_toast, write_heartbeat
 from .live_events import emit as _emit_live_event
 from .journal.logger import (
@@ -42,6 +45,7 @@ from .risk.manager import (
     sector_invested, sector_of, sector_room_dollars, size_position,
     stop_distance_pct, theme_room_dollars,
 )
+from .round_trips import reconcile_positions, round_trips
 from .signals.macro import MacroRegime, assess_regime
 from .signals.technical import QuantSignal, compute_signal
 
@@ -66,12 +70,93 @@ CLEAN_SPLIT_FACTORS = (2.0, 3.0, 4.0, 5.0, 10.0)
 # the buy is still settling, and by the time the retry runs it usually isn't.
 STOP_REJECTION_RETRY_SECONDS = 20.0
 
+# What the heartbeat / progress card say when the end-of-cycle stop
+# reconciliation could not read open orders. Coverage is then UNKNOWN — not
+# "all covered" (the previous stamp) and not "none held" — and both readers
+# treat it as an alert until a later cycle verifies again.
+STOP_COVERAGE_UNKNOWN_REASON = "open orders unreadable — protective-stop coverage not verified this cycle"
+
 # Same-cycle analyst circuit: after this many consecutive CLI/API failures
 # (None from analyze()), skip remaining LLM calls this cycle. Exits, stops,
 # and fail-closed WAIT on new entries are unchanged. Stops a 14 × timeout
 # hang from blowing the 30-minute Task Scheduler limit and holding cycle.lock
 # (2026-09-04 09:45: Codex stdin wait, journal never written, next cycle 12:15).
 LLM_FAIL_FAST_STREAK = 3
+
+
+def _analyst_failure(settings: Settings) -> dict | None:
+    """Why the last analyze() returned None, as far as the provider can tell.
+
+    The CLI provider classifies its failures (quota / auth / timeout / parse /
+    not_found / unknown) and keeps the last one on its module; the API provider
+    does not, so its failures stay uncategorised. Never raises."""
+    try:
+        if settings.analyst_provider != "cli":
+            return {"category": "unknown", "detail": "api provider returned no verdict"}
+        from .llm import cli_provider
+
+        failure = cli_provider.last_failure
+        if failure is None:
+            return None
+        return {
+            "category": failure.category,
+            "detail": failure.summary(),
+            "retry_hint": failure.retry_hint,
+            "exit_code": failure.exit_code,
+            "elapsed_s": failure.elapsed_s,
+        }
+    except Exception:
+        return None
+
+
+class _LlmStatus:
+    """Per-cycle summary of the analyst layer for the heartbeat / progress card.
+
+    States: `off` (skip_llm, analyst not configured, or — the common fast-scan
+    case — no symbol escalated so the analyst was never asked), `ok`,
+    `degraded` (some failures, circuit still closed), `circuit_open`
+    (LLM_FAIL_FAST_STREAK hit — every later entry this cycle fail-closed to
+    WAIT). `category` / `detail` carry the provider's classification of the
+    LAST failure so "quant-only since Tuesday" comes with "quota — try again
+    at Sep 20th 4:00 PM" attached. A cycle with zero calls must not say `ok`:
+    that word means the analyst answered, not that it was never consulted."""
+
+    def __init__(self, *, use_llm: bool, reason: str | None = None,
+                 fast_mode: bool = False) -> None:
+        self.use_llm = use_llm
+        self.reason = reason
+        self.fast_mode = fast_mode
+        self.calls = 0
+        self.failures = 0
+        self.circuit_open = False
+        self.last: dict | None = None
+
+    def record(self, verdict, settings: Settings) -> None:
+        self.calls += 1
+        if verdict is None:
+            self.failures += 1
+            self.last = _analyst_failure(settings) or self.last
+
+    def as_dict(self) -> dict:
+        if not self.use_llm:
+            return {"state": "off", "reason": self.reason or "quant-only"}
+        if self.calls == 0:
+            reason = ("fast tier: no symbol escalated to the analyst this scan"
+                      if self.fast_mode else "no analyst call this cycle")
+            return {"state": "off", "reason": reason, "calls": 0}
+        if self.circuit_open:
+            state = "circuit_open"
+        elif self.failures:
+            state = "degraded"
+        else:
+            state = "ok"
+        out: dict = {"state": state, "calls": self.calls, "failures": self.failures}
+        if self.last:
+            out["category"] = self.last.get("category")
+            out["detail"] = self.last.get("detail")
+            if self.last.get("retry_hint"):
+                out["retry_hint"] = self.last["retry_hint"]
+        return out
 
 
 def _detect_and_reset_splits(conn, peaks, positions, log, cycle_timestamp: str) -> None:
@@ -142,10 +227,38 @@ def _release_shares_for_sale(broker, symbol: str, log) -> None:
         log.exception("%s: could not clear resting orders; the sell may be rejected.", symbol)
 
 
+def _stop_covers(order, position) -> bool:
+    """A resting sell-stop is protection only if the broker still reports it
+    live (see broker.stop_is_resting) AND it covers the whole position. A
+    stop sized for an earlier, smaller lot leaves the top-up naked; a
+    `rejected`/`expired` order left in the open-orders view covers nothing."""
+    if order is None:
+        return False
+    if not stop_is_resting(getattr(order, "status", None)):
+        return False
+    order_qty = float(getattr(order, "qty", 0.0) or 0.0)
+    return order_qty + 1e-6 >= float(position.qty)
+
+
+def _stop_shortfall(order, position) -> str:
+    """Why `_stop_covers` said no, for the log line."""
+    status = getattr(order, "status", None)
+    if not stop_is_resting(status):
+        return f"status={status}"
+    return f"qty {float(getattr(order, 'qty', 0.0) or 0.0):g} < position {float(position.qty):g}"
+
+
 def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, live: bool = False,
-                                ids: OrderIdMinter | None = None) -> tuple[int, int] | None:
+                                ids: OrderIdMinter | None = None,
+                                refreshed: dict | None = None) -> tuple[int, int] | None:
     """Make sure every open position is sitting behind a broker-side stop at the
     right level, and that the level ratchets up as a position runs.
+
+    `refreshed`, when a dict is passed, is filled in only if a stop FILLED on
+    submit and the book was therefore re-read: `attempted` (bool), `ok` (the
+    re-read succeeded), `positions` (the refreshed dict, or None) and `filled`
+    (the symbols whose stop executed — sold, whatever the re-read said). The
+    return shape stays (covered, total) | None for every existing reader.
 
     This is what closes the gap between cycles: the client-side exit check only
     looks twice a day, so without a resting order a position is unprotected for
@@ -154,8 +267,16 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
 
     Returns (covered, total) positions, or None when open orders were unreadable
     and coverage is therefore unknown. The caller stamps this into the heartbeat
-    so `heartbeat --check` can alert on a naked position; every branch below that
-    leaves one uncovered also logs, but nothing was watching those logs.
+    so `heartbeat --check` can alert on a naked position — and, for None, writes
+    `stops_unknown` so the watchdog alerts on "unverified" instead of inheriting
+    the previous cycle's coverage. Every branch below that leaves a position
+    uncovered also logs, but nothing was watching those logs.
+
+    "Covered" means a sell-stop the broker reports as live (new / accepted /
+    held / partially_filled, see broker.RESTING_STOP_STATUSES) whose qty is at
+    least the position's. Symbol presence alone is not coverage: the VEEV stop
+    of 2026-09-16 was `accepted` at submit and `rejected` by 04:00 ET while the
+    heartbeat kept reporting 5/5.
     """
     ids = ids or OrderIdMinter(datetime.now(timezone.utc).isoformat())
     try:
@@ -166,13 +287,18 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
 
     existing = {o.symbol: o for o in open_orders if o.side == "sell" and o.order_type == "stop"}
     covered: set[str] = set()
+    filled: set[str] = set()  # stops that executed on submit — those positions are being sold
 
     for symbol, position in positions.items():
         atr = atrs.get(symbol)
+        current = existing.get(symbol)
         if atr is None:
             log.warning("No ATR for %s; leaving its protective stop untouched.", symbol)
-            if symbol in existing:
+            if _stop_covers(current, position):
                 covered.add(symbol)
+            elif current is not None:
+                log.error("%s: resting stop is not live protection (%s) and no ATR to size a "
+                          "replacement — position counts as uncovered.", symbol, _stop_shortfall(current, position))
             continue
 
         wanted = protective_stop_price(
@@ -180,7 +306,6 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
             high_water_mark=peaks.get(symbol, position.avg_entry_price),
             atr14=atr, risk=risk,
         )
-        current = existing.get(symbol)
         market = getattr(position, "current_price", 0.0) or 0.0
         if market > 0 and wanted >= market:
             # A stop at/above the market is rejected by the broker outright.
@@ -196,7 +321,7 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
             # long as the bad data persists, which is why the two cases are not
             # logged at the same level. `heartbeat --check` asserts coverage
             # independently.
-            if current is not None:
+            if _stop_covers(current, position):
                 covered.add(symbol)
                 log.warning(
                     "%s: computed protective stop %.2f is not below the market (%.2f) — "
@@ -206,35 +331,58 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
             else:
                 log.error(
                     "%s: NO PROTECTIVE STOP IN PLACE — computed stop %.2f is not below the "
-                    "market (%.2f) and nothing is resting; position_peaks or the quote looks "
+                    "market (%.2f) and %s; position_peaks or the quote looks "
                     "wrong. Relying on the client-side check until this clears.",
                     symbol, wanted, market,
+                    "nothing is resting" if current is None
+                    else f"the resting order is not protection ({_stop_shortfall(current, position)})",
                 )
             continue
 
         # Only replace when the level actually moves up — cancel/replace churn
         # briefly leaves the position naked, so it should not happen for noise.
+        # "Adequate" is more than the price: the order must be live at the
+        # broker and cover the whole position. VEEV's overnight `rejected`
+        # stop and a stop sized for a smaller lot both used to pass here on
+        # symbol presence alone.
+        level = wanted
         if current is not None:
-            if current.stop_price is not None and wanted <= current.stop_price + 0.01:
+            live_and_whole = _stop_covers(current, position)
+            price_ok = current.stop_price is not None and wanted <= current.stop_price + 0.01
+            if live_and_whole and price_ok:
                 covered.add(symbol)
                 continue
+            if not live_and_whole:
+                log.warning("%s: resting stop @ %.2f is not full protection (%s) — replacing.",
+                            symbol, current.stop_price or 0.0, _stop_shortfall(current, position))
             if not broker.cancel_order(current.order_id):
-                # The old stop is still resting, so the position stays covered.
+                # The old stop is still resting: covered only if it was live
+                # and whole in the first place (merely at a lower level).
                 log.error("%s: could not cancel stale stop; not placing a replacement.", symbol)
-                covered.add(symbol)
+                if live_and_whole:
+                    covered.add(symbol)
                 continue
-            log.info("%s: raising protective stop %.2f -> %.2f", symbol, current.stop_price or 0.0, wanted)
+            if price_ok:
+                # Replacing for size/status, not level: never hand back a
+                # ratchet the old order had already earned (unless that level
+                # is no longer below the market, where it would be rejected).
+                if current.stop_price > wanted and not (market > 0 and current.stop_price >= market):
+                    level = current.stop_price
+                log.info("%s: re-placing protective stop at %.2f for the full %s shares",
+                         symbol, level, position.qty)
+            else:
+                log.info("%s: raising protective stop %.2f -> %.2f", symbol, current.stop_price or 0.0, wanted)
             if live:
                 time.sleep(0.35)
 
         stop_id = ids.mint("stop", symbol)
-        result = broker.submit_stop_sell(symbol, position.qty, wanted, client_order_id=stop_id)
+        result = broker.submit_stop_sell(symbol, position.qty, level, client_order_id=stop_id)
         if result is None and live:
             time.sleep(0.35)
             # Deliberately the SAME id: if the first submit actually reached
             # Alpaca despite the failure, this retry is rejected as a duplicate
             # instead of doubling the protection.
-            result = broker.submit_stop_sell(symbol, position.qty, wanted, client_order_id=stop_id)
+            result = broker.submit_stop_sell(symbol, position.qty, level, client_order_id=stop_id)
         if result is None and live:
             # An explicit rejection — the wash-trade rule when the stop lands
             # while the entry buy is still settling, or an id burned by a
@@ -243,14 +391,61 @@ def _reconcile_protective_stops(broker, positions, peaks, atrs, risk, log, *, li
             # giving up until the next cycle's reconciliation.
             time.sleep(STOP_REJECTION_RETRY_SECONDS)
             result = broker.submit_stop_sell(
-                symbol, position.qty, wanted, client_order_id=ids.mint("stop", symbol),
+                symbol, position.qty, level, client_order_id=ids.mint("stop", symbol),
             )
         if result is None:
             log.error("%s: NO PROTECTIVE STOP IN PLACE — relying on the twice-daily client-side check.", symbol)
-        else:
+            continue
+        # The submit answered — but "answered" is not "resting". Same rule as
+        # for orders read back from the book: only a status in
+        # RESTING_STOP_STATUSES counts. Neither of the other two outcomes gets
+        # a second order: a second sell against a position whose stop just
+        # filled would sell shares we no longer hold (or short the account),
+        # and a second order next to one the broker has not settled yet would
+        # double the protection into a double sale.
+        status = getattr(result, "status", None)
+        if stop_is_resting(status):
             covered.add(symbol)
+        elif str(status).lower() == "filled":
+            filled.add(symbol)
+            log.warning(
+                "%s: protective stop %s FILLED on submit — the position is being sold at %.2f; "
+                "not counted as covered and no further sell is placed this cycle.",
+                symbol, result.order_id, level,
+            )
+        else:
+            log.warning(
+                "%s: protective stop %s is in an undetermined state (%s) — not counted as covered; "
+                "left for the next reconciliation rather than doubled with a fresh order.",
+                symbol, result.order_id, status,
+            )
 
-    return len(covered), len(positions)
+    total = len(positions)
+    if filled:
+        # A stop that filled on submit means that position is gone (or shrunk);
+        # counting it as an uncovered position would page the operator about a
+        # holding that no longer exists. Re-read the book so `total` reflects
+        # what is actually still held — the WHOLE refreshed book, including a
+        # symbol that appeared during the loop (a late buy fill), which is a
+        # real, uncovered holding. The refreshed dict goes back to the caller
+        # through `refreshed` so the heartbeat and progress card describe the
+        # book as it is now, not the pre-fill snapshot (review round 2, R1).
+        # If the re-read fails, keep the conservative count and say so.
+        try:
+            held_positions = broker.get_positions()
+        except Exception:
+            log.exception("Could not re-read positions after a stop filled on submit; "
+                          "coverage counts the sold position as uncovered until the next cycle.")
+            if refreshed is not None:
+                refreshed.update(attempted=True, ok=False, positions=None, filled=set(filled))
+        else:
+            total = len(held_positions)
+            covered &= set(held_positions)
+            if refreshed is not None:
+                refreshed.update(attempted=True, ok=True, positions=dict(held_positions),
+                                 filled=set(filled))
+
+    return len(covered), total
 
 
 def _journal_safe(log, fn, *args, **kwargs) -> bool:
@@ -279,6 +474,71 @@ def _emit_live(asof, stage: str, **fields) -> None:
         )
 
 
+def _fills_reconciliation_unresolved(positions) -> list[dict]:
+    """fills 派生的未平仓持仓 vs 券商 positions 差异（见 AGENTS.md F1 的 VEEV 案例）。
+
+    Observation only — never touches decisions or orders. GET-only broker
+    read (module-level BookBrokerReader import so tests can monkeypatch it
+    without hitting the real paper API); any failure (missing credentials,
+    network, rate limit) is logged and swallowed so a reconciliation hiccup
+    can never stall a cycle.
+
+    `positions is None` means this cycle never got a broker positions
+    snapshot at all (yielded to the deep cycle, lost the cycle lock, or
+    raised before reading positions) — that is NOT the same as a real empty
+    book (`{}`), so it must not be treated as "no positions" and compared
+    against fills, which would report every real open lot as vanished (the
+    ChatGPT review's R3, a P0-A-3 gap). Only `is None` counts; a falsy-but-
+    real `{}` still goes through the full reconciliation below.
+    """
+    if positions is None:
+        return [{
+            "kind": "positions_unavailable",
+            "detail": "本轮未取得券商持仓快照，跳过账实对账（不代表持仓与 fills 一致）",
+        }]
+    log = logging.getLogger("run_cycle")
+    try:
+        reader = BookBrokerReader(ROOT)
+        try:
+            fills, _reason = reader.fills()
+        except BrokerError as exc:
+            # Routine on a book with no engine-visible Alpaca creds (P4) —
+            # would otherwise log a full traceback every single cycle.
+            log.warning("fills reconciliation skipped: %s", exc)
+            return []
+        if fills is None:
+            return []
+        if reader.last_fills_truncated:
+            # The fills window may be missing the opening buy for an open
+            # lot, which would make a real position look "missing from
+            # fills" — a false alarm. Say the comparison is incomplete
+            # instead of listing (possibly wrong) per-symbol diffs.
+            return [{
+                "kind": "fills_truncated",
+                "detail": "成交历史触到读取上限，账实对账不完整——未列出逐 symbol 差异",
+            }]
+        broker_positions = [
+            {"symbol": sym, "qty": getattr(pos, "qty", None)}
+            for sym, pos in positions.items()
+        ]
+        diffs = reconcile_positions(round_trips(fills), broker_positions)
+        # An `undetermined` entry (R5: an order-ambiguous same-timestamp
+        # fill group touched this symbol) is not a confirmed mismatch —
+        # give it its own kind so a reader (or the dashboard) can't read it
+        # as "we found a difference" when the true answer is "we couldn't
+        # verify this one".
+        return [
+            {
+                "kind": "position_undetermined" if d.get("undetermined") else "position_mismatch",
+                "detail": d["detail"],
+            }
+            for d in diffs
+        ]
+    except Exception:
+        log.exception("fills reconciliation failed — continuing without it.")
+        return []
+
+
 def _stamp_cycle_progress(
     *,
     asof,
@@ -289,13 +549,28 @@ def _stamp_cycle_progress(
     rows: list | None = None,
     orders_this_cycle: int = 0,
     stop_coverage: tuple[int, int] | None = None,
+    stop_coverage_unknown: str | None = None,
     status: str = "ok",
     did: list[str] | None = None,
     did_not: list[str] | None = None,
     unresolved: list | None = None,
     skipped: str | None = None,
+    llm_status: dict | None = None,
+    dry_run: bool = False,
+    positions_unverified: tuple[str, int] | None = None,
 ) -> None:
-    """Live wakeups only — same gate as write_heartbeat. Never raises."""
+    """Live wakeups only — same gate as write_heartbeat. Never raises.
+
+    `stop_coverage` is (covered, total) from the end-of-cycle reconciliation;
+    `stop_coverage_unknown` is the reason it could not run (open orders
+    unreadable). Neither set = no reconciliation happened (skipped scan).
+
+    `positions_unverified` = (reason, last_known_count) when the cycle's
+    positions dict is NOT a verified broker read (a stop filled and the
+    re-read failed, review round 4 R1). The caller passes `positions=None`
+    alongside it so the fills comparison takes its unavailable branch; the
+    card then reports the broker block as degraded with the last known count
+    in the reason, and the round as incomplete."""
     if asof is not None:
         return
     from .progress import emit_progress, infer_book_id
@@ -305,6 +580,16 @@ def _stamp_cycle_progress(
     unresolved = list(unresolved or [])
     if skipped:
         did_not.append(skipped)
+    if llm_status and llm_status.get("state") == "circuit_open":
+        # The per-row "llm_fail_closed" entries below say WHICH names were
+        # held back; this one says WHY the analyst was down (quota/auth/...)
+        # and, when the CLI said so, when it comes back.
+        why = llm_status.get("category") or "unknown"
+        detail = llm_status.get("detail") or ""
+        unresolved.append({
+            "kind": "llm_unavailable",
+            "detail": f"LLM 不可用：{why}" + (f" — {detail}" if detail else ""),
+        })
     if orders_this_cycle:
         did.append(f"{orders_this_cycle} orders placed")
     elif not did and not skipped:
@@ -316,6 +601,19 @@ def _stamp_cycle_progress(
         reasoning = getattr(row, "reasoning", None) or ""
         if "fail closed" in reasoning.lower() or "LLM failed" in reasoning:
             unresolved.append({"kind": "llm_fail_closed", "detail": getattr(row, "symbol", "")})
+    if positions_unverified is not None:
+        why, last_known = positions_unverified
+        unresolved.append({
+            "kind": "positions_unverified",
+            "detail": f"{why} (last known snapshot: {int(last_known)} positions)",
+        })
+        if status == "ok":
+            status = "incomplete"
+    if not dry_run:
+        # DryRunBroker.get_positions() is always {}, so under --dry-run every
+        # real broker fill would look like a vanished position (false VEEV-
+        # style alarms written into the real progress.json).
+        unresolved += _fills_reconciliation_unresolved(positions)
     equity = float(getattr(account, "equity", 0) or 0) if account is not None else None
     cash = float(getattr(account, "cash", 0) or 0) if account is not None else None
     exposure = None
@@ -331,6 +629,18 @@ def _stamp_cycle_progress(
             })
             if status == "ok":
                 status = "incomplete"
+    elif stop_coverage_unknown is not None:
+        # The reconciliation could not read the book: coverage is unknown,
+        # which is a different (and worse) fact than "all covered" — the card
+        # must not read as a clean cycle (ChatGPT review R2).
+        total = None if positions is None else len(positions)
+        unresolved.append({
+            "kind": "stop_coverage_unknown",
+            "detail": f"{stop_coverage_unknown} "
+                      + ("(positions held: unknown)" if total is None else f"({total} positions held)"),
+        })
+        if status == "ok":
+            status = "incomplete"
     locks = []
     for item in unresolved:
         kind = item.get("kind") if isinstance(item, dict) else None
@@ -347,8 +657,11 @@ def _stamp_cycle_progress(
         broker={
             "equity": equity,
             "cash": cash,
-            "n_positions": len(positions or {}),
-            "degraded": account is None,
+            "n_positions": (positions_unverified[1] if positions_unverified is not None
+                            else len(positions or {})),
+            "degraded": account is None or positions_unverified is not None,
+            "reason": (f"positions unverified — last known snapshot: {positions_unverified[1]} positions; "
+                       f"{positions_unverified[0]}") if positions_unverified is not None else None,
         },
         risk={
             "exposure_pct": exposure,
@@ -371,8 +684,15 @@ def _restore_protective_stop(broker, log, *, symbol: str, qty: float,
     wanted = protective_stop_price(
         entry_price=entry_price, high_water_mark=peak, atr14=atr14, risk=risk,
     )
-    if broker.submit_stop_sell(symbol, qty, wanted, client_order_id=ids.mint("stop", symbol)) is not None:
+    result = broker.submit_stop_sell(symbol, qty, wanted, client_order_id=ids.mint("stop", symbol))
+    if result is not None and stop_is_resting(getattr(result, "status", None)):
         log.info("%s: restored a protective stop at %.2f after the failed sell.", symbol, wanted)
+    elif result is not None:
+        # Same three-way rule as the reconciliation: an order that filled or
+        # sits in an unsettled state is not a restored stop, and must not be
+        # followed by another sell order here.
+        log.warning("%s: restore attempt returned status=%s — not treating the position as "
+                    "covered; the end-of-cycle reconciliation decides.", symbol, result.status)
 
 
 def _submit_protected_sell(broker, log, *, symbol: str, qty: float, purpose: str,
@@ -996,7 +1316,8 @@ def run_cycle(
     settings = settings or load_settings()
     cycle_symbols = list(dict.fromkeys(scan_symbols if scan_symbols is not None else settings.watchlist))
     compute = signal_model or compute_signal
-    cycle_timestamp = datetime.now(timezone.utc).isoformat()
+    cycle_started_at = datetime.now(timezone.utc)
+    cycle_timestamp = cycle_started_at.isoformat()
     ids = OrderIdMinter(cycle_timestamp)
     live_session = asof is None
     owns_conn = conn is None
@@ -1059,9 +1380,21 @@ def run_cycle(
             log.info("Analyst backend: api (model=%s)", settings.analyst_model)
     else:
         log.warning("Running quant-only — %s", "skipped via --skip-llm" if skip_llm else analyst_problem)
+    llm_status = _LlmStatus(
+        use_llm=use_llm,
+        reason=None if use_llm else ("skipped via --skip-llm" if skip_llm else analyst_problem),
+        fast_mode=fast_mode,
+    )
 
     account = broker.get_account()
     positions = broker.get_positions()
+    # How many positions the broker reported the last time a FULL read
+    # succeeded. Updated only by successful reads (here, the opening refresh,
+    # the end-of-cycle re-read, the post-fill refresh) — never by the
+    # execution-side filtering that drops a symbol whose stop just filled.
+    # It is what "last known snapshot" means when the current snapshot is
+    # unverified (review round 5, R1).
+    last_verified_position_count = len(positions)
     market_open = broker.is_market_open()
     log.info(
         "Account: equity=$%.2f cash=$%.2f open_positions=%d market_open=%s",
@@ -1085,10 +1418,11 @@ def run_cycle(
               skip_llm=skip_llm, dry_run=use_dry_run, skipped="market_closed")
         _live("cycle_end", skipped="market_closed", n_evaluated=0, n_orders=0)
         if asof is None:
-            write_heartbeat(conn, "fast")
+            write_heartbeat(conn, "fast", started_at=cycle_started_at)
         _stamp_cycle_progress(
             asof=asof, fast_mode=True, cycle_no=cycle_no, account=account,
             positions=positions, status="no_trade", skipped="market closed",
+            dry_run=use_dry_run,
         )
         return
 
@@ -1159,8 +1493,46 @@ def run_cycle(
     # bounds that window to one cycle start instead of one full cycle; it runs
     # again at the end once today's fills are visible.
     _fill_holding_atrs(positions, atrs, feed, asof, signal_weights)
+    start_refresh: dict = {}
     _reconcile_protective_stops(broker, positions, peaks, atrs, settings.risk, log,
-                                live=live_session, ids=ids)
+                                live=live_session, ids=ids, refreshed=start_refresh)
+    # An opening stop that FILLED on submit has already sold that position.
+    # Everything below that decides or sizes a sell reads `positions`, so the
+    # snapshot must be replaced with the re-read book NOW — otherwise the
+    # falling tape that tripped the stop also produces a signal/forced SELL
+    # for the same symbol and _submit_protected_sell() sells the old share
+    # count a second time (review round 3, R1). Whatever the re-read said,
+    # the filled symbols are frozen: no sell path may act on their stale
+    # entry this cycle. A failed re-read keeps the old snapshot for
+    # everything else and records the uncertainty.
+    stop_sold: set[str] = set(start_refresh.get("filled") or ())
+    # Two different facts travel separately from here on (review round 4, R1):
+    #   `positions`          — what execution may act on (filled symbols removed);
+    #   `snapshot_unverified` — why that dict is NOT a verified broker read, or
+    #                           None when it is. A dict built to exclude order
+    #                           targets is not evidence of a verified (empty)
+    #                           book, and must never be written to the
+    #                           heartbeat / progress card as one.
+    snapshot_unverified: str | None = None
+    if start_refresh.get("attempted"):
+        if start_refresh.get("ok"):
+            positions = start_refresh["positions"]
+            last_verified_position_count = len(positions)
+            invested_value = sum(p.market_value for p in positions.values())
+            open_position_count = len(positions)
+            log.warning("Opening protective stop filled for %s — working from the re-read book "
+                        "(%d positions) for the rest of this cycle.",
+                        ", ".join(sorted(stop_sold)), len(positions))
+        else:
+            positions = {s: p for s, p in positions.items() if s not in stop_sold}
+            snapshot_unverified = (
+                f"opening protective stop filled for {', '.join(sorted(stop_sold))} and the "
+                "positions re-read failed — the working snapshot is the pre-fill book minus "
+                "those symbols, not a verified read"
+            )
+            log.error("Opening protective stop filled for %s but the positions re-read failed — "
+                      "no sell will be placed for them this cycle; other positions use the "
+                      "pre-fill snapshot.", ", ".join(sorted(stop_sold)))
 
     for symbol in cycle_symbols:
         _live("symbol_enter", symbol=symbol)
@@ -1274,17 +1646,22 @@ def run_cycle(
                 _t0 = time.perf_counter()
                 verdict = analyze(signal, news, fundamentals, settings)
                 _ms = int((time.perf_counter() - _t0) * 1000)
+                llm_status.record(verdict, settings)
                 if verdict is None:
                     llm_fail_streak += 1
-                    _live("llm_call_done", symbol=symbol, ms=_ms, error="none")
+                    failure = llm_status.last or {}
+                    _live("llm_call_done", symbol=symbol, ms=_ms, error="none",
+                          category=failure.get("category"))
                     if llm_fail_streak >= LLM_FAIL_FAST_STREAK:
+                        llm_status.circuit_open = True
                         log.error(
                             "Analyst CLI/API failed %d symbols in a row — skipping remaining "
                             "LLM calls this cycle (fail-closed: new entries WAIT). Exits and "
-                            "stops still run.",
-                            LLM_FAIL_FAST_STREAK,
+                            "stops still run. Last failure: %s",
+                            LLM_FAIL_FAST_STREAK, failure.get("detail") or "uncategorised",
                         )
-                        _live("llm_circuit_open", streak=LLM_FAIL_FAST_STREAK)
+                        _live("llm_circuit_open", streak=LLM_FAIL_FAST_STREAK,
+                              category=failure.get("category"), detail=failure.get("detail"))
                 else:
                     llm_fail_streak = 0
                     _live("llm_call_done", symbol=symbol, ms=_ms, stance=verdict.stance)
@@ -1670,10 +2047,50 @@ def run_cycle(
     except Exception:
         log.exception("Could not re-read positions; reconciling against the opening snapshot instead.")
         final_positions = positions
+    else:
+        # A real read: whatever doubt the opening refresh left is resolved by
+        # it — a solved failure must not keep reporting as a current one.
+        snapshot_unverified = None
+        last_verified_position_count = len(final_positions)
+    refreshed: dict = {}
     stop_coverage = _reconcile_protective_stops(
         broker, final_positions, peaks, atrs, settings.risk, log,
-        live=live_session, ids=ids,
+        live=live_session, ids=ids, refreshed=refreshed,
     )
+    # A stop that filled on submit changed the book AFTER final_positions was
+    # read. The reconciliation re-read it; that refreshed book — not the
+    # pre-fill snapshot — is what the heartbeat and the progress card (and
+    # its fills-vs-positions comparison) must describe, or a position the
+    # broker has just sold is reported as held-but-missing-from-fills
+    # (review round 2, R1). A failed re-read leaves the snapshot unverified.
+    if refreshed.get("attempted"):
+        if refreshed.get("ok"):
+            final_positions = refreshed["positions"]
+            snapshot_unverified = None
+            last_verified_position_count = len(final_positions)
+        else:
+            snapshot_unverified = (
+                f"protective stop filled on submit for {', '.join(sorted(refreshed.get('filled') or ()))} "
+                "and the positions re-read failed — this cycle's positions are the pre-fill snapshot"
+            )
+    # What the monitors are told (review round 4, R1). Execution above already
+    # did its job against the working snapshot; the REPORT must not upgrade
+    # that snapshot to a verified check:
+    #   - verified snapshot, open orders read      -> (covered, total);
+    #   - verified snapshot, open orders unreadable -> coverage unknown;
+    #   - snapshot itself unverified                -> coverage unknown with the
+    #     snapshot reason, held count unknown, no fills verdict — even if the
+    #     reconciliation just returned a tidy (0, 0) against a filtered {}.
+    reported_positions: dict | None = final_positions
+    if snapshot_unverified is not None:
+        coverage_unknown = f"positions snapshot unverified: {snapshot_unverified}"
+        stop_coverage = None
+        reported_positions = None  # _stamp_cycle_progress writes the positions_unverified entry
+    else:
+        # None here means the open-orders read failed, not "nothing to protect":
+        # the heartbeat and the progress card must say "unverified", or the
+        # watchdog keeps trusting the previous cycle's coverage (review R2).
+        coverage_unknown = None if stop_coverage is not None else STOP_COVERAGE_UNKNOWN_REASON
 
     if isinstance(broker, DryRunBroker):
         mode = "dry_run"
@@ -1689,11 +2106,14 @@ def run_cycle(
     # only — a backtest/test replay carries a throwaway journal whose ids and
     # timestamps would falsely freshen the watchdog stamp.
     if asof is None:
-        write_heartbeat(conn, "fast" if fast_mode else "deep", stop_coverage=stop_coverage)
+        heartbeat_mode = "fast" if fast_mode else "deep"
+        write_heartbeat(conn, heartbeat_mode, stop_coverage=stop_coverage, stop_coverage_unknown=coverage_unknown, positions=None if reported_positions is None else len(reported_positions), started_at=cycle_started_at, llm_status=llm_status.as_dict())
     _stamp_cycle_progress(
         asof=asof, fast_mode=fast_mode, cycle_no=cycle_no, account=account,
-        positions=final_positions, rows=rows, orders_this_cycle=orders_this_cycle,
-        stop_coverage=stop_coverage, status="ok",
+        positions=reported_positions, rows=rows, orders_this_cycle=orders_this_cycle,
+        stop_coverage=stop_coverage, stop_coverage_unknown=coverage_unknown,
+        status="ok", llm_status=llm_status.as_dict(), dry_run=use_dry_run,
+        positions_unverified=None if snapshot_unverified is None else (snapshot_unverified, last_verified_position_count),
     )
     if owns_conn:
         conn.close()
@@ -1734,7 +2154,7 @@ def main() -> None:
                  "the deep cycle takes the lock.", DEEP_CYCLE_YIELD_MINUTES, RUN_TIMES_ET)
         _stamp_cycle_progress(
             asof=None, fast_mode=True, cycle_no=None, account=None, positions=None,
-            status="no_trade", skipped="yielded to deep cycle",
+            status="no_trade", skipped="yielded to deep cycle", dry_run=args.dry_run,
         )
         return
 
@@ -1758,7 +2178,7 @@ def main() -> None:
             _notify_toast("Deep cycle skipped: could not acquire the cycle lock.")
         _stamp_cycle_progress(
             asof=None, fast_mode=args.fast, cycle_no=None, account=None, positions=None,
-            status="failed", skipped="cycle lock not acquired",
+            status="failed", skipped="cycle lock not acquired", dry_run=args.dry_run,
         )
         return
     try:
@@ -1766,7 +2186,7 @@ def main() -> None:
     except Exception:
         _stamp_cycle_progress(
             asof=None, fast_mode=args.fast, cycle_no=None, account=None, positions=None,
-            status="failed", skipped="cycle raised",
+            status="failed", skipped="cycle raised", dry_run=args.dry_run,
         )
         raise
     finally:

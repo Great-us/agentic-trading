@@ -294,3 +294,133 @@ def test_directional_score_signs():
     assert parse_verdict(VERDICT_JSON, "T").directional_score == 0.7
     assert parse_verdict({**VERDICT_JSON, "stance": "bearish"}, "T").directional_score == -0.7
     assert parse_verdict({**VERDICT_JSON, "stance": "neutral"}, "T").directional_score == 0.0
+
+
+# --- failure diagnostics (P0-B-1) --------------------------------------------
+#
+# 2026-09-16/17: Codex exited 1 three times per deep cycle and the log showed
+# only "Reading additional input from stdin..." — the first 500 chars of
+# stderr. The real cause ("You've hit your usage limit ... try again at Sep
+# 20th") was at the tail. These pin down: tail is logged, failure is
+# classified, the last failure is exposed to run.py, and a success clears it.
+
+CODEX_QUOTA_STDERR = (
+    "Reading additional input from stdin...\n"
+    + "".join(f"2026-09-17T13:45:{i:02d} codex_core: some routine startup line number {i}\n"
+              for i in range(40))
+    + "ERROR: You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) "
+    "or try again at Sep 20th, 2026 4:00 PM."
+)
+
+
+class _ExitProc:
+    """Fake Popen: fixed exit code and streams, optional timeout on communicate."""
+
+    def __init__(self, returncode=1, stdout="", stderr="", hang=False):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self._hang = hang
+        self.pid = 4242
+
+    def communicate(self, timeout=None):
+        if self._hang and timeout is not None:
+            self._hang = False  # the post-kill communicate() returns
+            raise cli_provider.subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+        return self._stdout, self._stderr
+
+
+def _run_with(monkeypatch, proc, tmp_path, cli="codex.exe", symbol="AAPL"):
+    monkeypatch.setattr(cli_provider.subprocess, "Popen", lambda argv, **kw: proc)
+    monkeypatch.setattr(cli_provider, "kill_process_tree", lambda p: None)
+    return cli_provider.analyze_via_cli(_signal(symbol), [], {}, cli_path=cli, cwd=tmp_path, timeout=5)
+
+
+def test_nonzero_exit_logs_the_tail_and_classifies_quota(monkeypatch, tmp_path, caplog):
+    cli_provider._clear_failure()
+    with caplog.at_level("ERROR", logger=cli_provider.logger.name):
+        verdict = _run_with(monkeypatch, _ExitProc(1, "", CODEX_QUOTA_STDERR), tmp_path)
+    assert verdict is None
+    text = caplog.text
+    assert "You've hit your usage limit" in text, "the stderr TAIL must reach the log"
+    assert "Reading additional input" in text, "the head is still there for context"
+    assert "category=quota" in text
+    assert "exited 1" in text
+    failure = cli_provider.last_failure
+    assert failure is not None
+    assert failure.category == "quota" and failure.exit_code == 1 and failure.symbol == "AAPL"
+    assert failure.retry_hint and "Sep 20th, 2026 4:00 PM" in failure.retry_hint
+    assert failure.summary().startswith("quota: try again at Sep 20th")
+    assert "chars omitted" in failure.detail  # head + tail, not the whole 40-line dump
+
+
+def test_auth_failure_is_classified_and_redacted(monkeypatch, tmp_path):
+    stderr = "Error: 401 Unauthorized — invalid api key. api_key=sk-live-abcdefghijklmnop1234567890 rejected"
+    assert _run_with(monkeypatch, _ExitProc(1, "", stderr), tmp_path, cli="claude.cmd") is None
+    failure = cli_provider.last_failure
+    assert failure.category == "auth"
+    assert "sk-live-abcdefghijklmnop1234567890" not in failure.detail
+    assert "[REDACTED]" in failure.detail
+
+
+def test_quota_wins_over_auth_when_a_spent_plan_is_phrased_as_403(monkeypatch, tmp_path):
+    stderr = "HTTP 403: rate limit exceeded for this billing period"
+    _run_with(monkeypatch, _ExitProc(1, "", stderr), tmp_path)
+    assert cli_provider.last_failure.category == "quota"
+
+
+def test_timeout_is_classified_with_elapsed(monkeypatch, tmp_path, caplog):
+    with caplog.at_level("ERROR", logger=cli_provider.logger.name):
+        verdict = _run_with(monkeypatch, _ExitProc(None, "", "partial", hang=True), tmp_path)
+    assert verdict is None
+    failure = cli_provider.last_failure
+    assert failure.category == "timeout"
+    assert failure.elapsed_s >= 0
+    assert "timed out" in caplog.text and "category=timeout" in caplog.text
+
+
+def test_bad_json_is_a_parse_failure(monkeypatch, tmp_path):
+    assert _run_with(monkeypatch, _ExitProc(0, "I would rather write an essay.", ""), tmp_path,
+                     cli="claude.cmd") is None
+    assert cli_provider.last_failure.category == "parse"
+    assert cli_provider.last_failure.exit_code == 0
+
+
+def test_schema_rejection_is_a_parse_failure(monkeypatch, tmp_path):
+    bad = json.dumps({"role": "assistant", "content": json.dumps({**VERDICT_JSON, "stance": "moon"})})
+    assert _run_with(monkeypatch, _ExitProc(0, bad, ""), tmp_path, cli="kimi.cmd") is None
+    assert cli_provider.last_failure.category == "parse"
+
+
+def test_missing_cli_is_not_found(monkeypatch, tmp_path):
+    def raise_missing(argv, **kw):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(cli_provider.subprocess, "Popen", raise_missing)
+    assert cli_provider.analyze_via_cli(_signal(), [], {}, cli_path="nope.cmd", cwd=tmp_path) is None
+    assert cli_provider.last_failure.category == "not_found"
+
+
+def test_success_clears_the_last_failure(monkeypatch, tmp_path):
+    _run_with(monkeypatch, _ExitProc(1, "", CODEX_QUOTA_STDERR), tmp_path)
+    assert cli_provider.last_failure is not None
+    ok = json.dumps({"role": "assistant", "content": json.dumps(VERDICT_JSON)})
+    verdict = _run_with(monkeypatch, _ExitProc(0, ok, ""), tmp_path, cli="kimi.cmd")
+    assert verdict is not None and verdict.stance == "bullish"
+    assert cli_provider.last_failure is None
+
+
+def test_classify_failure_buckets():
+    assert cli_provider.classify_failure("", "", timed_out=True) == "timeout"
+    assert cli_provider.classify_failure("You've hit your usage limit.") == "quota"
+    assert cli_provider.classify_failure("HTTP 429 Too Many Requests") == "quota"
+    assert cli_provider.classify_failure("Please log in: run `claude login`") == "auth"
+    assert cli_provider.classify_failure("Segmentation fault") == "unknown"
+
+
+def test_head_tail_keeps_both_ends():
+    text = "H" * 300 + "M" * 2000 + "T" * 700
+    out = cli_provider.head_tail(text)
+    assert out.startswith("H" * 200) and out.endswith("T" * 600)
+    assert "chars omitted" in out
+    assert cli_provider.head_tail("short") == "short"

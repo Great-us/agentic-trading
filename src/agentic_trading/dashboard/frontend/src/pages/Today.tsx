@@ -16,6 +16,8 @@ export default function Today({ bookId }: { bookId: string }) {
 
   const healthCls = {
     ok: "ok", weekend: "idle", stale: "bad", missing: "bad", corrupt: "bad",
+    stale_intraday: "bad", after_hours: "idle", closed_or_holiday: "idle",
+    stops_unknown: "bad",
   }[data.health.status] ?? "idle";
   const binding = data.vetoes.filter((v) => v.recent > 0 || v.total > 0);
   const pool = data.holdings.filter((h) => h.bucket === "pool");
@@ -30,14 +32,25 @@ export default function Today({ bookId }: { bookId: string }) {
     <>
       <div className={`health-bar ${healthCls}`}>
         <strong>{data.health.message}</strong>
-        <span className="muted">
-          深周期 {shortTime(data.health.deep.timestamp)}
-          {data.health.deep.stops_covered != null && data.health.deep.positions != null
-            ? ` · 止损 ${data.health.deep.stops_covered}/${data.health.deep.positions}`
-            : ""}
-          {data.health.deep.naked ? " · 有裸仓" : ""}
-        </span>
+        <span className="muted">深周期 {shortTime(data.health.deep.timestamp)}</span>
         {!llmBook && <span className="muted">快扫 {shortTime(data.health.fast.timestamp)}</span>}
+        {data.health.stop_check && (
+          // The most recent ACTUAL check, whichever mode ran it — not
+          // necessarily "deep" — so it's its own line rather than folded
+          // into either mode's timestamp above.
+          <span
+            className="muted"
+            title={data.health.stop_check.unknown ? (data.health.stop_check.reason ?? undefined) : undefined}
+          >
+            · 止损（{data.health.stop_check.mode === "deep" ? "深周期" : "快扫"}{" "}
+            {shortTime(data.health.stop_check.checked_at)}）
+            {data.health.stop_check.unknown
+              ? " 覆盖未核验"
+              : ` ${data.health.stop_check.stops_covered}/${data.health.stop_check.positions}`}
+            {data.health.stop_check.naked ? " · 有裸仓" : ""}
+          </span>
+        )}
+        {data.health.note && <span className="muted">· {data.health.note}</span>}
       </div>
 
       <div className={`panel handoff ${statusCls}`}>

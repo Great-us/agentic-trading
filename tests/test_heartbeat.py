@@ -362,3 +362,505 @@ def test_check_is_quiet_when_every_position_is_covered(tmp_path):
         "fast": {"timestamp": fresh, "cycle_id": 9},
     }), encoding="utf-8")
     assert hb.check_heartbeat(now=now, path=path) is None
+
+
+# --- coverage unknown ≠ coverage fine (review R2) ----------------------------------
+#
+# get_open_orders failed → the reconciliation returned None → the old stamp
+# simply omitted the coverage keys, and --check then read the OTHER mode's
+# older "all covered" entry. A failed check must alert; a cycle that never
+# ran a check (market-closed fast exit, pre-field stamps) must not.
+
+def test_unverified_coverage_after_a_good_cycle_alerts(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY - timedelta(hours=1))
+    write_heartbeat(None, "deep", path=path, stop_coverage=(4, 4))       # yesterday's clean check
+    write_heartbeat(None, "fast", path=path, stop_coverage=(4, 4))
+    assert check_heartbeat(now=WEDNESDAY - timedelta(minutes=59), path=path) is None
+
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "fast", path=path, stop_coverage=None,          # this scan: read failed
+                    stop_coverage_unknown="open orders unreadable — protective-stop coverage not verified this cycle",
+                    positions=4)
+    entry = json.loads(path.read_text(encoding="utf-8"))["fast"]
+    assert entry["stops_unknown"] is True and entry["stops_covered"] is None and entry["positions"] == 4
+    problem = check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path)
+    assert problem is not None
+    assert "没能核验止损覆盖" in problem and "4 个持仓" in problem and "open orders unreadable" in problem
+    assert "全部覆盖」不能沿用" in problem
+
+
+def test_unverified_coverage_is_not_hidden_by_a_later_skipped_scan(tmp_path, monkeypatch):
+    # deep check failed at 16:15; the 16:35 fast scan found the market closed
+    # and stamped without any coverage keys. The failure is still the newest
+    # *check* and must still alert.
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path, stop_coverage_unknown="open orders unreadable", positions=3)
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(minutes=20))
+    write_heartbeat(None, "fast", path=path)                             # skipped scan, no check
+    problem = check_heartbeat(now=WEDNESDAY + timedelta(minutes=21), path=path)
+    assert problem is not None and "没能核验止损覆盖" in problem
+
+
+def test_skipped_scan_after_a_clean_check_is_quiet(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path, stop_coverage=(3, 3))
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(minutes=20))
+    write_heartbeat(None, "fast", path=path)                             # market closed: no check ran
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=21), path=path) is None
+
+
+def test_unverified_coverage_clears_once_a_later_check_succeeds(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path, stop_coverage_unknown="open orders unreadable", positions=3)
+    write_heartbeat(None, "fast", path=path)
+    assert "没能核验" in check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path)
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(minutes=20))
+    write_heartbeat(None, "fast", path=path, stop_coverage=(3, 3))
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=21), path=path) is None
+
+
+def test_unverified_coverage_without_a_position_count_still_alerts(tmp_path):
+    path = tmp_path / "hb.json"
+    fresh = (WEDNESDAY - timedelta(minutes=5)).isoformat()
+    _write_raw(path, {
+        "deep": {"timestamp": fresh, "cycle_id": 1, "stops_unknown": True,
+                 "stops_covered": None, "positions": None},
+        "fast": {"timestamp": fresh, "cycle_id": 1},
+    })
+    problem = check_heartbeat(now=WEDNESDAY, path=path)
+    assert problem is not None and "没能核验止损覆盖" in problem and "持仓的保护状态未知" in problem
+
+
+# --- the check record must survive skipped cycles (review round 2, R2) --------------
+#
+# write_heartbeat rebuilt data[mode] on every call, so a fast scan that ran a
+# check and failed (stops_unknown) was wiped by the NEXT fast scan that ran
+# no check at all (market closed / yielded). The watchdog then fell back to
+# deep's older "all covered" and the alert cleared without a successful
+# re-check. Liveness (timestamp/cycle) and "last actual stop check" are now
+# separate records; skipping a check leaves the check record alone.
+
+def _seq(path, monkeypatch, steps):
+    """steps: (minutes_after_WEDNESDAY, mode, kwargs) written in order."""
+    for minutes, mode, kwargs in steps:
+        monkeypatch.setattr(hb, "_utcnow", lambda m=minutes: WEDNESDAY + timedelta(minutes=m))
+        write_heartbeat(None, mode, path=path, **kwargs)
+
+
+def test_same_mode_skip_does_not_erase_a_failed_check(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    _seq(path, monkeypatch, [
+        (0, "deep", {"stop_coverage": (4, 4)}),                                 # 09:45 deep: fine
+        (10, "fast", {"stop_coverage_unknown": "open orders unreadable", "positions": 4}),  # 09:55: read failed
+        (30, "fast", {}),                                                       # 10:15: yielded / closed, no check
+    ])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "stops_unknown" not in data["fast"], "the skipped scan is not itself a failed check"
+    problem = check_heartbeat(now=WEDNESDAY + timedelta(minutes=31), path=path)
+    assert problem is not None and "没能核验止损覆盖" in problem, \
+        "the failed check is still the most recent check — a skipped scan must not clear it"
+
+
+def test_cross_mode_success_clears_the_watchdog(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    _seq(path, monkeypatch, [
+        (0, "deep", {"stop_coverage_unknown": "open orders unreadable", "positions": 3}),
+        (20, "fast", {"stop_coverage": (3, 3)}),
+    ])
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=21), path=path) is None
+
+
+def test_failure_then_other_mode_success_then_skip_does_not_reactivate(tmp_path, monkeypatch):
+    # The naive fix — copying the old check fields onto the new stamp — would
+    # resurrect fast's stale failure here. The most recent CHECK is deep's
+    # success; fast's later skip changes nothing.
+    path = tmp_path / "hb.json"
+    _seq(path, monkeypatch, [
+        (0, "fast", {"stop_coverage_unknown": "open orders unreadable", "positions": 3}),
+        (10, "deep", {"stop_coverage": (3, 3)}),
+        (30, "fast", {}),
+    ])
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=31), path=path) is None
+    record = json.loads(path.read_text(encoding="utf-8"))["stop_check"]
+    assert record["mode"] == "deep" and record["stops_covered"] == 3 and not record.get("unknown")
+
+
+def test_stop_check_record_is_written_once_per_actual_check(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    _seq(path, monkeypatch, [(0, "deep", {"stop_coverage": (2, 4)})])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    record = data["stop_check"]
+    assert record["checked_at"] == WEDNESDAY.isoformat()
+    assert record["mode"] == "deep" and record["stops_covered"] == 2 and record["positions"] == 4
+    assert record.get("unknown") in (None, False)
+    _seq(path, monkeypatch, [(5, "fast", {})])
+    assert json.loads(path.read_text(encoding="utf-8"))["stop_check"] == record
+    _seq(path, monkeypatch, [(9, "fast", {"stop_coverage_unknown": "502", "positions": 4})])
+    record2 = json.loads(path.read_text(encoding="utf-8"))["stop_check"]
+    assert record2["unknown"] is True and record2["reason"] == "502" and record2["mode"] == "fast"
+    assert record2["checked_at"] == (WEDNESDAY + timedelta(minutes=9)).isoformat()
+
+
+def test_old_format_stamps_without_a_check_record_still_work(tmp_path):
+    fresh = (WEDNESDAY - timedelta(minutes=5)).isoformat()
+    path = tmp_path / "hb.json"
+    _write_raw(path, {"deep": {"timestamp": fresh, "cycle_id": 1, "stops_covered": 5, "positions": 6},
+                      "fast": {"timestamp": fresh, "cycle_id": 1}})
+    problem = check_heartbeat(now=WEDNESDAY, path=path)
+    assert problem is not None and "1/6" in problem                 # naked gap still read per mode
+    _write_raw(path, {"deep": {"timestamp": fresh, "cycle_id": 1, "stops_covered": 6, "positions": 6},
+                      "fast": {"timestamp": fresh, "cycle_id": 1}})
+    assert check_heartbeat(now=WEDNESDAY, path=path) is None         # and no false unknown
+
+
+# --- first write over an OLD-format file must not lose its last check (round 3, R2)
+
+def _legacy_file(path, *, deep_minutes, fast_minutes, fast_unknown=True):
+    """A heartbeat written by the pre-`stop_check` code: coverage lives only in
+    the per-mode stamps. deep checked fine earlier; fast failed later."""
+    deep_ts = (WEDNESDAY - timedelta(minutes=deep_minutes)).isoformat()
+    fast_ts = (WEDNESDAY - timedelta(minutes=fast_minutes)).isoformat()
+    fast = {"timestamp": fast_ts, "cycle_id": 41}
+    if fast_unknown:
+        fast.update({"stops_covered": None, "positions": 4, "stops_unknown": True,
+                     "stops_unknown_reason": "open orders unreadable"})
+    _write_raw(path, {"deep": {"timestamp": deep_ts, "cycle_id": 40, "stops_covered": 4, "positions": 4},
+                      "fast": fast})
+    return fast_ts
+
+
+def test_first_skipped_write_over_a_legacy_file_keeps_the_failed_check(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    fast_ts = _legacy_file(path, deep_minutes=60, fast_minutes=10)
+    assert "没能核验" in check_heartbeat(now=WEDNESDAY, path=path)   # legacy read already alerts
+    # First write by the new code: a fast scan that ran no check.
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "fast", path=path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "stop_check" in data, "the legacy last check must be migrated before the entry is rebuilt"
+    assert data["stop_check"]["unknown"] is True and data["stop_check"]["mode"] == "fast"
+    assert data["stop_check"]["checked_at"] == fast_ts, "migration keeps the original check time"
+    assert data["stop_check"]["reason"] == "open orders unreadable"
+    problem = check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path)
+    assert problem is not None and "没能核验止损覆盖" in problem
+
+
+def test_legacy_migration_then_a_real_success_clears_watchdog_and_dashboard(tmp_path, monkeypatch):
+    # P2 ships no dashboard package; the watchdog half is covered by the test above.
+    book_health = pytest.importorskip("agentic_trading.dashboard.views").book_health
+
+    path = tmp_path / "hb.json"
+    _legacy_file(path, deep_minutes=60, fast_minutes=10)
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "fast", path=path)                          # skipped scan: still unknown
+    assert book_health(path, now=WEDNESDAY)["status"] == "stops_unknown"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(minutes=20))
+    write_heartbeat(None, "deep", path=path, stop_coverage=(4, 4))    # real re-check
+    now = WEDNESDAY + timedelta(minutes=21)
+    assert check_heartbeat(now=now, path=path) is None
+    health = book_health(path, now=now)
+    assert health["status"] != "stops_unknown" and health["stop_check"]["unknown"] is False
+
+
+def test_legacy_file_without_any_check_migrates_nothing(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    fresh = (WEDNESDAY - timedelta(minutes=5)).isoformat()
+    _write_raw(path, {"deep": {"timestamp": fresh, "cycle_id": 1}, "fast": {"timestamp": fresh, "cycle_id": 1}})
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "fast", path=path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "stop_check" not in data
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path) is None
+
+
+def test_legacy_migration_prefers_unknown_on_a_timestamp_tie(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    ts = (WEDNESDAY - timedelta(minutes=10)).isoformat()
+    _write_raw(path, {"deep": {"timestamp": ts, "cycle_id": 1, "stops_covered": 4, "positions": 4},
+                      "fast": {"timestamp": ts, "cycle_id": 1, "stops_covered": None, "positions": 4,
+                               "stops_unknown": True, "stops_unknown_reason": "502"}})
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path)
+    assert json.loads(path.read_text(encoding="utf-8"))["stop_check"]["unknown"] is True
+
+
+def test_cli_exits_1_and_toasts_on_unverified_coverage(tmp_path, monkeypatch, capsys):
+    fired = []
+    monkeypatch.setattr(hb, "_notify_toast", fired.append)
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "HEARTBEAT_PATH", path)
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path, stop_coverage_unknown="open orders unreadable", positions=4)
+    write_heartbeat(None, "fast", path=path)
+    with pytest.raises(SystemExit) as exc:
+        hb.main(["--check"])
+    assert exc.value.code == 1
+    assert "[ALERT]" in capsys.readouterr().out
+    assert len(fired) == 1 and "没能核验" in fired[0]
+
+
+# --- cycle timeliness (P0-B-3) ----------------------------------------------------
+#
+# 2026-09-16: the 16:15 ET deep cycle ran at 19:19 ET (machine asleep, Task
+# Scheduler StartWhenAvailable catch-up). The stamp said "ok". A late cycle
+# decides on a stale time point; a skipped deep slot decides on nothing.
+
+from zoneinfo import ZoneInfo  # noqa: E402 — test-local helper import
+
+ET = ZoneInfo("America/New_York")
+
+
+def _et(y, m, d, hh, mm):
+    return datetime(y, m, d, hh, mm, tzinfo=ET).astimezone(timezone.utc)
+
+
+def test_scheduled_slot_before_picks_the_right_grid_slot():
+    # P1 deep 09:45 / 16:15; fast 09:35 + 20 min through 15:55.
+    assert hb.scheduled_slot_before("deep", _et(2026, 9, 16, 19, 19), "p1") == _et(2026, 9, 16, 16, 15)
+    assert hb.scheduled_slot_before("deep", _et(2026, 9, 17, 9, 46), "p1") == _et(2026, 9, 17, 9, 45)
+    # Monday pre-open → Friday's 16:15 (weekend has no slots).
+    assert hb.scheduled_slot_before("deep", _et(2026, 9, 14, 9, 0), "p1") == _et(2026, 9, 11, 16, 15)
+    assert hb.scheduled_slot_before("fast", _et(2026, 9, 17, 9, 36), "p1") == _et(2026, 9, 17, 9, 35)
+    assert hb.scheduled_slot_before("fast", _et(2026, 9, 17, 12, 59), "p1") == _et(2026, 9, 17, 12, 55)
+    # P2 runs its own grid (09:50/16:20, fast 10:10 → 15:50).
+    assert hb.scheduled_slot_before("deep", _et(2026, 9, 17, 9, 52), "p2") == _et(2026, 9, 17, 9, 50)
+    assert hb.scheduled_slot_before("fast", _et(2026, 9, 17, 16, 30), "p2") == _et(2026, 9, 17, 15, 50)
+    # Books without a registered schedule get nothing rather than P1's grid.
+    assert hb.scheduled_slot_before("deep", _et(2026, 9, 17, 9, 52), "p4") is None
+
+
+def test_slots_between_counts_only_weekday_slots_strictly_inside():
+    # 09-15 16:15 → 09-16 16:15 skipped the 09-16 09:45 deep run.
+    assert hb.slots_between("deep", _et(2026, 9, 15, 16, 15), _et(2026, 9, 16, 16, 15), "p1") == 1
+    # Friday close → Monday open: nothing scheduled in between.
+    assert hb.slots_between("deep", _et(2026, 9, 11, 16, 15), _et(2026, 9, 14, 9, 45), "p1") == 0
+    # Consecutive slots → 0; same slot twice → 0.
+    assert hb.slots_between("deep", _et(2026, 9, 16, 9, 45), _et(2026, 9, 16, 16, 15), "p1") == 0
+    assert hb.slots_between("deep", _et(2026, 9, 16, 9, 45), _et(2026, 9, 16, 9, 45), "p1") == 0
+    # A morning of sleep skips seven fast scans (10:35 … 12:35).
+    assert hb.slots_between("fast", _et(2026, 9, 16, 10, 15), _et(2026, 9, 16, 12, 55), "p1") == 7
+    assert hb.slots_between("deep", _et(2026, 9, 15, 16, 15), _et(2026, 9, 16, 16, 15), "p4") is None
+
+
+def test_on_time_deep_stamp_carries_slot_fields_and_passes(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: hb.BOOK_SCHEDULES["p1"])
+    started = _et(2026, 9, 17, 9, 46)
+    monkeypatch.setattr(hb, "_utcnow", lambda: started + timedelta(minutes=4))
+    path = tmp_path / "hb.json"
+    write_heartbeat(None, "deep", path=path, started_at=started)
+    write_heartbeat(None, "fast", path=path, started_at=started - timedelta(minutes=10))
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    assert entry["started_at"] == started.isoformat()
+    assert entry["scheduled_slot"] == _et(2026, 9, 17, 9, 45).isoformat()
+    assert entry["late_minutes"] == 1.0
+    assert "missed_slots" not in entry  # first stamp with slot info: nothing to compare to
+    assert check_heartbeat(now=started + timedelta(minutes=5), path=path) is None
+
+
+def test_late_deep_cycle_is_flagged_with_planned_and_actual_times(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: hb.BOOK_SCHEDULES["p1"])
+    started = _et(2026, 9, 16, 19, 19)  # the real one
+    monkeypatch.setattr(hb, "_utcnow", lambda: started + timedelta(minutes=3))
+    path = tmp_path / "hb.json"
+    write_heartbeat(None, "deep", path=path, started_at=started)
+    write_heartbeat(None, "fast", path=path, started_at=started - timedelta(hours=4))
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    assert entry["late_minutes"] == 184.0
+    problem = check_heartbeat(now=started + timedelta(minutes=10), path=path)
+    assert problem is not None
+    assert "晚了 184 分钟" in problem
+    assert "09-16 16:15" in problem and "09-16 19:19" in problem
+
+
+def test_lateness_exactly_at_threshold_passes_one_minute_beyond_fails(tmp_path):
+    path = tmp_path / "hb.json"
+    now = WEDNESDAY
+    fresh = (now - timedelta(minutes=5)).isoformat()
+
+    def stamp(late):
+        _write_raw(path, {
+            "deep": {"timestamp": fresh, "cycle_id": 1, "late_minutes": late,
+                     "scheduled_slot": fresh, "started_at": fresh},
+            "fast": {"timestamp": fresh, "cycle_id": 1},
+        })
+
+    stamp(hb.LATE_MAX_MINUTES)
+    assert check_heartbeat(now=now, path=path) is None
+    stamp(hb.LATE_MAX_MINUTES + 1)
+    assert "晚了" in check_heartbeat(now=now, path=path)
+
+
+def test_only_the_newest_stamp_s_lateness_counts(tmp_path):
+    # Yesterday's late deep is history once a fast scan has run on time.
+    path = tmp_path / "hb.json"
+    now = WEDNESDAY
+    _write_raw(path, {
+        "deep": {"timestamp": (now - timedelta(hours=3)).isoformat(), "cycle_id": 1, "late_minutes": 184.0},
+        "fast": {"timestamp": (now - timedelta(minutes=5)).isoformat(), "cycle_id": 2, "late_minutes": 1.2},
+    })
+    assert check_heartbeat(now=now, path=path) is None
+
+
+def test_missed_deep_slot_is_counted_and_alerts(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: hb.BOOK_SCHEDULES["p1"])
+    path = tmp_path / "hb.json"
+    first = _et(2026, 9, 15, 16, 16)
+    monkeypatch.setattr(hb, "_utcnow", lambda: first + timedelta(minutes=2))
+    write_heartbeat(None, "deep", path=path, started_at=first)
+    # The 09-16 09:45 slot never stamps; the 16:15 one does.
+    second = _et(2026, 9, 16, 16, 16)
+    monkeypatch.setattr(hb, "_utcnow", lambda: second + timedelta(minutes=2))
+    write_heartbeat(None, "deep", path=path, started_at=second)
+    write_heartbeat(None, "fast", path=path, started_at=second - timedelta(minutes=30))
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    assert entry["missed_slots"] == 1
+    problem = check_heartbeat(now=second + timedelta(minutes=5), path=path)
+    assert problem is not None and "漏跑了 1 个计划槽" in problem
+
+
+def test_consecutive_deep_slots_report_zero_missed(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: hb.BOOK_SCHEDULES["p1"])
+    path = tmp_path / "hb.json"
+    for started in (_et(2026, 9, 11, 16, 15), _et(2026, 9, 14, 9, 47)):  # Fri close → Mon open
+        monkeypatch.setattr(hb, "_utcnow", lambda s=started: s + timedelta(minutes=2))
+        write_heartbeat(None, "deep", path=path, started_at=started)
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    assert entry["missed_slots"] == 0 and entry["late_minutes"] == 2.0
+
+
+def test_missed_fast_slots_are_recorded_but_do_not_alert(tmp_path, monkeypatch):
+    # A fast scan that finds the deep cycle holding the lock exits without a
+    # stamp by design, so a skipped fast slot is dashboard data, not a page.
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: hb.BOOK_SCHEDULES["p1"])
+    path = tmp_path / "hb.json"
+    for started in (_et(2026, 9, 16, 9, 35), _et(2026, 9, 16, 10, 15)):
+        monkeypatch.setattr(hb, "_utcnow", lambda s=started: s + timedelta(seconds=30))
+        write_heartbeat(None, "fast", path=path, started_at=started)
+    monkeypatch.setattr(hb, "_utcnow", lambda: _et(2026, 9, 16, 9, 46))
+    write_heartbeat(None, "deep", path=path, started_at=_et(2026, 9, 16, 9, 45))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["fast"]["missed_slots"] == 1  # 09:55 skipped
+    assert check_heartbeat(now=_et(2026, 9, 16, 10, 20), path=path) is None
+
+
+def test_unknown_book_schedule_writes_only_started_at(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_book_schedule", lambda book_id=None: None)
+    path = tmp_path / "hb.json"
+    write_heartbeat(None, "deep", path=path, started_at=WEDNESDAY)
+    write_heartbeat(None, "fast", path=path, started_at=WEDNESDAY)
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    assert entry["started_at"] == WEDNESDAY.isoformat()
+    assert "scheduled_slot" not in entry and "late_minutes" not in entry
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path) is None
+
+
+def test_run_cycle_passes_its_start_time_to_both_stamps():
+    import agentic_trading.run as run_mod
+
+    source = Path(run_mod.__file__).read_text(encoding="utf-8")
+    call_sites = re.findall(r"^\s*write_heartbeat\(.*\)$", source, flags=re.MULTILINE)
+    assert call_sites and all("started_at=cycle_started_at" in c for c in call_sites), call_sites
+
+
+# --- llm_status in the stamp (P0-B-1) ---------------------------------------------
+
+def test_llm_status_is_written_sanitised_and_an_open_circuit_alerts(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    path = tmp_path / "hb.json"
+    write_heartbeat(None, "deep", path=path, llm_status={
+        "state": "circuit_open", "category": "quota", "failures": 3, "calls": 3,
+        "retry_hint": "try again at Sep 20th, 2026 4:00 PM",
+        "detail": "x" * 1000, "prompt": "must not be copied",
+    })
+    # A later fast scan that never consulted the analyst must not mask it.
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(minutes=10))
+    write_heartbeat(None, "fast", path=path, llm_status={
+        "state": "off", "reason": "fast tier: no symbol escalated to the analyst this scan", "calls": 0,
+    })
+    entry = json.loads(path.read_text(encoding="utf-8"))["deep"]
+    status = entry["llm_status"]
+    assert status["state"] == "circuit_open" and status["category"] == "quota"
+    assert status["failures"] == 3 and len(status["detail"]) == 400
+    assert "prompt" not in status
+    problem = check_heartbeat(now=WEDNESDAY + timedelta(minutes=11), path=path)
+    assert problem is not None
+    assert "circuit_open" in problem and "quota" in problem and "Sep 20th" in problem
+    assert "fail-closed" in problem
+    # The alert text already says it; the INFO line never repeats circuit_open
+    # (here it describes the newer fast stamp's "off", which is a different mode).
+    note = hb.llm_status_note(json.loads(path.read_text(encoding="utf-8")))
+    assert note is None or "circuit_open" not in note
+
+
+def test_open_circuit_alert_clears_when_the_next_deep_cycle_answers(tmp_path, monkeypatch):
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    write_heartbeat(None, "deep", path=path, llm_status={"state": "circuit_open", "category": "quota"})
+    write_heartbeat(None, "fast", path=path)
+    assert "熔断" in check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path)
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY + timedelta(hours=6))
+    write_heartbeat(None, "deep", path=path, llm_status={"state": "ok", "calls": 14, "failures": 0})
+    write_heartbeat(None, "fast", path=path)
+    assert check_heartbeat(now=WEDNESDAY + timedelta(hours=6, minutes=1), path=path) is None
+
+
+def test_degraded_and_off_states_are_info_not_alerts(tmp_path, monkeypatch):
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    path = tmp_path / "hb.json"
+    write_heartbeat(None, "deep", path=path, llm_status={
+        "state": "degraded", "calls": 14, "failures": 2, "category": "timeout",
+    })
+    write_heartbeat(None, "fast", path=path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert check_heartbeat(now=WEDNESDAY + timedelta(minutes=1), path=path) is None
+    note = hb.llm_status_note(data)
+    assert note and "degraded" in note and "timeout" in note and "失败 2 次" in note
+    fresh = WEDNESDAY.isoformat()
+    off = {"deep": {"timestamp": fresh, "llm_status": {"state": "off", "reason": "skipped via --skip-llm"}}}
+    assert hb.llm_status_note(off) and "skip-llm" in hb.llm_status_note(off)
+    assert hb._llm_problems(off) == []
+
+
+def test_ok_llm_status_produces_no_note():
+    fresh = WEDNESDAY.isoformat()
+    assert hb.llm_status_note({"deep": {"timestamp": fresh, "llm_status": {"state": "ok"}}}) is None
+    assert hb.llm_status_note({"deep": {"timestamp": fresh}}) is None
+
+
+def test_cli_prints_the_llm_note_on_the_ok_path(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(hb, "_notify_toast", lambda _m: None)
+    monkeypatch.setattr(hb, "check_heartbeat", lambda *a, **k: None)
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "HEARTBEAT_PATH", path)
+    _write_raw(path, {"deep": {"timestamp": WEDNESDAY.isoformat(),
+                               "llm_status": {"state": "degraded", "category": "timeout", "failures": 1}}})
+    with pytest.raises(SystemExit) as exc:
+        hb.main(["--check"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "[OK]" in out and "[INFO]" in out and "timeout" in out
+
+
+def test_cli_toasts_and_exits_1_on_an_open_circuit(tmp_path, monkeypatch, capsys):
+    fired = []
+    monkeypatch.setattr(hb, "_notify_toast", fired.append)
+    path = tmp_path / "hb.json"
+    monkeypatch.setattr(hb, "HEARTBEAT_PATH", path)
+    fresh = (WEDNESDAY - timedelta(minutes=5)).isoformat()
+    monkeypatch.setattr(hb, "_utcnow", lambda: WEDNESDAY)
+    _write_raw(path, {
+        "deep": {"timestamp": fresh, "cycle_id": 1,
+                 "llm_status": {"state": "circuit_open", "category": "quota",
+                                "retry_hint": "try again at Sep 20th, 2026 4:00 PM"}},
+        "fast": {"timestamp": fresh, "cycle_id": 1},
+    })
+    with pytest.raises(SystemExit) as exc:
+        hb.main(["--check"])
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "[ALERT]" in out and "quota" in out and "Sep 20th" in out
+    assert len(fired) == 1 and "quota" in fired[0]

@@ -21,6 +21,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -32,6 +33,20 @@ logger = logging.getLogger(__name__)
 # skipping them made the largest decision class invisible to this report.
 ACTIONS = ("buy", "sell", "trim", "wait", "hold", "avoid")
 MIN_REPORT_N = 5
+
+# Cycle timestamps are stamped in UTC (run.py: datetime.now(timezone.utc)).
+# A deep cycle run late in the ET evening (see AGENTS.md F5 — a 16:15 ET slot
+# has run as late as 19:19 ET) can cross the UTC midnight boundary while still
+# the same ET trading session. Bucketing by the UTC calendar date would then
+# evaluate the decision against the wrong session's forward close.
+ET = ZoneInfo("America/New_York")
+
+# Modes a cycle can be journaled under (run.py: dry_run / backtest / paper).
+# Only "paper" reflects real broker-forward execution; dry_run has no real
+# fills and backtest replays history, so mixing them into the paper-forward
+# quality ledger would misrepresent live standing. Callers that need the full
+# journal (backtests, ad-hoc audits) pass mode=None explicitly.
+DEFAULT_MODE = "paper"
 
 
 @dataclass
@@ -59,7 +74,13 @@ def _naive_index(idx: pd.Index) -> pd.DatetimeIndex:
 
 
 def forward_stats(df: pd.DataFrame, asof: pd.Timestamp) -> dict[str, float | None]:
-    """Returns vs the last close on or before `asof`. None if the horizon isn't in the data."""
+    """Returns vs the last close on or before `asof`. None if the horizon isn't in the data.
+
+    mfe_20d/mae_20d require the full 20-session future window (same bound as
+    ret_20d, j = i+20 in range) — a partial window from a recent decision that
+    hasn't matured yet is immature, not a smaller-but-valid extreme, so it must
+    read None like the other unmatured horizons rather than silently reporting
+    a truncated max/min as if it were the full 20-day figure."""
     empty = {"ret_1d": None, "ret_5d": None, "ret_20d": None, "mfe_20d": None, "mae_20d": None}
     if df is None or df.empty or "Close" not in df.columns:
         return empty
@@ -89,7 +110,7 @@ def forward_stats(df: pd.DataFrame, asof: pd.Timestamp) -> dict[str, float | Non
 
     future = work.iloc[i + 1 : i + 21]
     mfe = mae = None
-    if not future.empty:
+    if len(future) == 20:
         high = future["High"].astype(float) if "High" in future.columns else future["Close"].astype(float)
         low = future["Low"].astype(float) if "Low" in future.columns else future["Close"].astype(float)
         mfe = float(high.max()) / c0 - 1.0
@@ -101,30 +122,45 @@ def forward_stats(df: pd.DataFrame, asof: pd.Timestamp) -> dict[str, float | Non
 
 
 def _cycle_asof(timestamp: str) -> pd.Timestamp:
+    """Calendar date the decision belongs to, in the exchange's own timezone.
+
+    Cycle timestamps are stamped in UTC. Converting to a naive UTC date (the
+    old behavior) instead of the ET trading-session date can misfile a decision
+    into the next session when a deep cycle runs very late in the ET evening —
+    e.g. 2026-09-16 22:30 ET (a documented 3+ hour delayed run, see AGENTS.md
+    F5) is 2026-09-17 02:30 UTC, still the 09-16 session."""
     ts = pd.Timestamp(timestamp)
     if ts.tzinfo is not None:
-        ts = ts.tz_convert(None)
+        ts = ts.tz_convert(ET).tz_localize(None)
     return ts.normalize()
 
 
-def load_decision_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def load_decision_rows(conn: sqlite3.Connection, mode: str | None = DEFAULT_MODE) -> list[sqlite3.Row]:
+    """Decisions for the given cycle mode ('paper' by default). Pass mode=None
+    for the full journal across all modes (backtests, ad-hoc audits)."""
     conn.row_factory = sqlite3.Row
     placeholders = ", ".join("?" for _ in ACTIONS)
-    return list(conn.execute(
-        f"""SELECT d.id AS decision_id, d.symbol, d.action, d.quant_score,
+    query = f"""SELECT d.id AS decision_id, d.symbol, d.action, d.quant_score,
                   d.llm_stance, d.llm_confidence, d.llm_risk_flags, c.timestamp
            FROM decisions d JOIN cycles c ON c.id = d.cycle_id
-           WHERE d.action IN ({placeholders})
-           ORDER BY d.id""",
-        ACTIONS,
-    ))
+           WHERE d.action IN ({placeholders})"""
+    params: list = list(ACTIONS)
+    if mode is not None:
+        query += " AND c.mode = ?"
+        params.append(mode)
+    query += " ORDER BY d.id"
+    return list(conn.execute(query, params))
 
 
 def evaluate_journal(
     conn: sqlite3.Connection,
     bars: dict[str, pd.DataFrame] | None = None,
+    mode: str | None = DEFAULT_MODE,
 ) -> list[OutcomeRow]:
-    rows = load_decision_rows(conn)
+    """Fills signal_outcomes for decisions in the given cycle mode ('paper' by
+    default). Idempotent: re-running over the same decisions upserts the same
+    signal_outcomes rows (keyed by decision_id) rather than duplicating them."""
+    rows = load_decision_rows(conn, mode=mode)
     if not rows:
         return []
     symbols = sorted({r["symbol"] for r in rows})
@@ -190,27 +226,45 @@ def _fmt(value: float | None) -> str:
     return "     n/a" if value is None else f"{value:+8.1%}"
 
 
+def _cell(values: list[float | None]) -> tuple[int, str]:
+    """(mature sample count, display string) for one horizon within a bucket.
+
+    Each horizon matures independently — a bucket can have 40 total decisions
+    but only 6 with a matured 20d close. Gating and averaging per horizon
+    (instead of on the bucket's total decision count) stops an average from
+    being printed over fewer real observations than MIN_REPORT_N."""
+    xs = [v for v in values if v is not None and v == v]
+    n = len(xs)
+    if n < MIN_REPORT_N:
+        return n, f"n<{MIN_REPORT_N}"
+    return n, _fmt(float(sum(xs) / n))
+
+
 def format_report(rows: list[OutcomeRow], sources: dict[str, str] | None = None) -> str:
     if not rows:
         return f"No {'/'.join(ACTIONS)} decisions in the journal."
     lines = [
         f"Forward outcomes for {len(rows)} decisions (does not change live knobs).",
+        "n1d/n5d/n20d are the matured sample count for that horizon, not the "
+        "bucket's decision count — MFE20/MAE20 mature together with +20d.",
         "",
-        f"{'bucket':<28} {'n':>4} {'+1d':>8} {'+5d':>8} {'+20d':>8} {'MFE20':>8} {'MAE20':>8}",
-        "-" * 76,
+        f"{'bucket':<28} {'ndec':>4} {'n1d':>4} {'+1d':>8} {'n5d':>4} {'+5d':>8} "
+        f"{'n20d':>4} {'+20d':>8} {'MFE20':>8} {'MAE20':>8}",
+        "-" * 104,
     ]
 
     def add(name: str, subset: list[OutcomeRow]) -> None:
-        n = len(subset)
-        if n == 0:
+        ndec = len(subset)
+        if ndec == 0:
             return
-        if n < MIN_REPORT_N:
-            lines.append(f"{name:<28} {n:4d}   (n<{MIN_REPORT_N}, skip averages)")
-            return
+        n1, c1 = _cell([r.ret_1d for r in subset])
+        n5, c5 = _cell([r.ret_5d for r in subset])
+        n20, c20 = _cell([r.ret_20d for r in subset])
+        _, cmfe = _cell([r.mfe_20d for r in subset])
+        _, cmae = _cell([r.mae_20d for r in subset])
         lines.append(
-            f"{name:<28} {n:4d} {_fmt(_mean([r.ret_1d for r in subset]))} "
-            f"{_fmt(_mean([r.ret_5d for r in subset]))} {_fmt(_mean([r.ret_20d for r in subset]))} "
-            f"{_fmt(_mean([r.mfe_20d for r in subset]))} {_fmt(_mean([r.mae_20d for r in subset]))}"
+            f"{name:<28} {ndec:4d} {n1:4d} {c1:>8} {n5:4d} {c5:>8} "
+            f"{n20:4d} {c20:>8} {cmfe:>8} {cmae:>8}"
         )
 
     add("all", rows)
@@ -259,9 +313,22 @@ def format_report(rows: list[OutcomeRow], sources: dict[str, str] | None = None)
     return "\n".join(lines)
 
 
+def _parse_mode(value: str) -> str | None:
+    return None if value.lower() in ("all", "none") else value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    parser.add_argument(
+        "--mode", type=_parse_mode, default=DEFAULT_MODE,
+        help=(
+            f"Cycle mode to evaluate (default: {DEFAULT_MODE!r} — only real "
+            "paper-forward decisions; dry_run and backtest cycles are excluded "
+            "unless you ask for them). Pass 'all' or 'none' for the full "
+            "journal across every mode."
+        ),
+    )
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -270,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No journal at {args.db}")
         return 0
     conn = connect(args.db)
-    rows = evaluate_journal(conn)
+    rows = evaluate_journal(conn, mode=args.mode)
     print(format_report(rows, sources=symbol_sources()))
     conn.close()
     return 0

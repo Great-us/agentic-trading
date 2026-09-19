@@ -26,8 +26,10 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from .broker_read import BookBrokerReader, BrokerError
+from .journal.evaluate import DEFAULT_MODE as OUTCOMES_DEFAULT_MODE
+from .journal.evaluate import MIN_REPORT_N
 from .journal.logger import DEFAULT_DB_PATH
-from .round_trips import round_trips
+from .round_trips import reconcile_positions, round_trips
 
 ET = ZoneInfo("America/New_York")
 
@@ -348,6 +350,141 @@ def _progress_lines(book_root: Path) -> list[str]:
     return lines
 
 
+def _outcomes_summary(
+    conn: sqlite3.Connection,
+    *,
+    mode: str | None = OUTCOMES_DEFAULT_MODE,
+    min_n: int = MIN_REPORT_N,
+) -> list[dict]:
+    """Forward-return averages per action bucket, read-only off `signal_outcomes`
+    (populated by `journal.evaluate`, which this report never calls — no writes).
+
+    n_1d/n_5d/n_20d are the per-horizon MATURED sample count, not the bucket's
+    decision count — a bucket can have 40 decisions but only 6 with a matured
+    20d close. `n_1d_small`/`n_5d_small`/`n_20d_small` flag each horizon
+    independently against `min_n` (evaluate.py's MIN_REPORT_N by default): a
+    bucket with 40 decisions and 40 matured 1d returns but only 1 matured 20d
+    return must not read as "big enough sample" just because the bucket-level
+    decision count clears the bar.
+
+    `mode='paper'` by default — dry_run and backtest cycles have no real
+    fills and must not count as paper-forward evaluation evidence. Pass
+    `mode=None` for the full journal across every mode (audit/debugging only).
+
+    Duplicated rather than imported from `dashboard.views.outcomes_summary`:
+    daily_report must keep working on P2, which has no `dashboard/` package
+    (AGENTS.md).
+    """
+    query = (
+        "SELECT d.action, COUNT(*) AS n,"
+        " SUM(CASE WHEN o.ret_1d IS NOT NULL THEN 1 ELSE 0 END) AS n_1d,"
+        " SUM(CASE WHEN o.ret_5d IS NOT NULL THEN 1 ELSE 0 END) AS n_5d,"
+        " SUM(CASE WHEN o.ret_20d IS NOT NULL THEN 1 ELSE 0 END) AS n_20d,"
+        " AVG(o.ret_1d)*100 AS ret_1d, AVG(o.ret_5d)*100 AS ret_5d,"
+        " AVG(o.ret_20d)*100 AS ret_20d"
+        " FROM signal_outcomes o"
+        " JOIN decisions d ON d.id = o.decision_id"
+        " JOIN cycles c ON c.id = d.cycle_id"
+    )
+    params: list = []
+    if mode is not None:
+        query += " WHERE c.mode = ?"
+        params.append(mode)
+    query += " GROUP BY d.action ORDER BY n DESC"
+    rows = conn.execute(query, params).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        for key in ("ret_1d", "ret_5d", "ret_20d"):
+            value = item[key]
+            item[key] = round(value, 2) if value is not None else None
+        item["n_1d_small"] = item["n_1d"] < min_n
+        item["n_5d_small"] = item["n_5d"] < min_n
+        item["n_20d_small"] = item["n_20d"] < min_n
+        out.append(item)
+    return out
+
+
+def _outcomes_table(rows: list[dict]) -> str:
+    lines = [
+        "| 决策 | n(决策数) | n1d | +1d | n5d | +5d | n20d | +20d |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for r in rows:
+        def _fmt(pct: float | None) -> str:
+            return "n/a" if pct is None else f"{pct:+.2f}%"
+
+        def _n(count_key: str, small_key: str) -> str:
+            mark = " ⚠️" if r.get(small_key) else ""
+            return f"{r[count_key]}{mark}"
+
+        lines.append(
+            f"| {r['action']} | {r['n']} | {_n('n_1d', 'n_1d_small')} | {_fmt(r['ret_1d'])} "
+            f"| {_n('n_5d', 'n_5d_small')} | {_fmt(r['ret_5d'])} "
+            f"| {_n('n_20d', 'n_20d_small')} | {_fmt(r['ret_20d'])} |"
+        )
+    return "\n".join(lines)
+
+
+def _evaluation_quality_lines(conn: sqlite3.Connection) -> list[str]:
+    """Only-read summary of paper-forward outcome quality. Never triggers an
+    evaluation run and never writes — purely a view over whatever
+    `signal_outcomes` already has (populated by a separate `journal.evaluate`
+    run, on its own schedule)."""
+    lines = [
+        "", "### 评估质量（paper-forward，只读展示）", "",
+        "> `n1d`/`n5d`/`n20d` 是该 horizon **已成熟的样本数**，不是决策数——"
+        "一个桶可能有 40 条决策但只有 6 条 20 日窗口已成熟，⚠️ 按每个 horizon "
+        f"各自的成熟数（< {MIN_REPORT_N}）独立标注，不看决策总数；只统计 "
+        f"`mode='{OUTCOMES_DEFAULT_MODE}'` 的周期，dry_run/backtest 不计入。"
+        "本节不跑评估、不写库，数据来自上一次 `journal.evaluate` 的结果。",
+    ]
+    try:
+        rows = _outcomes_summary(conn)
+    except sqlite3.Error as exc:
+        lines.append(f"无法读取 signal_outcomes：{exc}")
+        return lines
+    if not rows:
+        lines.append("`signal_outcomes` 暂无数据（尚未跑过 `journal.evaluate`，或该 mode 无决策）。")
+        return lines
+    lines.append(_outcomes_table(rows))
+    return lines
+
+
+def _llm_status_lines(book_root: Path) -> list[str]:
+    """Only-read summary of the analyst layer's last-known state, straight off
+    heartbeat.json (P0-B-1's `llm_status` block) — no threshold logic, no
+    alerting, just what's there for each mode that reported one."""
+    from .progress import read_progress
+
+    lines = ["", "### LLM 分析师状态（心跳，只读展示）", ""]
+    payload = read_progress(book_root / "data" / "heartbeat.json")
+    if not payload:
+        lines.append("没有心跳文件，或心跳无法解析。")
+        return lines
+    shown = False
+    for mode, label in (("deep", "深周期"), ("fast", "快扫")):
+        entry = payload.get(mode)
+        status = entry.get("llm_status") if isinstance(entry, dict) else None
+        if not isinstance(status, dict):
+            continue
+        shown = True
+        bits = [f"{label}：**{status.get('state') or 'unknown'}**"]
+        if status.get("calls") is not None:
+            bits.append(f"调用 {status['calls']} 次")
+        if status.get("failures") is not None:
+            bits.append(f"失败 {status['failures']} 次")
+        if status.get("category"):
+            bits.append(f"类别 {status['category']}")
+        tail = status.get("retry_hint") or status.get("reason") or status.get("detail")
+        if tail:
+            bits.append(str(tail))
+        lines.append("- " + "，".join(bits))
+    if not shown:
+        lines.append("心跳里没有 `llm_status` 字段（旧格式戳，或本盘未记录）。")
+    return lines
+
+
 def session_et_date(conn: sqlite3.Connection, now_utc: datetime) -> str:
     """ET calendar date of the latest paper cycle, else ET now.
 
@@ -363,17 +500,35 @@ def session_et_date(conn: sqlite3.Connection, now_utc: datetime) -> str:
     return _et_date(now_utc)
 
 
-def load_broker_fills(book_root: Path | str) -> tuple[list[dict] | None, str | None]:
-    """GET-only fill history. Never writes. Degrades to (None, reason)."""
+def load_broker_fills(book_root: Path | str) -> tuple[list[dict] | None, str | None, bool]:
+    """GET-only fill history. Never writes. Degrades to (None, reason, False).
+
+    Third element is True when the fetch hit broker_read's max_records cap,
+    meaning older fills exist beyond what was returned (AGENTS.md F6).
+    """
+    reader = BookBrokerReader(Path(book_root))
     try:
-        fills, reason = BookBrokerReader(Path(book_root)).fills()
+        fills, reason = reader.fills()
+    except BrokerError as exc:
+        return None, str(exc), False
+    except Exception as exc:  # noqa: BLE001 — network / parse / missing .env
+        return None, f"{type(exc).__name__}: {exc}", False
+    if fills is None:
+        return None, reason or "broker unavailable", False
+    return fills, None, reader.last_fills_truncated
+
+
+def load_broker_positions(book_root: Path | str) -> tuple[list[dict] | None, str | None]:
+    """GET-only broker positions. Never writes. Degrades to (None, reason)."""
+    try:
+        positions, reason = BookBrokerReader(Path(book_root)).positions()
     except BrokerError as exc:
         return None, str(exc)
     except Exception as exc:  # noqa: BLE001 — network / parse / missing .env
         return None, f"{type(exc).__name__}: {exc}"
-    if fills is None:
+    if positions is None:
         return None, reason or "broker unavailable"
-    return fills, None
+    return positions, None
 
 
 def _fills_on_session(fills: list[dict], session_day: str) -> list[dict]:
@@ -415,22 +570,69 @@ def _fills_table(rows: list[dict]) -> str:
 
 def _closed_trips_table(rows: list[dict]) -> str:
     lines = [
-        "| 符号 | 开仓时间(ET) | 平仓时间(ET) | 股数 | 实现盈亏 |",
-        "|---|---|---|---:|---:|",
+        "| 符号 | 开仓时间(ET) | 平仓时间(ET) | 股数 | 实现盈亏 | 备注 |",
+        "|---|---|---|---:|---:|---|",
     ]
     for t in rows:
+        notes = []
+        if t.get("incomplete"):
+            notes.append("⚠️ 不完整（缺期初买入记录）")
+        if t.get("ambiguous"):
+            notes.append("⚠️ 同一时刻多笔买卖，顺序无法确定")
         lines.append(
             f"| {t.get('symbol')} | {_short_et(t.get('opened_at'))} "
             f"| {_short_et(t.get('closed_at'))} | {float(t.get('qty') or 0.0):.4g} "
-            f"| {_money(t.get('realized_pnl'))} |"
+            f"| {_money(t.get('realized_pnl'))} | {'；'.join(notes)} |"
         )
     return "\n".join(lines)
+
+
+def _reconciliation_table(diffs: list[dict]) -> str:
+    lines = [
+        "| 符号 | fills 派生持仓 | 券商持仓 | 说明 |",
+        "|---|---:|---:|---|",
+    ]
+    for d in diffs:
+        fills_qty = "—" if d.get("fills_qty") is None else f"{d['fills_qty']:g}"
+        broker_qty = "—" if d.get("broker_qty") is None else f"{d['broker_qty']:g}"
+        # An undetermined symbol (R5: order-ambiguous fills touched it) is
+        # not a confirmed diff and must not read like one — same table,
+        # different label, so it's still visible but not conflated with
+        # "known to disagree".
+        label = "❓ 无法确定" if d.get("undetermined") else "⚠️ 未解释"
+        lines.append(f"| {d.get('symbol')} | {fills_qty} | {broker_qty} | {label}：{d.get('detail')} |")
+    return "\n".join(lines)
+
+
+def _reconciliation_section(
+    fills: list[dict] | None,
+    positions: list[dict] | None,
+    positions_reason: str | None,
+) -> list[str]:
+    """fills 派生的未平仓 open lots vs 券商 positions，逐 symbol 比对（见 AGENTS.md F1）。
+    只做观测展示，不影响任何决策。"""
+    lines = ["", "### 账实对账（fills 派生持仓 vs 券商持仓）", ""]
+    if fills is None:
+        lines.append("无法核对：本会话未能读取券商成交。")
+        return lines
+    if positions is None:
+        lines.append(f"无法核对：**{positions_reason or 'broker unavailable'}**。")
+        return lines
+    diffs = reconcile_positions(round_trips(fills), positions)
+    if not diffs:
+        lines.append("一致：fills 派生的未平仓持仓与券商持仓逐 symbol 匹配。")
+    else:
+        lines.append(_reconciliation_table(diffs))
+    return lines
 
 
 def _fills_section(
     session_day: str,
     fills: list[dict] | None,
     reason: str | None,
+    truncated: bool = False,
+    positions: list[dict] | None = None,
+    positions_reason: str | None = None,
 ) -> list[str]:
     lines = [
         "",
@@ -449,6 +651,8 @@ def _fills_section(
     if fills is None:
         lines += ["", f"无法读取券商成交，本栏降级：**{reason or 'broker unavailable'}**。"]
         return lines
+    if truncated:
+        lines += ["", "> ⚠️ 成交历史可能不完整：已触到读取上限，更早的成交未被拉取。"]
 
     session_fills = _fills_on_session(fills, session_day)
     closed = _closed_trips_on_session(fills, session_day)
@@ -460,10 +664,24 @@ def _fills_section(
     lines += ["", "### 本会话已平仓回合", ""]
     if closed:
         lines.append(_closed_trips_table(closed))
-        total = sum(float(t.get("realized_pnl") or 0.0) for t in closed)
-        lines += ["", f"- 本会话已实现盈亏合计：**{_money(total)}**"]
+        # Excluded from the confident total for two independent reasons — a
+        # trip can be both (an orphan sell whose timestamp also happened to
+        # tie), so they're counted and reported separately rather than as
+        # one "not complete" bucket.
+        complete = [t for t in closed if not t.get("incomplete") and not t.get("ambiguous")]
+        total = sum(float(t.get("realized_pnl") or 0.0) for t in complete)
+        incomplete_n = sum(1 for t in closed if t.get("incomplete"))
+        ambiguous_n = sum(1 for t in closed if t.get("ambiguous"))
+        notes = []
+        if incomplete_n:
+            notes.append(f"{incomplete_n} 笔不完整回合")
+        if ambiguous_n:
+            notes.append(f"{ambiguous_n} 笔顺序无法确定")
+        suffix = f"（另有 {'、'.join(notes)}未计入）" if notes else ""
+        lines += ["", f"- 本会话已实现盈亏合计：**{_money(total)}**{suffix}"]
     else:
         lines.append("本会话无已平仓回合。")
+    lines += _reconciliation_section(fills, positions, positions_reason)
     return lines
 
 
@@ -652,12 +870,17 @@ def generate_report(
             lines.append("以下类别**未落库**（只写进 logs/*.log 运行日志），无法从 journal 统计：")
         for item in NOT_JOURNALED:
             lines.append(f"- {item}")
+        lines += _llm_status_lines(_infer_book_root(db_path))
+        lines += _evaluation_quality_lines(main_conn)
 
         # (b2) broker fills / closed round-trips --------------------------------
         session_day = session_et_date(main_conn, now_utc)
         book_root = _infer_book_root(db_path)
-        fills, fill_reason = load_broker_fills(book_root)
-        lines += _fills_section(session_day, fills, fill_reason)
+        fills, fill_reason, fills_truncated = load_broker_fills(book_root)
+        positions, positions_reason = load_broker_positions(book_root)
+        lines += _fills_section(
+            session_day, fills, fill_reason, fills_truncated, positions, positions_reason
+        )
 
         # (c) P2 comparison ------------------------------------------------------
         if p2_conn is not None:
