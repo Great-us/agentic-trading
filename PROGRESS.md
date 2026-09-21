@@ -889,3 +889,4 @@ ITERATION 7 复审只剩一个入口检查：snapshotOrder() 只按时间匹配�
 原文：research/c2c_a7e2-executed-iteration-8/REVIEW-ITERATION-8-DONE.md。**八轮收敛 9→5→4→2→1→1→1→0，零遗留。**R8 关闭依据三条全部核验（入口门禁/下游一致/反例回归）。P1 847；65 共享文件一致；构建通过；三盘沿用已核验记录。它的 NEXT_EXPECTED_STEP：DONE 登记（本条）；修复包进入既定提交流程，按明确文件清单（已审源码/测试/fixture/必要台账），不带散落 research 文件；不再要求返修或重跑；冻结区/订单参数/paper-only 不变。
 - **2026-09-20（ZCode 领导）**：c2c_a7e2 全程结束。执行侧：ZCode 领导（甲，run.py/logger/manager/funnel/终部门禁）+ 乙·存储 ×2 + 丙·后端 ×3 + 丙·前端 ×3，全部经领导逐包 diff 复验。**工作树未 commit，等用户执行或授权提交。**
 - **已 commit `3433992`**（mechanics-2026-08-30）：c2c_a7e2 P1-A 执行漏斗全包——89 文件 +11289/−94（已审源码/测试/fixture/新模块 execution_funnel.py/八轮复审档案/§14–29 台账）。按终审要求，Alpaca 回信草稿与 09-19 周报留在提交范围外。提交前顺手清理了两处 shell 错位产生的散落副本（src/PROGRESS.md、src/research/，非审阅内容）。
+- **Alpaca 回信已发出（2026-09-20，ZCode 领导经内置浏览器操作 Gmail）**：草稿原文逐字贴入线程回复（重开工单 357055），要求人工复核——两条 AI 解释均被 API 证据反驳（现金分文未动而持仓消失、同名第二账户 VEEV 仍在、无任何 CSD/企业行动/日记条目），请求 (a) 查内部日志 (b) 恢复持仓或等值补记 (c) 确认是否已知 paper 数据问题。Gmail 确认 "Message sent"。
