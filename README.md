@@ -2,17 +2,30 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+![Agentic Trading — bilingual paper-trading overview](docs/media/agentic-trading-remotion/renders/agentic-trading-intro.gif)
+
+20 秒中英双语简介；仅模拟交易，画面为合成流程示意，不代表实际收益。
+20-second bilingual overview with synthetic visuals, not actual performance.
+[MP4](docs/media/agentic-trading-remotion/renders/agentic-trading-intro.mp4) ·
+[Animation source](docs/media/agentic-trading-remotion/README.md)
+
 **可审计的 AI 美股模拟交易系统 / Auditable AI-assisted US-equities paper trading**
 
 量化信号 → AI 分析 → 风控检查 → Alpaca 模拟执行 → 成交对账与只读仪表盘。
-支持结构化决策记录、交易意图追踪、止损覆盖核验和多交易书观测。
+支持结构化决策记录、交易意图追踪、止损覆盖检查和多交易书观测。
 当前执行引擎为股票多头模拟交易；收益能力仍在前瞻验证中。
 
 A US-equities paper-trading agent: technical (quant) signals combined with
 a configurable LLM's qualitative read on news/fundamentals, run through hard
 risk limits and executed autonomously on Alpaca's **paper** trading account.
 Long-only, with an auditable intent-to-order trail, fill reconciliation,
-protective-stop verification and a local read-only dashboard.
+protective-stop coverage checks and a local read-only dashboard.
+
+止损机制尝试提交保护单，并按周期协调、回查状态和数量；回查失败时可回退采用提交响应。
+这些检查不保证有效挂单、成交或止损价格。
+The engine attempts protective-stop submission and periodically reconciles order
+status and quantity. If a lookup fails, it may fall back to the submission
+response. Coverage checks do not guarantee an active order, execution, or a stop price.
 
 This repository contains the P1 engine and dashboard. P2/P3/P4 references in
 operational notes describe separate local deployments; their specialized
@@ -91,23 +104,24 @@ Then for each symbol in `config/watchlist.yaml`:
    `max_chase_vs_signal_pct`) hold an intent that would buy the top of the
    morning's move for a later scan instead. Intents expire after **72
    hours** — long enough to span a weekend, short enough that a week-old
-   analysis can't execute after an outage. With `require_llm_for_entry` on
-   (default), a BUY whose LLM verdict went missing mid-cycle is downgraded to
-   WAIT: a decision chain missing a layer doesn't open new risk (`--skip-llm`
-   stays an explicit operator override). No credentials → `DryRunBroker`.
+   analysis can't execute after an outage. When `require_llm_for_entry` is on
+   and this cycle uses the analyst (`use_llm = analyst_ok and not skip_llm`),
+   a new BUY with no LLM verdict is downgraded to WAIT. `--skip-llm` explicitly
+   bypasses this verdict gate; other risk checks still apply.
+   No credentials → `DryRunBroker`.
 7. **Journal** (`journal/logger.py`) — every symbol's signal, verdict, decision,
    and order outcome is written to `data/journal.db` (SQLite) for later review.
 
 Then once more at the end of the cycle:
 
-8. **Protective-stop reconciliation** — positions are re-read (so anything that
-   just filled is included) and every one of them is checked against a resting
-   stop order at Alpaca, which is placed or ratcheted up as needed. This is what
-   protects a position between cycles. The same reconciliation **also runs at
-   the start** of every cycle, so a position left bare by a mid-cycle crash
-   (killed process, timeout) gets its stop back within one cycle start instead
-   of surviving unprotected through an entire pass. A failed sell re-places the
-   stop immediately rather than waiting for the end-of-cycle pass.
+8. **Protective-stop reconciliation** — the engine attempts to refresh positions
+   and checks protective-order status and quantity, submitting or ratcheting
+   stops where needed. Reconciliation also runs at the start of active cycles
+   to detect gaps left by an interrupted pass. A failed sell triggers an
+   immediate restoration attempt with result checks. These are best-effort
+   operations: broker errors, stale observations, expiry, or interrupted cycles
+   can leave coverage absent or unconfirmed. No cycle or restoration attempt
+   guarantees an active stop, execution, or a particular fill price.
 
 ## Setup
 
@@ -330,9 +344,10 @@ cycle at 9:45 AM and 4:15 PM US/Eastern on weekdays:
 **09:45, not pre-market.** The cycle must run after the open so its data, regime
 read, and stop reconciliation all see a live market. Since the entry-window
 change, the 9:45 cycle itself no longer submits buys: decisions queue as
-`TradeIntent`s and the 20-minute fast scans execute them from 10:00 ET once the
-gap and chase checks pass — so a buy fills *and* receives its protective stop
-without ever trading the opening chaos. Orders from the afternoon run queue for
+`TradeIntent`s and the 20-minute fast scans may submit them from 10:00 ET once the
+entry, gap, chase, and risk checks pass. The engine then attempts protective-stop
+submission and checks the result; neither an entry fill nor stop coverage is
+guaranteed. Orders from the afternoon run queue for
 the next session's window, which is the intended behaviour for a
 swing-horizon strategy.
 
@@ -543,9 +558,10 @@ because the "safe" version was actively harmful, not merely cautious:
 
 **No fixed take-profit.** A momentum strategy earns its return from a small
 number of large winners. Capping gains at +15% while letting losses run to the
-stop inverts the payoff — you keep the small wins and all of the losses. Winners
-are now cut by a 12% trailing stop instead, so a trend can run as far as it
-wants and only gives back a fixed slice of its peak.
+stop changes the payoff by limiting large winners. The configured 12% trailing
+component instead sets a trigger level relative to the tracked peak, alongside
+the other stop rules. It does not cap realised drawdown: gaps, slippage, absent
+coverage, or execution failures can produce a larger loss.
 
 **Stops scale with volatility, not a fixed percentage.** At 60% annualised
 volatility (MSFT, AMZN, and TSLA were all near or above that in testing) one
@@ -595,18 +611,19 @@ positions, which this project uses for every buy:
 | plain stop order | **supported** | supported |
 | time in force | DAY only | GTC allowed |
 
-So the resting order is a plain stop, and DAY-only means it must be re-placed
-each cycle rather than left indefinitely. The pre-market run covers the session
-that follows it.
+The engine uses plain DAY stops and periodically attempts to reconcile or renew
+them; they cannot be assumed to remain active indefinitely. A completed cycle
+does not guarantee coverage in the next session. Coverage can lapse, fail, or
+remain unconfirmed, so current order-status and quantity checks matter.
 
 Two consequences worth understanding:
 
 - **A resting stop reserves the shares it covers.** Any exit path therefore
   cancels open orders for that symbol before selling, or the sell is rejected
   for insufficient quantity.
-- **A stop is not a floor.** It becomes a market order when touched, so a
-  position that gaps down overnight fills at the gapped price, not the stop
-  price. No order type avoids that.
+- **A stop is not a floor.** A stop-market order becomes a market order when
+  triggered; gaps and slippage can put its execution price below the stop level.
+  Execution can also be delayed or fail. The trigger is not a guaranteed fill price.
 
 ### Unfilled buys are not re-bought
 
@@ -644,21 +661,23 @@ exercised live against the paper account.
   would require deliberately rewriting both, not just editing `.env`.
 - **Long-only.** No shorting/margin logic exists; `SELL` only ever closes an
   existing long.
-- **Risk limits are hard-coded to win.** Stop / trailing-stop / take-profit
+- **Risk limits take precedence over signals.** Stop / trailing-stop / take-profit
   checks run before the quant/LLM decision even happens, and position sizing is
   capped regardless of how confident a signal is.
-- **Every position sits behind a broker-side stop**, so protection does not
-  depend on this program being awake — see below.
-- **Holdings that leave the watchlist stay protected.** Peak updates and the
-  client-side exit checks run over everything the account holds, not just
-  current watchlist names — dropping a symbol no longer silently downgrades its
-  trailing stop to a frozen level and blinds its exit checks.
+- **Broker-side stop coverage is checked, not guaranteed.** An active broker
+  order can operate between cycles, but expiry, rejection, broker errors, or
+  interrupted reconciliation can leave a position uncovered or unconfirmed.
+- **Off-watchlist holdings remain in the monitoring path.** Peak updates,
+  client-side exits, and stop reconciliation include observed account holdings,
+  not just watchlist names. Inclusion does not guarantee successful observation,
+  order submission, or uninterrupted protection.
 - **A bad tick cannot poison the trailing stop.** An implausible bar High is
   ignored for the peak update, and a computed stop at/above the market is
   refused rather than submitted-and-rejected every cycle.
-- **LLM failures degrade to quant-only**, they never get treated as a
-  bullish/bearish signal by default — a failed API call returns `None`, not a
-  guess.
+- **Missing LLM verdicts are not fabricated signals.** When the analyst is in
+  use and `require_llm_for_entry` is enabled, a new BUY with no verdict becomes
+  WAIT. `--skip-llm` explicitly bypasses this verdict gate, not the other risk
+  checks. A failed analysis returns `None`, not an invented bullish/bearish view.
 - **Orders are idempotent within a cycle.** Every submit carries a
   deterministic `client_order_id` derived from (cycle, purpose, symbol), so a
   submit that times out client-side is retried with the same id — Alpaca

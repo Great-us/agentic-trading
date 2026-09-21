@@ -294,15 +294,39 @@
   closed_or_holiday；⑨ 只读诊断 `journal/p1_diagnostics.py`。**VEEV 持仓 09-16 夜间从 P1 券商
   账户消失**（无成交无现金变动，P2 的 VEEV 仍在），已向 Alpaca 申诉。冻结区零改动。
 
-## 运维速查
-
-- 2026-09-21（Codex，开源发布准备）：用户要求将当前分支替代旧 master 并推送 GitHub、
+- 2026-09-21（Codex，开源发布）：用户要求将当前分支替代旧 master 并推送 GitHub、
   开源及制作中英双语 GIF。本地已将 mechanics-2026-08-30 改名为 master，保留完整历史。
   新增 MIT LICENSE、上游 MIT 归属 THIRD_PARTY_NOTICES.md、README 双语简介与部署范围说明。
   发布前扫描全部可达历史的 344 个 Git blob，唯一密钥模式命中为脱敏单元测试的合成字符串，
   未发现真实凭据；这不是完整安全审计。未跟踪的 Alpaca 回信稿、09-19 周报不随本次发布纳入。
   GIF 制作委派给既有 Codex 任务 01a0c5f3-f44e-7990-95f8-87e60d7e155b，要求网页 GPT 规划，
   仅使用合成演示数据，产物放 docs/media/。本次未改交易引擎或冻结配置。
+  已将 master 推送至 Great-us/agentic-trading，仓库由 PRIVATE 改为 PUBLIC；
+  GitHub API 已确认默认分支 master、MIT 许可证及公开状态。
+  GIF 员工已交付 Remotion 版本至 `docs/media/agentic-trading-remotion/`：20 秒，
+  最终 GIF 960×540/12fps/3,471,888 bytes，另有 MP4 与源码；主管复跑 lint/tsc 通过并检查五幕中点。
+  README 已接入动画。最初未完成网页 GPT 事前规划；固定入口恢复后，实际完成了源码/文案的
+  GPT for Codex 事后复审，Iteration 5 最终为 `PUBLISH_READY`。修订了 long-only 标识、
+  LLM 缺失结论的条件说明，以及止损尝试/覆盖检查与成交保证的区别。GPT 没有审阅 GIF/MP4
+  二进制或画面；视觉验收由本地执行者和主管完成。本次发布仅纳入 Remotion 成品与可复现源码，
+  不纳入其它媒体草稿、私人研究文件、node_modules、账户数据或本地连接配置。
+
+- 2026-09-21（Codex，固定入口迁移）：Trading 的 C2C Bridge 已从 Quick Tunnel 切为
+  `https://connector.anbostein.indevs.in/mcp`。本机 `Cloudflared` Windows Service 为 Auto/Running，
+  48765 只服务 Trading；C2C 的 local `config.json` 用 workspace ID 绑定固定 origin，避免影响另一个
+  5821 Bridge。服务端、OAuth 发行者/发现元数据和资源 URI 都从该 origin 派生；ChatGPT 的
+  `https://chatgpt.com/connector_platform_oauth/callback` 仍是第三方客户端回调，未改。旧的 48765
+  Quick Tunnel 进程已退出。C2C 全套 187 tests、typecheck 与 live 11/11 OAuth + MCP 验证通过，未碰
+  交易引擎或冻结配置。随后在 ChatGPT 的实际插件记录中只读核验：`Codex with ChatGPT · Trading`
+  已登记目标固定地址（Connected on Sep 21, 2026，OAuth connected account），**不需要删除、重建或
+  Refresh**，并且绝不能碰其它 connector/tunnel。既有 Trading 对话最初显示授权 expired；经用户明确
+  同意，仅恢复了该已登记客户端、重启 Trading Bridge 并完成一次 OAuth 重新授权（URL 未变、未删除/重建
+  connector）。随后 ChatGPT 通过该连接确认 workspace 为 Trading，并读取 `README.md` 与指定的 Remotion
+  源码/文案。其只读事后复审确认使用的是固定流程文案、未读取账户或行情数据、未冒称二进制 GIF 视觉审阅；
+  初步指出需核实三类措辞：绝对化 LLM 故障表述、long-only 标签、broker-stop 表述。未改动画、README 或交易
+  代码，也未触碰其它连接。
+
+## 运维速查
 
 - 计划任务：**10 个** `AgenticTrading*`（Task Scheduler），入口 `run_cycle.cmd` /
   `run_weekly_review.cmd`。深周期 9:45/16:15 ET，fast scan 盘中每 20 分钟；
