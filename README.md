@@ -1,8 +1,29 @@
 # Agentic Trading
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**可审计的 AI 美股模拟交易系统 / Auditable AI-assisted US-equities paper trading**
+
+量化信号 → AI 分析 → 风控检查 → Alpaca 模拟执行 → 成交对账与只读仪表盘。
+支持结构化决策记录、交易意图追踪、止损覆盖核验和多交易书观测。
+当前执行引擎为股票多头模拟交易；收益能力仍在前瞻验证中。
+
 A US-equities paper-trading agent: technical (quant) signals combined with
-Kimi K3's qualitative read on news/fundamentals, run through hard risk limits,
-executed autonomously on Alpaca's **paper** trading account. Long-only.
+a configurable LLM's qualitative read on news/fundamentals, run through hard
+risk limits and executed autonomously on Alpaca's **paper** trading account.
+Long-only, with an auditable intent-to-order trail, fill reconciliation,
+protective-stop verification and a local read-only dashboard.
+
+This repository contains the P1 engine and dashboard. P2/P3/P4 references in
+operational notes describe separate local deployments; their specialized
+strategy modules and account data are not bundled here. Configure local paths
+in `config/dashboard.yaml` and scheduler scripts for your own installation.
+Historical research and review notes are dated records, not evidence of current
+profitability. Paper-forward strategy validation is still in progress.
+
+项目源码采用 [MIT 许可证](LICENSE)；第三方归属见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。运行需自行配置行情、券商和模型访问。
+Source code is MIT-licensed; provider access and market-data rights are separate.
 
 It does place orders without asking — but only ever against a paper account, on
 simulated money. The code refuses to construct a live broker client at all; see
@@ -23,8 +44,9 @@ Then for each symbol in `config/watchlist.yaml`:
 
 1. **Quant signal** (`signals/technical.py`) — a transparent composite score in
    `[-1, 1]` from trend (price vs SMA50), SMA20/SMA50 crossover, 20-day
-   momentum, MACD histogram, and RSI14. No ML, no curve-fit parameters — you can
-   read the score and know exactly why it's what it is. Also flags a setup as
+   momentum, MACD histogram, and RSI14. The rule-based score is inspectable;
+   historical parameter selection is documented in the holdout ledger and
+   should not be treated as out-of-sample proof. Also flags a setup as
    *extended* (trend intact but price stretched above its 20-day mean with a hot
    RSI), which becomes a WAIT rather than a chase.
 2. **Risk override check** — if the symbol is already held, the ATR stop,

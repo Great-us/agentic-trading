@@ -296,6 +296,14 @@
 
 ## 运维速查
 
+- 2026-09-21（Codex，开源发布准备）：用户要求将当前分支替代旧 master 并推送 GitHub、
+  开源及制作中英双语 GIF。本地已将 mechanics-2026-08-30 改名为 master，保留完整历史。
+  新增 MIT LICENSE、上游 MIT 归属 THIRD_PARTY_NOTICES.md、README 双语简介与部署范围说明。
+  发布前扫描全部可达历史的 344 个 Git blob，唯一密钥模式命中为脱敏单元测试的合成字符串，
+  未发现真实凭据；这不是完整安全审计。未跟踪的 Alpaca 回信稿、09-19 周报不随本次发布纳入。
+  GIF 制作委派给既有 Codex 任务 01a0c5f3-f44e-7990-95f8-87e60d7e155b，要求网页 GPT 规划，
+  仅使用合成演示数据，产物放 docs/media/。本次未改交易引擎或冻结配置。
+
 - 计划任务：**10 个** `AgenticTrading*`（Task Scheduler），入口 `run_cycle.cmd` /
   `run_weekly_review.cmd`。深周期 9:45/16:15 ET，fast scan 盘中每 20 分钟；
   周复盘两盘各一个（P1 周六 08:30 / P2 周六 09:30）。
