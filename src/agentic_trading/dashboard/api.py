@@ -31,6 +31,7 @@ from .views import (
     cycles_index,
     decisions as decisions_view,
     equity_series,
+    funnel_summary,
     latest_cycle,
     list_intents,
     logic_payload,
@@ -187,6 +188,31 @@ def get_vetoes(book_id: str, days: int = 7) -> JSONResponse:
         return JSONResponse({"vetoes": veto_counts(conn, days=days)})
     finally:
         conn.close()
+
+
+@app.get("/api/books/{book_id}/funnel")
+def get_funnel(book_id: str, mode: str = "paper") -> JSONResponse:
+    """A-4 (c2c_a7e2 §五): read-only execution-funnel aggregation for Today.
+
+    GET-only; the journal opens read-only and the aggregation never writes or
+    migrates. Broker fills are matched by order_id as positive evidence — a
+    read failure or a truncated window degrades explicitly instead of being
+    read as "no fills".
+    """
+    book = _book_or_404(book_id)
+    reader = _reader(book)
+    fills, fill_reason = reader.fills()
+    # getattr: older/fake readers may not carry the truncation flag.
+    truncated = getattr(reader, "last_fills_truncated", None) if fills is not None else None
+    conn = _conn(book_id)
+    try:
+        payload = funnel_summary(
+            conn, mode=mode, fills=fills, fills_reason=fill_reason,
+            fills_truncated=truncated,
+        )
+    finally:
+        conn.close()
+    return JSONResponse(payload)
 
 
 @app.get("/api/books/{book_id}/today")

@@ -1,0 +1,27 @@
+  expected (P2 only)  : p2_roster.py
+  expected (P3 only)  : p3/__init__.py
+  expected (P3 only)  : p3/briefing.py
+  expected (P3 only)  : p3/config.py
+  expected (P3 only)  : p3/evaluate.py
+  expected (P3 only)  : p3/execute.py
+  expected (P3 only)  : p3/high_water.py
+  expected (P3 only)  : p3/ids.py
+  expected (P3 only)  : p3/journal.py
+  expected (P3 only)  : p3/ledger.py
+  expected (P3 only)  : p3/llm.py
+  expected (P3 only)  : p3/pool.py
+  expected (P3 only)  : p3/prompts.py
+  expected (P3 only)  : p3/reconciler.py
+  expected (P3 only)  : p3/shadow.py
+  expected (P3 only)  : p3/watchdog.py
+  expected (P4 only)  : p4/__init__.py
+  expected (P4 only)  : p4/bars.py
+  expected (P4 only)  : p4/config.py
+  expected (P4 only)  : p4/executor.py
+  expected (P4 only)  : p4/journal.py
+  expected (P4 only)  : p4/mechanical.py
+  expected (P4 only)  : p4/minute_broker.py
+  expected (P4 only)  : p4/playbook.py
+  expected (P4 only)  : p4/reconciler.py
+  expected (P4 only)  : p4/replay.py
+In sync: 65 shared files identical across P1, P2, P3, P4; config/risk.yaml byte-identical.

@@ -8,6 +8,7 @@ from __future__ import annotations
 import itertools
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,45 @@ class OrderIdMinter:
         return f"at-{purpose}-{symbol}-{self._stamp}-{next(self._seq)}"[:120]
 
 
+def _safe_optional_float(raw) -> float | None:
+    """Optional broker fill fields are display evidence, never control flow:
+    a garbage string (review R1 counter-example: filled_qty="bad" alongside a
+    VALID status) must degrade that field to None, not raise through the stop
+    chain that consumed the submit response."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring unparseable optional fill field %r.", raw)
+        return None
+
+
+@dataclass(frozen=True)
+class OrderObservation:
+    """Read-only evidence about one broker order, produced exclusively via
+    Broker.observe_order() — the single order re-query entry point (c2c_a7e2
+    contract 2). It is deliberately separate from OrderResult: an OrderResult
+    is a *submit fact*, an OrderObservation is *later evidence* and must never
+    rewrite the submit result, release budget, or trigger a retry."""
+
+    order_id: str
+    status: str | None            # normalized lowercase broker status; None = re-query failed
+    observed_at: str              # ISO UTC
+    filled_qty: float | None
+    filled_avg_price: float | None
+    filled_at: str | None
+    error: str | None
+
+    def is_terminal(self) -> bool:
+        """True only when the broker's own status says this order can no longer
+        change (dead or fully filled). A failed re-query (status=None) is NOT
+        terminal — absence of evidence is not evidence of completion."""
+        return self.status is not None and (
+            self.status in DEAD_ORDER_STATUSES or self.status == "filled"
+        )
+
+
 @dataclass
 class OpenOrder:
     order_id: str
@@ -119,6 +159,7 @@ class Broker(Protocol):
     def submit_notional_buy(self, symbol: str, notional: float, *, atr14: float | None = None, client_order_id: str | None = None) -> OrderResult | None: ...
     def get_open_orders(self) -> list[OpenOrder]: ...
     def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None: ...
+    def observe_order(self, order_id: str) -> OrderObservation | None: ...
     def cancel_order(self, order_id: str) -> bool: ...
 
 
@@ -237,6 +278,34 @@ class AlpacaBroker:
             for o in orders
         ]
 
+    def observe_order(self, order_id: str) -> OrderObservation:
+        """The single order re-query entry point. Returns read-only evidence
+        about the order's current state; a failed query yields status=None plus
+        an error message rather than raising or guessing. Optional fill fields
+        are only present when the broker actually reported them."""
+        try:
+            order = self._client.get_order_by_id(order_id)
+        except Exception as exc:
+            logger.warning("Order re-query failed for %s: %s", order_id, exc)
+            return OrderObservation(
+                order_id=order_id, status=None,
+                observed_at=datetime.now(timezone.utc).isoformat(),
+                filled_qty=None, filled_avg_price=None, filled_at=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        raw_qty = getattr(order, "filled_qty", None)
+        raw_price = getattr(order, "filled_avg_price", None)
+        raw_filled_at = getattr(order, "filled_at", None)
+        return OrderObservation(
+            order_id=str(order_id),
+            status=_enum_str(order.status).lower() if getattr(order, "status", None) is not None else None,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+            filled_qty=_safe_optional_float(raw_qty),
+            filled_avg_price=_safe_optional_float(raw_price),
+            filled_at=str(raw_filled_at) if raw_filled_at else None,
+            error=None,
+        )
+
     def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None:
         """Broker-side protective stop. Plain stop rather than trailing, because
         Alpaca does not accept trailing stops on fractional positions — the
@@ -262,16 +331,27 @@ class AlpacaBroker:
             return None
         # "Submitted" is not "resting". Alpaca acknowledges with `accepted`
         # and can still reject a moment later (wash-trade rule, buying-power,
-        # queue processing), so re-read the order once before claiming the
-        # position is protected. A failed re-read falls back to the submit
-        # response — that is what we had before, not a reason to give up.
+        # queue processing), so re-read the order once — via the shared
+        # observe_order() entry — before claiming the position is protected.
+        # A failed re-read (observation carries status=None + error) falls
+        # back to the submit response — that is what we had before, not a
+        # reason to give up.
         status = _enum_str(order.status)
         try:
-            refreshed = self._client.get_order_by_id(order.id)
-            status = _enum_str(refreshed.status)
+            observation = self.observe_order(str(order.id))
         except Exception:
+            # P0 fallback preserved (review R1): even the shared re-query entry
+            # raising must leave the stop path on the submit response.
             logger.warning("Could not re-read protective stop %s for %s after submit; "
-                           "trusting the submit response (%s).", order.id, symbol, status, exc_info=True)
+                           "trusting the submit response (%s).", order.id, symbol, status,
+                           exc_info=True)
+            observation = None
+        if observation is not None and observation.status is not None:
+            status = observation.status
+        else:
+            detail = f" ({observation.error})" if observation is not None and observation.error else ""
+            logger.warning("Could not re-read protective stop %s for %s after submit; "
+                           "trusting the submit response (%s)%s.", order.id, symbol, status, detail)
         # Three outcomes, and the caller decides on `status`, not on None-ness:
         #   DEAD (rejected/expired/...)   -> None: nothing rests, caller may re-place.
         #   resting (stop_is_resting)     -> OrderResult: the position is covered.
@@ -348,6 +428,11 @@ class DryRunBroker:
     def submit_stop_sell(self, symbol: str, qty: float, stop_price: float, *, client_order_id: str | None = None) -> OrderResult | None:
         logger.info("[DRY RUN] would place protective stop: %s x%s @ %.2f", symbol, qty, stop_price)
         return OrderResult(symbol=symbol, side="sell", qty=qty, status="dry_run", order_id=None)
+
+    def observe_order(self, order_id: str) -> OrderObservation | None:
+        # No broker behind a dry run: the caller degrades to "unverified",
+        # never a fabricated paper fill.
+        return None
 
     def cancel_order(self, order_id: str) -> bool:
         logger.info("[DRY RUN] would cancel order %s", order_id)

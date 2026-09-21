@@ -334,6 +334,45 @@ f. 在 PROGRESS.md §6 末尾追加一段，标题「候选员工 D（OpenCode /
   - 现场：P1 `heartbeat --check` 现在 **[ALERT] exit 1**，内容正是 16:15 深周期的 `circuit_open / quota / try again at Sep 20th, 2026 4:00 PM`——这就是裁定 ② 想要的响声，额度恢复前每小时的 HeartbeatCheck 都会响一次。
   - 已知边界（记录不返工）：`_reconcile_protective_stops` 的 `existing = {o.symbol: o}` 同一 symbol 多张止损只看最后一张；正常 cancel/replace 流程只会有一张。
 
+- **2026-09-20（Claude Sonnet 5，员工丙）：SizingDiagnostics（c2c_a7e2 第一步，契约 §14.4）DONE-待审。**
+  - **半成品处置**：`git diff` 核过上一任丙的 +52 行（dataclass + `_empty_sizing_diagnostics` + SizeResult.diagnostics 默认值），形状与 §14.4 逐字段一致、未接调用点、向后兼容——**续写，不重写**。
+  - **基线 fixture（先钉后改）**：`tests/test_risk.py` 新增 `_SIZING_BASELINE`——13 个代表性输入（现金充足 / 单仓上限 / 行业顶到 / 相关性折扣 / 敞口顶到 / 现金顶到 / 组合止损风险顶到 / 行业余量归零 / 低于最低仓位 / invalid price / max_open_positions / invalid stop / 现金与敞口并列）的 `(approved, notional.hex(), reason)` 逐位记录。**改动前运行即绿**（钉住的是改动前行为），接线后仍逐位一致 = 诊断不改变 sizing 结果的证据。
+  - **接线（`risk/manager.py`，算术逐位不动）**：三个早退挂 `_empty_sizing_diagnostics("invalid_price" / "max_open_positions" / "invalid_stop_distance")`；主路径把原有内联表达式提为局部变量（`position_cap` / `stop_risk_room_notional` / `min_position_notional`，表达式与运算顺序不变），字段全部从本次 sizing 实际中间变量带出。`stop_risk_room_pct = remaining_risk / equity` 只在 `port_cap > 0` 分支内计算，未配置时 None（不多算除法）；`sector_theme_room = max(0.0, sector_room)` 与原比较表达式同源；`available_notional` = round 之后、归零之前的值。拒绝时 `notional=0.0` 不动。原因串一个字符未改。
+  - **结构化命名（契约只给了示例，命名是我的设计，请领导/ChatGPT 核）**：`binding_constraints` ∈ `risk_budget`（无钳制，等于风险预算 target）/ `position_cap` / `exposure_cap` / `cash` / `stop_risk_budget`，相关性折扣**追加** `correlation_haircut`，行业钳制**覆盖**为 `("sector_cap",)`（与 reason 串的替换语义一致）；min 值并列时按 limits 顺序全列（如 `("exposure_cap", "cash")`）。`reject_code` ∈ 三个早退码 + `below_min_position`（批准为 None）。
+  - **红→绿**：红输出（接线前）——
+    ```
+    FAILED tests/test_risk.py::test_diagnostics_full_path_nothing_clamps - AssertionError: isinstance(None, SizingDiagnostics)
+    …（10 个 diagnostics 用例同因）
+    10 failed, 43 passed in 0.85s
+    ```
+    绿：`tests/test_risk.py` **54 passed**（原 42 + 新 12）。
+  - **自我返修 1 处**：我原假设 RISK fixture 的 `max_portfolio_stop_risk_pct` 未配置（默认实为 0.06，见 config.py:41），`test_diagnostics_full_path_nothing_clamps` 错断 stop 字段为 None；已改为断言实际计算值，并新增 `test_diagnostics_stop_risk_fields_none_when_cap_not_configured`（`replace(RISK, max_portfolio_stop_risk_pct=0.0)`）覆盖 None 分支。
+  - **测试数**：test_risk.py 42 → 54（+12）；P1 全量 **690 passed**（基线 678 + 12）。
+  - **同步**：`risk/manager.py` + `tests/test_risk.py` 已 `cp -p` 到 P2/P3/P4；`check_p2_sync.py` **exit 0**（64 shared files identical + risk.yaml byte-identical）；三盘 `test_risk.py` 各 54 passed。
+  - 未 commit、未碰 `run.py` / 冻结区 / `.env`。**下一步等领导通知「乙的 logger 契约已落地」后做 `dashboard/views.py` 漏斗聚合（第二步）。**
+
+- **2026-09-20（ZCode 领导，接任）**：接任领导。背景：Claude Desktop 周额度 403（09-23 22:00 恢复），用户指定 ZCode 以「领导 + 子 agent 员工」模式继续 c2c_a7e2；协调主通道仍为本文件，子 agent 只汇报不写台账。
+  1. **丙的 SizingDiagnostics 领导侧通过（DONE → 领导通过，待 ChatGPT 终审）**：diff 逐段复核——三个早退挂 `_empty_sizing_diagnostics`（reason 串零改动）；主路径只把内联表达式提为局部变量（`position_cap` / `stop_risk_room_notional` / `min_position_notional`），算术与 round 时点逐位不动；`stop_risk_room_pct` 仅在 `port_cap > 0` 分支计算；拒绝时 `notional=0` 不动、`available_notional` 保留归零前值；sector cap 覆盖 `binding_constraints=("sector_cap",)` 与 reason 的替换语义一致。13 例逐位基线为证。`binding_constraints` 的命名设计（丙自注）留 ChatGPT 终审核。
+  2. **甲的基线轨迹补完（leader 接手 403 中断处）**：跑场景生成器，6 条事件逐条人工核对后写入 fixture `expected_events`：RATCHET 止损 @110（`0x1.b8p+6`）→ SELLER 市价卖出 5 股 → cancel `stop-1` → 棘轮上移 @131.8（`0x1.079…ap+7`）→ BUYA $18,000（=position_cap，`0x1.194p+14`）→ BUYB $17,000（=sector 余量，`0x1.09ap+14`）；VETO sizing 否决、CHASE 追高拦截，均零调用。**记录语义说明**：记录时工作树含丙的 `risk/manager.py` 改动，但本场景的全部 sizing 路径（position_cap / sector cap / 否决）被丙的 13 例逐位基线覆盖（改前即绿），故轨迹等价于 97a65d6。P1 全量 **691 passed**（此前 690+1 fail → 修复）。
+  3. **四盘同步**：`tests/test_trade_trace_baseline.py` + `tests/fixtures/trade_trace_baseline.json` 已 cp 到 P2/P3/P4，三盘该测试各 1 passed；`check_p2_sync.py` exit 0。
+  4. **A-1 完成（ZCode 子 agent「乙·存储」执行，领导复验通过）**：`journal/logger.py` 357→557 行——`trade_intents.version`（UUID4，save 时生成、读取/flush 不生成、删除重建不复用、旧行保持 NULL 不补造）+ `IntentSaveReceipt` + `intent_events` 8 个可空关联列（增量迁移、幂等、先列后唯一索引，`idx_intent_events_event_id` 配 INSERT OR IGNORE 去重）+ `record_intent_event` 白名单 payload（`INTENT_EVENT_PAYLOAD_KEYS`，嵌套递归、非有限浮点→NULL）+ savepoint 隔离事件写入。新测试 `tests/test_intent_identity.py` 9 例红→绿（迁移幂等 / 十次 deferred flush 单一 intent_id / 替换保留前版本 / 删除重建不复用 / event_id 去重 / 事件写失败不回滚业务保存 / 旧签名兼容 / payload 白名单 / 旧构造兼容）。P1 全量 **700 passed**，三盘 test_intent_identity 各 9 passed，sync exit 0。
+     - **已知偏离（两处，留 ChatGPT 终审）**：① `record_intent_event` 用位置参数个数区分旧式 `(timestamp, symbol, kind)` 与新式 `(symbol, kind, deferred, detail)`（现有签名与 run.py 5 处旧调用决定，两者完全向后兼容，混合传参会 TypeError）；② 该函数现在结尾带 `conn.commit()`（旧版无 commit）——与本模块 save/clear 一致，且 savepoint 保证失败不污染调用方事务。
+  5. **A-3 完成（ZCode 子 agent「乙·订单」执行，领导复验通过）**：`execution/broker.py` 355→417 行——`OrderObservation`（frozen，7 字段 + `is_terminal()`：status=None 不算终态）+ `Broker.observe_order()` 协议（DryRunBroker → None 不伪报）+ `AlpacaBroker.observe_order()`（复用 `get_order_by_id`，异常 → status=None + error，成交字段防御性解析）+ `submit_stop_sell` 回查段改走唯一入口：status 非 None 采用，回查失败逐字保留 fallback 语义（"Could not re-read … trusting the submit response"，堆栈改为 error 串入日志正文），三分类返回与下游判定原样。新测试 `tests/test_order_observation.py` 24 例红→绿（契约要求全覆盖：accepted 未成交 / accepted→filled / 部分成交 / rejected/canceled/expired / 未知 / 回查异常 / 旧 fake 降级 / 同订单多观察只算一张 / rejected 不改写非空买单结果 / accepted≠买单 filled / `submit_notional_buy` 零改动）。P1 全量 **724 passed**（700+24），`test_stop_reconciliation` + `test_p0_hardening` 止损回归原样全绿，三盘各 24 passed，sync exit 0。
+     - **说明（留 ChatGPT 终审）**：回查成功的状态现在经 `.lower()` 规范化（此前 `_enum_str` 不转小写）；Alpaca 状态枚举实际为小写，123 个定向测试（含 P0-B-2 全部回归）绿。
+  6. **A-2 核心接线完成（领导亲任甲，红测试先行）**：
+     - **新共享模块 `src/agentic_trading/execution_funnel.py`（四盘 65 号共享文件）**：`FunnelRecorder`——一个规范化事件双目的地（SQLite `intent_events` + live_events JSONL 新 stage `"funnel"`），构造/序列化/写库/写 JSONL 四层各自容错，一目的地失败不阻塞另一目的地、不抛入交易路径；payload 支持惰性 callable（构造失败仍记事件、payload 置 NULL）；身份只用 uuid4（不碰 OrderIdMinter 序号）；`run_id = {book_id}:{cycle_started_at_iso}:{uuid4[:8]}`（book_id = 环境变量 `AGTRADING_BOOK_ID` 或书根目录名）；`attempt_id = {intent_id}:{run_id}` 自动串联；`observe()` 每订单每周期限额一次，OrderObservation→kind 映射（filled→`order_filled`、部分成交→`order_partial`、DEAD/其余→`order_observed`（payload.order_status）、观察缺失/失败→`order_unknown`），旧 fake / DryRun 无 `observe_order` 降级为 `order_unknown(observe_unavailable)` 不伪报。
+     - **`run.py` 接线**（交易语义零改动）：`decision_buy` 只记最终 decide() 的 BUY（快扫 quant-only 候选不计入分母）；创建前八门禁逐一 `intent_not_created`（entry_ineligible / pending_buy / already_held / llm_fail_closed / regime_unknown / max_new_orders / dry_run / save_failed）；`save_trade_intent` 改直调拿回执（局部适配，不用只返回 bool 的 `_journal_safe`），成功后 `intent_created`/`intent_replaced` 带 `decision_key` 关联；flush：运行级 `flush_skipped`（outside_window / orders_unreadable / market_closed / regime_unknown，symbol="*"）、`flush_wait`（not_before / no_quote / **open_missing**——开盘价缺失记"检查未执行"不写"通过"）、旧五类（ttl/gap/chase_signal/chase_open/sizing）全部带身份关联列续写不重复，sizing 事件 payload 带丙的诊断快照（cash_available / available_notional / min_notional / sizing 全量 to_dict）；提交事实 `order_submitted`（原响应状态 + 真实 order_id + client_order_id + sizing 快照，提交≠成交）；flush 循环后统一观察一遍（每单一次，不插在买单之间、不等待、不重试）；"TradeIntent filled $X @ ~价" 的日志与 live 状态改为 **submitted（预留、成交未核验）** 语义；新增 `intent_cleared`（already_held / pending_buy）——§14.2 词表的一处**领导批准扩展**（旧意图因已持仓被 flush 清除，不是 not_created 也不是 wait），留 ChatGPT 终审。
+     - **测试 `tests/test_execution_funnel.py` 15 例**：单元 9（双目的地、单侧故障隔离×2、payload 构造失败、event_id 去重、attempt 串联、运行级 "*"、观察映射+限额）+ 集成 2（基线场景全漏斗断言：4 decision_buy → 4 intent_created → 2 order_submitted（含 cycle-1 意图版本跨周期贯穿）→ 2 order_unknown、VETO sizing / CHASE chase_signal、cycle-2 的 intent_replaced 与 pending_buy 门禁；mode=paper）+ **不变性 4**（健康 / SQLite 写失败 / JSONL 失败 / payload 构造失败四种状态下，交易调用轨迹与 97a65d6 fixture **逐位一致**、意图与持仓不变——PLAN §七验收项）。红证据：接线前集成 2 例真红（`mode` 为空集）；心跳源码锚测试一度被插入代码撑破 900 字符窗口，以「事件调用置于锚点之前」解决，被审代码块保持逐字原样。
+     - **四盘**：P1 **739 passed** / P2 641+1skip（漏斗 15 绿）/ P3 910（漏斗 15 绿）/ P4 874（漏斗 15 绿）；`check_p2_sync.py` exit 0（65 共享文件，+1 = execution_funnel.py）。测试对 book 前缀的断言已改为从模块动态取（各盘自己的根目录名）。
+     - **未做（A-2 尾巴，下一包）**：`live_events.py` 容错测试补嵌套字段与重放兼容（PLAN §A-2 测试要求里的一项）；run.py 深处其余静默分支的查漏由 ChatGPT 复审把关。
+  7. **A-4 后端完成（ZCode 子 agent「丙·后端」执行，领导复验通过）**：`dashboard/views.py` +495 行（`funnel_summary()` 只读聚合——本会话 decision_buy 为分母、ET 会话日、carryover 承接意图单列、按 order_id 去重多观察/多部分成交合一、fills 只作正面证据、sizing 快照只转述不重算、旧行/旧 schema/fills 失败显式降级；现有函数零改动）+ `dashboard/api.py` `GET /api/books/{id}/funnel`（fills 截断/失败透传）+ 新测试 `tests/test_funnel_aggregation.py` 15 例（3/5 口径、十次重试不放大分母、跨日承接、替换版本隔离、部分成交、ET/UTC 边界、>120 事件、旧 schema、读取前后 itdump 逐字节一致）+ test_dashboard.py +1。P1 全量 **755 passed**；P3 927 / P4 891（P2 无 dashboard 不涉及）；sync exit 0。
+     - **领导修正一处**：A-1 的 payload 白名单缺 `submit_status` / `notional` / `filled_at`（A-4 报备：SQLite 侧提交事实与成交时间被裁掉）——已补入 `INTENT_EVENT_PAYLOAD_KEYS`（无敏感性、显示必要），logger.py 四盘同步，P1 755 仍全绿，P2 identity+funnel 24 绿、P3/P4 各 39 绿。
+     - **A-4 自报三处语义决定（留 ChatGPT 终审）**：① `attempts` = 触碰该意图的不同 run 数（含创建 run，十次重试场景为 11），重试事件数另列 `wait_events`；② 身份列 NULL 的旧行进 mode 无关降级桶；③ `filled_verified` = order_filled 事件或 fills 匹配正量且未被 order_partial 抢先（部分成交优先归 partial）。
+     - **锚点维护**：`check_handoff_anchors.py --fix` 改写 29 处引用（A-4 插入导致的 MOVED）；剩 5 处 MISSING 全部早于本包（P0/P1-B 对 run.py `_journal_safe` 区、broker_read 安全块、outcomes_summary 签名的合法重写）——任务书行文更新推迟到 c2c_a7e2 收尾后，本轮接受该漂移并记录。
+     - 注：views.py 个别降级提示文案为中英混合（如「cycles 表不可读」），不影响功能，留终审后统一。
+  8. **A-4 前端完成（ZCode 子 agent「丙·前端」执行，领导复验通过）——c2c_a7e2 实现全部落地**：`api.ts` +129（全可空 funnel 类型 + 客户端）；`Today.tsx` +278/−4（「执行漏斗」面板：KPI 摘要、逐链明细、承接意图独立节、run_skips、降级显式；旧"想买但没买成"替换为按阶段标注；交班卡/止损/fills 保留）；新测试 `tests/test_frontend_render.py` 6 例（esbuild 捆真实源码 + react-dom/server 静态渲染；覆盖预算不足原句、部分成交、accepted≠filled、旧 schema 不伪造 0/0、加载失败、非 P1 书兼容；**诚实缺口**：useEffect 取数生命周期与 CSS 未覆盖，node/esbuild 缺失时 skip）。`npm run build` 含 tsc 零错误（领导亲跑复核）；dist 为 P1 本地产物不跨盘（查实 sync 不覆盖 dist/.tsx，P3/P4 前端为过期副本无构建设施，现状惯例即 P1 独立构建）。
+  9. **EXECUTED ITERATION 1 证据包已组装**：`research/c2c_a7e2-executed-iteration-1/`（四盘全量 pytest 原始输出 **761 / 642+1skip / 927 / 891**、`check_p2_sync` exit 0、npm build 输出、git head/status、diff stat vs 97a65d6）+ `EXECUTED-ITERATION-1.md`（待用户粘贴给 ChatGPT 的 C2C 消息）。基线轨迹不变性由 `tests/test_execution_funnel.py` 4 个不变性测试钉住（健康/SQLite 故障/JSONL 故障/payload 故障下与 fixture 逐位一致）。**等用户执行浏览器侧动作**（登录 → Trading 项目原对话 → 粘贴）。
+
 ## 8. 交 ChatGPT 复审的 C2C 消息（用户粘贴到 Codex-Planning 会话）
 
 > 说明：ChatGPT 通过 MCP 读 Trading 工作区。它要看的 diff 基线是 commit `72431f0`（员工动手前的状态）；`git diff 72431f0 -- src tests` 就是 P0 全部改动。
@@ -612,4 +651,240 @@ LEDGER: PROGRESS.md §2 取证发现、§3 状态表、§6 逐包执行与审阅
 
 **六轮累计退回并关闭的缺陷（除首轮领导审阅外全部由 ChatGPT 独立发现）**：R1 止损提交后状态绕过 / 成交后旧快照 / 周期开始处未接收刷新 / 过滤快照当已核验 / 历史计数来源；R2 查询失败仍报健康 / 跳过周期抹掉 unknown / 旧格式迁移；R3 positions=None 误对账；R4 分页死循环 / 空页误判截断；R5 超卖漏量 / 同时间戳歧义（三种平局形态）/ 歧义污染汇总；R6 outcomes 未按 paper 过滤；R7 deep 掩盖 fast 停摆 / 首槽前误判；R8 协议窗口起点 / 截止。
 - **2026-09-18 12:20 ET（Claude，领导）**：ITERATION 6 → **DONE / APPROVED**（§13）。C2C checkpoint 已清。等用户 commit。
+- **2026-09-18 12:40 ET（Claude，领导）**：用户决定不配固定域名。**已 commit `97a65d6`**（P0 + P1-B 全部，含 4 个新文件；AGENTS.md 基线更新为 678/581/850/814 并加交接条目）。向 ChatGPT 6 Pro 发新任务 **c2c_a7e2 INIT：P1-A 四包**（意图版本号 / flush 前漏斗事件 / accepted≠filled 复用 P0-B-2 回查 / Today 漏斗视图 + 结构化 sizing 余量），要求 PLAN 给出避免 run.py 并发编辑的执行顺序。
 
+## 14. c2c_a7e2：P1-A 执行漏斗（ChatGPT 6 Pro PLAN 2026-09-18，基线 97a65d6）
+
+完整 PLAN 原文存 `research/c2c_a7e2-p1a-plan.md`（ChatGPT 通过 MCP 核实 HEAD 后给出，行号以其为准；§5-C 的旧行号作废）。本节是领导钉死的**三份共享契约 + 所有权 + 顺序**，员工按此实现，偏离必须先报领导。
+
+### 14.1 所有权（唯一写者）
+
+| 员工 | 独占文件 | 顺序 |
+|---|---|---|
+| **甲 = B（Opus）** | `run.py`（唯一写者）、新 `execution_funnel.py`、`live_events.py`、完整周期测试（`test_execution_funnel.py`、基线轨迹测试） | ① 基线轨迹 + 红测试 + funnel 骨架 → ② 乙的 logger 契约落地后接 A-1/A-2 → ③ 乙的 OrderObservation 落地后接 A-3 → ④ 丙的 SizingDiagnostics 落地后把快照接进 sizing 事件 |
+| **乙 = A（Sonnet）** | `journal/logger.py`、`execution/broker.py`、`test_intent_identity.py`、`test_order_observation.py`、止损适配测试 | ① A-1 存储（契约 1）→ ② OrderObservation（契约 2）+ `submit_stop_sell` 改用它 |
+| **丙 = C（Sonnet）** | `risk/manager.py`、`dashboard/views.py` / `api.py`、前端、`test_risk.py`、`test_dashboard.py` | ① SizingDiagnostics（契约 3）+ test_risk 精确基线 → ② 乙 logger 落地后做 views 漏斗聚合 → ③ 甲接线后做 A-4 端到端 + 前端 + 离线渲染测试 |
+
+规则：其他人发现 `run.py` 问题只报位置和反例给甲；不以"不同函数"为并发例外。PROGRESS.md 汇总由领导写；四盘 cp 由各员工照旧做但领导最终统一核 sync。
+
+### 14.2 契约 1：事件与身份（乙实现存储，甲实现写入）
+
+- `trade_intents.version TEXT NULL`：UUID4 字符串。`save_trade_intent()` 在创建/替换时生成；读取与 flush 不生成；删除后重建不复用。旧活动意图保持 NULL 直到被真实新决策替换（迁移不补造）。
+- `TradeIntent` 末尾加 `version: str | None = None`。
+- `save_trade_intent(conn, intent) -> IntentSaveReceipt`，`IntentSaveReceipt(version: str, action: Literal["created","replaced"], previous_version: str | None)`；旧调用者可忽略返回值。
+- `intent_events` 新增可空列（增量迁移、可重复执行；唯一索引在列迁移完成后再建）：`event_id TEXT`、`run_id TEXT`、`mode TEXT`、`decision_key TEXT`、`intent_id TEXT`（= 意图 version）、`attempt_id TEXT`、`order_id TEXT`、`payload TEXT`（JSON，白名单字段，处理嵌套与非有限数）。历史行全部 NULL。
+- `record_intent_event(conn, symbol, kind, deferred, detail, *, event_id=None, run_id=None, mode=None, decision_key=None, intent_id=None, attempt_id=None, order_id=None, payload=None)` 向后兼容；同一 `event_id` 重复投递不双计（INSERT OR IGNORE）。
+- 身份格式：`run_id = f"{book_id}:{cycle_started_at_iso}:{uuid4().hex[:8]}"`（run_cycle 开始生成一次，不用 MAX(cycles.id)+1）；`decision_key = f"{run_id}:{symbol}"`；`attempt_id = f"{intent_id}:{run_id}"`。
+- kind 词表（旧五类 `gap / chase_signal / chase_open / sizing / ttl` 语义不变，只补关联列）：`decision_buy`、`intent_created`、`intent_replaced`、`intent_not_created`（payload.reason ∈ entry_ineligible / pending_buy / already_held / llm_fail_closed / regime_unknown / max_new_orders / dry_run / save_failed）、`flush_skipped`（运行级：outside_window / orders_unreadable / market_closed）、`flush_wait`（not_before / no_quote / open_missing）、`order_submitted`、`order_observed`、`order_partial`、`order_filled`、`order_unknown`。
+
+### 14.3 契约 2：OrderObservation（乙实现，`execution/broker.py`）
+
+```python
+@dataclass(frozen=True)
+class OrderObservation:
+    order_id: str
+    status: str | None            # 规范化小写券商状态；回查失败 None
+    observed_at: str              # ISO UTC
+    filled_qty: float | None
+    filled_avg_price: float | None
+    filled_at: str | None
+    error: str | None
+    def is_terminal(self) -> bool  # status in DEAD_ORDER_STATUSES or == "filled"
+```
+- `Broker` 协议加 `observe_order(order_id: str) -> OrderObservation | None`；`DryRunBroker` / 旧 fake 返回 None（调用方降级为"未核验"，不崩、不伪报成交）。`AlpacaBroker` 用 `get_order_by_id` 实现，异常 → `status=None, error=…`。
+- `submit_stop_sell` 改为调用 `observe_order` 取状态，**三分类返回语义与 fallback 不变**（DEAD→None / resting→placed / 其他带 status 返回）。买单观察结果与 `OrderResult` 分离：观察到 rejected 不把原非空提交结果改成 None，不释放预算、不恢复意图、不重试。
+
+### 14.4 契约 3：SizingDiagnostics（丙实现，`risk/manager.py`）
+
+```python
+@dataclass(frozen=True)
+class SizingDiagnostics:
+    cash_available: float | None
+    exposure_room: float | None
+    position_cap: float | None
+    stop_risk_room_pct: float | None
+    stop_risk_room_notional: float | None
+    sector_theme_room: float | None      # _entry_sizing_inputs 已取 min，展示为「行业/主题有效余量」
+    pre_haircut_notional: float | None
+    post_haircut_notional: float | None
+    available_notional: float | None     # 归零前的可用预算
+    min_position_notional: float | None
+    binding_constraints: tuple[str, ...] # 如 ("exposure_cap",)
+    reject_code: str | None              # 如 "below_min_position"
+    def to_dict(self) -> dict
+```
+- `SizeResult` 末尾加 `diagnostics: SizingDiagnostics | None = None`。**现有运算顺序、浮点、round 时点、approved、notional、reason 逐位不变**；拒绝时 `notional=0` 不动，`available_notional` 保留归零前值；早退未算的字段为 None，不补零、不多算除法。
+
+### 14.5 验收（ChatGPT 将核）
+
+- **基线轨迹先于一切修改**：甲用固定时钟/固定行情/固定 LLM/假券商 + 临时 journal，在当前 HEAD 记录每次 `submit_notional_buy` 的 symbol / notional(`float.hex()`) / atr14 / client_order_id / 顺序 / 次数，存为测试 fixture。之后比较：基线 / 正常观测 / 各观测环节故障（payload 构造、SQLite 写、JSONL 写各自抛异常）三组轨迹逐位一致；意图队列、预算预留、SELL/止损调用不受影响。
+- 每包红测试先红后绿的输出；每个 BUY 链可归类，缺证显示未知。
+- 四盘全量、sync exit 0（新共享模块也 cp，不改排除清单）、前端 build + 最小离线渲染测试。
+- 冻结区 / .env / 分析师 / 订单参数 / P0 止损链不变；新回查全部 mock。
+- **2026-09-18 14:10 ET（Claude，领导）**：三轮/四轮之间隧道又断（trycloudflare 自身不稳，本地未重启），重建连接器 + 配对后 ChatGPT 给出 c2c_a7e2 PLAN（`research/c2c_a7e2-p1a-plan.md`）。领导钉死三份契约与所有权（§14）。派单：**B=甲**（基线轨迹 fixture + execution_funnel 骨架 + 红测试，先不接线）；**A=乙**（logger 身份迁移 + OrderObservation）；**C=丙**（SizingDiagnostics + test_risk 精确基线）。接线顺序由领导按各方落地通知甲。
+
+---
+
+## 15. 新领导交接（2026-09-20，会话重启后由旧领导写的交接块）
+
+> 旧领导会话（Opus 5）上下文已满重启。本节是给新领导 chat 的入口；读 AGENTS.md（铁律）→ 本节 → §3 状态表 → §14。
+
+### 15.1 现在处于什么状态
+
+- **已完成并入库**：基线 `72431f0` → P0/P1-B 修复包 `97a65d6`（ChatGPT 6 Pro 六轮 C2C 复审 DONE / APPROVED，退回 17 项全部关闭）。四盘测试 P1 678 / P2 581+1skip / P3 850 / P4 814 全绿，`check_p2_sync.py` exit 0。
+- **进行中的任务 c2c_a7e2（P1-A 执行漏斗）**：ChatGPT 已出 PLAN（`research/c2c_a7e2-p1a-plan.md`），领导契约与所有权在 §14。计划：甲(B) 基线轨迹+funnel 骨架 → 乙(A) logger 身份+OrderObservation → 丙(C) SizingDiagnostics → 甲接线 → 丙 A-4 → 领导审 → 交 ChatGPT EXECUTED ITERATION 1。
+- **工作树现状（2026-09-20）**：`git status` 只有：
+  - `M PROGRESS.md`（本交接与派单记录，待 commit）
+  - `M src/agentic_trading/risk/manager.py`（**丙的 SizingDiagnostics 半成品**：`risk/manager.py` 多了 SizingDiagnostics dataclass + `_empty_sizing_diagnostics` + SizeResult.diagnostics 字段，约 +52 行；P1 测试仍 678 全绿，所以它是向后兼容的半成品，**没被接到任何调用点**——新领导应让丙（C）把它做完或先 stash 另存）
+  - `?? research/c2c_a7e2-p1a-plan.md`（PLAN 原文，要入库）
+  - `?? research/weekly-review-2026-09-19.md`（周六自动跑的周报，正常产物）
+- **员工会话状态**：旧的甲/乙/丙 chat 由用户于 2026-09-20 主动删除（上下文过长）。A/B 无产出，C 的半成品在工作树（`risk/manager.py`）。新领导需重开三个员工会话并按 §14 重新派单（乙从头、甲从头、丙接着半成品）。A 的 logger/broker **完全没动**（无 test_intent_identity / test_order_observation / observe_order）；B 的基线轨迹/漏斗骨架**没开始**（无 execution_funnel.py / test_execution_funnel.py / trade_trace_baseline fixture）。**等于整个 c2c_a7e2 只做了丙的第一步的一半。**
+
+### 15.2 新领导第一件事
+
+1. 跑 `python check_handoff_anchors.py`（HANDOFF-DASHBOARD 的行号锚）；`check_p2_sync.py`（应 exit 0，§14 的模块尚未同步到兄弟盘）。
+2. 决定 `risk/manager.py` 半成品怎么办：让新的丙继续做完（推荐——它不影响现有行为），或 `git stash` 暂存。不要在它和甲的 run.py 接线同时并发。
+3. 重新开三个员工 chat（P1 组），按 §14 重新派单——把 §15.1 的"谁做到哪了"告诉它们，乙从头开始，甲从头开始，丙接着半成品。
+4. C2C 复审：桥接配置在 `%LOCALAPPDATA%/codex-with-chatgpt`（session 里存了 Trading 项目与对话 URL）；若临时隧道地址失效（重启后会变），按技能流程重建连接器 + 配对，复审对话是 Trading 项目里的「Workspace name response」。
+5. ChatGPT 那边 c2c_a7e2 的 checkpoint 状态是 EXECUTING（等 EXECUTED ITERATION 1）；长时间没动静它不会主动来催，重启后你在同一对话里发 EXECUTED 即可。
+
+### 15.3 不要重做的事
+
+- 不要重新跑 P0/P1-B 的取证或复审（§2/§9–§13 已是终审结论）。
+- 不要把 `risk/manager.py` 的半成品当"已完成"——它没有被任何 sizing 调用点使用，也没有触发事件。
+- Alpaca VEEV 申诉已发邮件（2026-09-17），回复来了再跟进，别重复发。
+
+### 15.4 未回答的开放问题（给新领导和用户）
+
+- Codex 额度 09-20 16:00 ET 恢复，09-21 周一开盘验证分析师是否恢复。
+- Alpaca 对 VEEV 的答复未到。
+- c2c_a7e2 完成前，Today 页的"为什么没成交"仍只有旧视图。
+- **2026-09-20（Claude 领导-p1，重启后的本会话）**：用户重开员工会话（甲 / 乙 / 字符“丙”）。已派单：甲 ← 基线轨迹 + funnel 骨架（第一阶段，不接线）；乙 ← A-1 存储 + OrderObservation；丙 ← SizingDiagnostics（先核上一任半成品）。汇报方式改为双通道：PROGRESS.md §6 为主（任何领导可读），消息给「领导-p1」为辅。
+
+
+## 16. ChatGPT 6 Pro 复审 ITERATION 1（2026-09-20，CHANGES_REQUESTED，R1–R9）
+
+原文逐字存档：`research/c2c_a7e2-executed-iteration-1/REVIEW-ITERATION-1.md`。它独立读取了 execution_output(id=8)、三盘 pytest/sync/build 原始输出、全部新增测试与源码 diff。**总体判定：整体设计可保留**（增量迁移、不补造旧身份、独立 OrderObservation、sizing 诊断、SQLite 持久漏斗；双调用签名与 .lower() 不作为退回原因；intent_cleared 词表可保留但记录时机须修正）。
+
+| # | 级别 | 主题 | 派给 |
+|---|---|---|---|
+| R1 | 高 | 观测异常仍可进入交易路径：run/event 身份生成、语义方法字段访问、诊断构造未在降级边界内；**P0 回归反例——回查 status 有效但 filled_qty="bad" 时 float() 抛错且 submit_stop_sell 已无外层捕获** | 领导（funnel/run.py/broker 防御性解析） |
+| R2 | 高 | 回测（asof 非空）绕过原 _emit_live 的 asof 门禁直接写 live JSONL；快扫休市出口同样 | 领导 |
+| R3 | 高 | record_intent_event savepoint 后无条件 commit 会提交调用方未提交业务事务；台账"本轮首次加 commit"的说法需纠正（基线函数本有 commit） | 领导 + 乙·存储 |
+| R4 | 高 | accepted 订单无跨周期回查（持久记录恢复未终结 order_id、周期末统一观察、请求预算）；聚合跨日丢失提交关联；观察时点须在全部下单处理之后 | 领导（执行侧）+ 丙·后端（聚合侧） |
+| R5 | 中 | 聚合状态规则：单条 fills≠整单完成；后续 unknown 不得抹掉已确认完成；提交失败信息（submit_status）被丢弃；前端把任意非空状态当"已受理"；fills 未按截止时间过滤 | 丙·后端 + 丙·前端 |
+| R6 | 中 | 生命周期：订单上限 break 记运行级原因；intent_cleared 须在清除成功后发；旧版本 superseded 终态；version=NULL 旧意图的降级桶口径（mode 无关不可见）；尝试数=真实 flush 尝试（创建/观察另列）；open_missing 不计等待 | 领导 + 丙·后端 |
+| R7 | 中 | SQLite/JSONL 共用递归白名单清洗：嵌套敏感键（api_key 哨兵验证）与非有限数，两目的地一致；原 payload 不得直发 JSONL | 乙·存储 |
+| R8 | 中 | Today 展示全部余量（现金/敞口/行业主题/组合止损风险）+ 快照时间/attempt；被替换链标历史快照；至少一条真实 size_position 贯通测试 | 丙·前端（等 R4/R5 后端契约稳定） |
+| R9 | 中 | 验收证据：用 git 导出的 97a65d6 临时树跑同一场景生成轨迹对照（不动当前/兄弟盘）；轨迹 fake 补 observe_order 真实观察（accepted/filled/rejected/异常）与 R1–R3 故障场景；recorder→聚合→Today 完整链测试 | 领导 |
+
+执行顺序（按其建议）：R1–R3 隔离与容错 → R4–R6 状态链；R7 并行；R8 后稳定后接线；R9 补证随修复产出。run.py 仍由领导单人修改。
+- **2026-09-20（ZCode 领导）**：EXECUTED ITERATION 1 已发（ChatGPT 连接器经重建：旧地址失效 → 删除旧定义 → 同名重建 → 配对；workspace_info 验证通过后发送）。收到本退回，进入 ITERATION 2。
+
+## 17. ITERATION 2 执行（ZCode 领导，2026-09-20）
+
+- **R1+R2 完成（领导亲任，红测试先行 9 红→全绿）**：
+  - R1 全链路降级边界：`execution_funnel.py` 新增 `make_funnel()` 永不抛工厂（失败→`_NullFunnelRecorder` 空记录器，事件丢弃不伪造）；`record()` 的 event_id 生成包 try；`intent_saved()` 对坏回执丢弃不抛（decision_key 改为内部计算，失败→None）；`observe()` 对毒观察对象（首个属性读取即抛）降级 `order_unknown(observe_read_failed)`。`broker.py` 新增 `_safe_optional_float()`——**复审反例（status 有效 + filled_qty="bad"）修复**：可选成交字段解析失败仅置 None，有效状态不丢；`submit_stop_sell` 的共享回查调用加回 P0 兜底 try（回查入口本身抛错时回到提交响应）。`risk/manager.py` SizingDiagnostics 构造包 try→None（诊断构造失败不阻断 sizing，算术结果不变）。
+  - R2 asof 门禁：`FunnelRecorder(jsonl=...)` 开关 + `run.py` 以 `jsonl=(asof is None)` 构造；`flush_run_skip(..., jsonl=...)` 同步——**回测/模拟周期不再触碰 live JSONL**，事件只落调用方提供的隔离 journal。红测试：哨兵 live 文件在两个 asof 周期后字节不变 + 隔离 journal 仍有 decision_buy。
+  - 测试：`test_execution_funnel.py` +8（身份生成失败×2 / 诊断构造失败 / 毒观察对象 / 抛错 broker / 坏回执 / asof 哨兵 / flush_run_skip 开关）、`test_order_observation.py` +2（垃圾可选字段保有效状态 / 回查抛错保 P0 兜底）。P1 全量 **771 passed**；三盘定向 49 绿；sync exit 0（65 文件；清理过两处误 cp 到错误路径的散落副本）。
+  - R7 的 funnel 侧接线（共用清洗）等乙·存储交付 `sanitize_intent_payload` 后由领导合并。
+- **进行中**：乙·存储（R3+R7 logger 侧，子 agent 后台）；丙·后端（R4 聚合侧 + R5，派单中）；领导接下来 R4 执行侧 + R6。
+- **R4 执行侧 + R6 执行侧完成（领导亲任；本批实现先行、红证据以变异法补证——两处变异均被对应测试抓获后还原）**：
+  - R4：`execution_funnel.py` 新增 `note_submission()`（本周期提交登记）+ `_unresolved_from_ledger()`（从 intent_events 恢复未终结 order_id：order_submitted 有单号、同 mode、无 order_filled/DEAD 终态）+ `observe_unresolved()`（**周期末统一观察**：本周期提交优先 + 恢复订单，总预算 `MAX_ORDER_OBSERVATIONS_PER_CYCLE=8`，整体永不抛）；`run.py` 把观察点从 flush 末尾**移到周期末止损重整之后**（PLAN 要求的"全部影响下单的处理完成之后"），仅 live paper（asof 空且非 dry run）。
+  - R6：`intent_cleared` 只在 `clear_trade_intent` 成功后发（失败→链保持排队，不伪造终态）；gap/ttl 决策事件同样改为清除成功后落库；订单上限 break 记一条运行级 `flush_skipped(max_new_orders_reached)`，受影响意图清单走 detail（payload 白名单无列表键，`limit` 走白名单），break 控制流不变、不伪造逐项检查。
+  - 测试：`test_execution_funnel.py` +4（第三周期恢复观察已成交订单且零新提交 / 观察预算封顶且本周期优先 / 清除失败不发终态且意图保留（sqlite3.OperationalError——`_journal_safe` 按设计只吞 SQLite 异常）/ 上限 break 运行级事件）；`TraceBroker` 补真实观察语义（observe_order + 已受理买单进 open_orders——忠实 Alpaca：买单受理后挂着、成交带外到达）。P1 全量 **793 passed**；三盘 28 绿；sync exit 0。
+  - R6 聚合侧三口径（attempts 不含创建 run / open_missing 不计等待 / legacy 桶判据改 intent_id IS NULL）已返修单发回丙·后端，在途。
+- **R4 聚合侧 + R5 + R6 聚合三口径验收通过（丙·后端子 agent，两轮）**：第一轮交付跨日全历史链（by_intent_all 不受会话日限定、创建日期不限定订单检索）、fills 截止过滤 + 活动 ID 去重、五态判定（submit_phase: submitted_accepted/submit_rejected/submit_unknown；order.phase: complete/partial/…；完成=order_filled 事件或券商 fill 标记，单条 partial 不算完成；后续 unknown 不回退完成证据）、superseded_by 推导、unlinked_fills、修正 5 处被点名的错误测试预期（31 例）。第二轮返修：attempts=flush 阶段按 run 去重（不含创建 run，十次 flush=10；另列 created_runs/observed_runs）、open_missing 不计 wait_events 但计 attempts、legacy 门改 intent_id IS NULL（与 mode 无关）+ degraded.identityless_observed_today 清单。P1 全量 793；P3/P4 各 83；sync exit 0。
+- **R9 完成（领导）**：①轨迹 fake 升级为真实观察语义——TraceBroker 提交互即自记 accepted 观察（OrderObservation，97a65d6 兼容守卫），场景集成断言从 order_unknown(observe_unavailable) 升级为 order_observed(accepted)（复审点名"所谓健康观测轨迹实际走的是 observe_unavailable"）；②**原始提交对照证据**：`git archive 97a65d6` 只读导出到临时目录（未 reset/checkout 任何盘），复制当前 runner + fixture，PYTHONPATH 覆盖验证加载导出树代码后跑基线轨迹测试 → **1 passed**——六条交易调用在 97a65d6 原始代码与当前工作树 fixture 之间逐位一致，"含丙改动的工作树记录"这一保留意见由直接证据关闭。证据：`research/c2c_a7e2-executed-iteration-1/baseline-97a65d6-trace-check.txt`。P1 全量 793；runner 已同步三盘；sync exit 0。
+- **在途**：乙·存储（R3+R7 logger 侧）、丙·前端（R8）。待乙 交货后领导做 R7 的 funnel 接线（共用清洗送双目的地）。
+- **R8 完成（丙·前端子 agent + 领导闭环缺口）**：SizingLine 展示全部余量（现金/敞口/行业主题有效余量/组合止损风险 pct+金额/单仓上限/折扣前后/可用预算/最低仓位，NULL="未评估" 与 $0 严格区分）；历史快照标注（superseded/终结链不再写"意图保留"）；rejected/canceled 不再显示"已受理"（改用后端 phase/submit_phase 语义）；api.ts 类型补齐；**真实 size_position 贯通渲染测试**（修掉复审点名的不一致 fixture）；npm build tsc 零错误。前端诚实报出后端缺口——sizing 快照未暴露时间/attempt：**领导闭环**：`views.py` `_funnel_sizing_snapshot` 现带 `event_ts` + `attempt_id`（event dict 补 attempt_id 键），Today.tsx 接线展示，`test_sizing_snapshot_carries_ts_and_attempt` 钉住。P1 全量 **797**；P3/P4 各 84；sync exit 0。
+- **R3+R7 完成（乙·存储子 agent 重派版，领导复验通过）**：R3 事务所有权——`owns_transaction = not conn.in_transaction`（SAVEPOINT 前取值；实测 SAVEPOINT 自身翻转该标志，外层 RELEASE 会提交整个事务）；owns=True 保持历史持久化，owns=False 只释放自己的 savepoint 绝不碰外层；失败路径 try/finally RELEASE 无残留。红证据：第二连接实证无条件 commit 曾把调用方未提交业务写入提前发布。**台账纠错核实：97a65d6 基线函数本来就有无条件 commit——§6 A-1 条目"本轮首次加 commit"的说法不成立，问题是把该提交语义接入观测路径还声称隔离**。R7——`sanitize_intent_payload`（顶层白名单 + 递归敏感键黑名单与 live_events._SECRET_KEYS 逐值 drift 钉子 + 非有限数→None）；SENTINEL 哨兵场景红→绿。
+- **R7 funnel 接线完成（领导）**：`execution_funnel.record()` 现先生成**一份**清洗后 payload 再投递双目的地，原 payload 不再直发 JSONL；集成测试断言 SQLite 与 JSONL 双侧无 SENTINEL。乙 报备的三盘 test_execution_funnel.py 旧版（R9 前断言 order_unknown）已用 P1 版 cp 修平。
+- **ITERATION 2 终态**：P1 **811** / P2 **670+1skip** / P3 **974** / P4 **938** 全绿；sync exit 0（65 文件）。R1–R9 全部关闭。未 commit，等 ITERATION 2 复审。
+
+## 18. ChatGPT 6 Pro 复审 ITERATION 2（2026-09-20，CHANGES_REQUESTED，关 4 剩 5）
+
+原文逐字存档：research/c2c_a7e2-executed-iteration-2/REVIEW-ITERATION-2.md。**关闭：R2（回测门禁）、R3（事务所有权）、R7（共用清洗）、R9（原提交轨迹补证）**。剩余为层间未接通问题：
+
+| # | 级别 | 剩余要点 | 派给 |
+|---|---|---|---|
+| R1 | 高 | save 的 uuid 生成在业务写入前（失败→假 save_failed→WAIT）；回执在 commit 后构造（构造失败→已提交却被判 WAIT+假事件）；sizing 三个早退的 _empty_sizing_diagnostics 未容错 | 领导（logger 解耦 + manager 早退 + run.py 适配） |
+| R4 | 高 | 恢复观察事件无 intent_id（candidates 第三元传 None）→聚合历史索引不收→跨周期成交接不回原链；三周期测试没接聚合验证 | 领导（执行侧恢复带 intent_id）+ 丙·后端（聚合按 order_id 唯一关联） |
+| R5 | 中 | submit None（含网络异常）被写成 rejected；canceled+部分成交生成 order_partial 后恢复器不认 DEAD（反复回查）+聚合丢 terminal_status | 领导（None→submit_unknown + observe 终态独立）+ 丙·后端（聚合）+ 丙·前端（渲染） |
+| R6 | 中 | attempts 仍含观察事件（1 提交+10 回查=11）；旧身份降级只覆盖旧五类；clear_failed 无归因事件；上限剩余名单要结构化传底端 | 丙·后端（+领导记 clear_failed） |
+| R8 | 中 | SizingLine 未读意图 classification（TTL 删除/已清除后仍写"意图保留"）；partial≠终结 | 丙·前端 |
+
+复审强调：下一轮要真实 writer→journal→聚合→渲染穿透测试，统一冻结时钟，不手工构造各层不同形状数据。
+- **2026-09-20（ZCode 领导）**：ITERATION 2 EXECUTED 已发（execution_output id=9 被读取）。收到本退回，进入 ITERATION 3。
+
+## 19. ITERATION 3 执行（ZCode 领导，2026-09-20）
+
+- **R1 剩余 + R5 执行侧 + R4 执行侧完成（领导，红测试先行 5 红→全绿）**：
+  - R1：`save_trade_intent` 的 uuid 生成包 try→失败降级 version=NULL **仍保存**（不再假 save_failed→WAIT）；回执构造在 commit 后包 try→失败返回 None 回执（业务已提交绝不改判，行内身份完好）；`risk/manager.py` 三个早退改走 `_safe_empty_diagnostics`（诊断构造失败→None，原否决不变）。
+  - R5：`run.py` 提交 payload 的 None 分类从 "rejected" 改 **"unknown"**（无确证拒绝证据不做肯定断言）；`execution_funnel.observe()` 终态事实优先（canceled+部分成交 → order_partial 携带 order_status=canceled + filled_qty 双事实）；恢复器终态判定改为**任意 order_* 事件的 DEAD status**（不再依赖 kind==order_observed，已取消订单不再被反复回查、不占预算）。
+  - R4：`_unresolved_from_ledger` 返回三元组 **(symbol, order_id, intent_id)**——从原提交事件带出可靠身份，恢复的 order_filled/order_observed 落回原链（candidates 合并修复了一处三元组解包遗漏，该 bug 曾让整个周期末观察静默失败）。
+  - 测试 +7：logger uuid 失败/回执构造失败（场景级轨迹不变 + 无假 save_failed + 身份降级/完好各自断言）、三个 sizing 早退容错、None→unknown、canceled+部分成交终态（双事实 + 恢复器不再重查）、恢复带 intent_id。P1 全量 **818 passed**；sync exit 0；三盘定向绿。
+- **在途**：丙·前端（R8 剩余）；丙·后端（R4/R5/R6 聚合侧）派单中。
+- **R6 领导尾巴完成（红先行 2 红→绿）**：①清除失败现在记**非终态归因事件** `clear_failed`（reason=already_held/pending_buy + intent_id），无假终态也非静默；②订单上限事件的 payload 增加白名单键 **unprocessed**（结构化受影响清单，detail 文本保留供人读），聚合/前端不再需要解析文本。R8 前端验收通过（818→820 全绿、build 零错误、三条生命周期链断言全过：TTL 丢弃/已清除不再显示"意图保留"、partial 不再显示"链已终结"）。P1 **820**；sync exit 0。
+- **在途**：丙·后端（R4/R5/R6 聚合侧，含三周期真实 journal 穿透测试）。
+- **R4/R5/R6 聚合侧完成（丙·后端，领导复验通过）——ITERATION 3 全部落地**：R4 关联规则=有身份 order_submitted 建 (书,mode,order_id) 归属索引（≤cutoff 任意 ET 日），无身份观察事件键命中**恰好一个** intent 则挂回原链（事件标记恢复出的身份）；冲突/原提交无身份/无提交记录三态均入 degraded.unattributed_order_events，不按 symbol 猜测。R5：submit unknown 口径（None 不进受理不进拒绝）；成交度与终态独立判定（partial+canceled 双事实保留、terminal_status 不丢、不算完成）。R6：attempts 移除四类观察事件（1 提交+10 回查=attempts 1/observed_runs 10）；identityless 覆盖全部需身份事件并按 mode 区分（identityless_by_mode）；run_skips 结构化透传 payload.unprocessed（不解析 detail 文本）。两个三周期真实 journal 穿透测试作为回归钉（执行侧恢复带身份后链路全通）。聚合 43 例（+9）；P1 全量 **829** / P2 678+1skip / P3 991 / P4 955；sync exit 0；build 零 TS 错误。
+- **ITERATION 3 终态：R1/R4/R5/R6/R8 全部关闭，等 ChatGPT ITERATION 3 复审。**
+
+## 20. ChatGPT 6 Pro 复审 ITERATION 3（2026-09-20，CHANGES_REQUESTED，关 R1/R5 剩 4 项收尾）
+
+原文：research/c2c_a7e2-executed-iteration-3/REVIEW-ITERATION-3.md。**过程插曲：复审先因连接器配对令牌失效被 BLOCKED（明确不改代码不重跑），领导重建连接器（临时地址已死 → 固定域名 connector.anbostein.indevs.in + 删除旧定义重建 + 重新配对）后恢复**。关闭 R1、R5（累计 R1/R2/R3/R5/R7/R9 关）。剩余：
+
+| # | 要点 | 派给 |
+|---|---|---|
+| R4（中） | 归属约束只护无身份观察：恢复器二次查询无 mode/book 条件、多版本倒序取首个 intent_id 不查冲突；fills 按裸 order_id 传链可双计完成 | 领导（execution_funnel 恢复器）+ 丙·后端（fills 接链） |
+| R6-A（中） | TTL/gap 分支删除失败无 clear_failed 归因（只有已持仓分支有） | 领导（run.py 两处） |
+| R6-B（中） | 前端未接 run_skips.unprocessed/detail、identityless_by_mode、unattributed_order_events；空状态误说"没有 BUY" | 丙·前端 |
+| R8（中） | SizingLine 对全部 partial 说"余单未终结"，未接订单 terminal_status（部分成交后取消矛盾） | 丙·前端 |
+| 证据 | npm-build.txt 未写入 iteration-3 目录（领导失误）——**已补**（重跑 build 落盘） | 领导 ✅ |
+
+## 21. ITERATION 4 执行（ZCode 领导）
+
+- **证据补齐**：npm-build.txt 重跑落盘到 iteration-3 目录（复审读到的 FILE_NOT_FOUND 已闭环）。
+- **R4 恢复器 + R6-A 完成（领导，红先行 3 红→绿）**：恢复器二次查询补 `AND mode = ?`（跨 mode 不串身份）；多版本提交冲突（同 order_id 不同 intent_id）不再倒序选边——**唯一才归属，冲突返回 None 交给聚合冲突检查**。run.py 的 TTL 与 gap 分支补 `clear_failed(reason=ttl/gap)` 非终态归因（删除失败不再静默，也不伪报丢弃终态）。测试 +4：恢复器 mode 过滤 / 冲突让位 / TTL、gap 删除失败归因（fixture 修正：TTL 窗口 72h 用 96h；gap 用新鲜 created 防止先触发 TTL）。P1 全量 **833**；sync exit 0。
+- **在途**：丙·后端（R4 fills 归属）、丙·前端（R6-B + R8 合并单）。
+- **R4 fills 归属完成（丙·后端，领导复验通过）**：fills 接链与观察接链同一条归属规则——`S(oid)`=同书同 mode 的有身份 order_submitted owner 集；唯一 → 该链独得 fills（完成恰计一次）；冲突/无身份 → `fills_withheld=True` 不给证据、fill 保留在 unlinked_fills 带案型原因（归属多个意图/原提交无身份/台账无提交）；跨 mode 同 order_id 隔离。测试 43→45（冲突+fills 变体、真实 observe_unresolved 穿透、mode 守护钉）。
+- **R6-B + R8 完成（丙·前端，领导复验通过）**：run_skips 的 detail+结构化 unprocessed 上屏；identityless 按 mode 分组（paper/dry_run/未分模式标签）；unattributed_order_events 逐条（order_id+原因）；空状态改为"没有可完整归因的链"（不断言"没有 BUY"）；R8 snapshotOrder() 按快照 event_ts 与订单 submitted_at 唯一配对——部分成交+余单取消显示"历史快照（部分成交，余单已取消）"，无终结证据保持"剩余订单未终结"。渲染 12 例（+2，真实聚合输出穿透）。build 零 TS 错误。**P1 全量 837**。
+- **ITERATION 4 终态：R4（恢复器+fills）/R6-A/R6-B/R8/证据补齐全部关闭。等 ChatGPT ITERATION 4 复审。**
+
+## 22. ChatGPT 6 Pro 复审 ITERATION 4（2026-09-20，CHANGES_REQUESTED，关 R4×2+R6-A 剩 2 项前端展示）
+
+原文：research/c2c_a7e2-executed-iteration-4/REVIEW-ITERATION-4.md。**R4 恢复器+fills、R6-A 关闭（源码已核；累计关 R1/R2/R3/R4/R5/R6-A/R7/R9）**。EVIDENCE_STATUS: PARTIAL_CONNECTOR_502——三盘/构建证据因连接 502 未读全，要求连接恢复后补读、不重跑。剩余两项均为前端展示边界：
+- R8 剩余：snapshotOrder() 配对失败（null）时仍按链级 phase 断言"余单未终结"——需分"唯一配对成功（用该订单自身状态）"与"配对失败（只展示快照+标注未能确定，不作存活断言）"两分支。
+- R6-B 剩余：①空状态 hasUnattributable 漏 unattributed_decision_events / orphan_intents / unknown_origin_intents（"无法归因 BUY"与"没有 BUY 决策"可同屏矛盾）；②unlinked fills 统一标题预设了"台账中无订单事件"原因、不显示后端逐条 note。
+- **2026-09-20（ZCode 领导）**：ITERATION 4 EXECUTED 已发（execution_output id=11 被读取；502 为间歇连接故障——502 是网关错误非令牌失效，若持续按 reconnect 流程处理）。
+
+## 23. ITERATION 5 执行（丙·前端，领导复验通过）
+
+- **R6-B + R8 最后两个展示边界完成**：R8——SizingLine 配对成功用**该订单自己**的 partial_evidence/terminal_status；配对失败（缺时间/零匹配/同刻多订单）独立分支"对应订单/终态未能确定——余单存活与终结均不作断言"（不再借链级 phase 下存活断言、不从他尝试借终态）。R6-B——空状态 reasons 数组纳入全部降级证据（unattributed_decision_events/orphan_intents/unknown_origin_intents/unattributed_order_events/identityless/解析异常/unlinked_fills），任一存在即"没有可完整归因的执行链"；未归因成交标题改中性、逐条显示后端 note。红证据含回退实测（4 failed）；反例全过（两订单同刻/零匹配/同链不同尝试/缺快照时间[真实聚合无法产生，在真实输出上清空 event_ts 测渲染分支，偏离已注明]；缺 run_id 决策/孤儿意图/不可解析时间戳/冲突 fills note；正常空会话保留原空状态）。渲染 16 例（+4）。**P1 全量 841 / P2 682+1skip / P3 997 / P4 961**；build 零 TS 错误。
+- **ITERATION 5 终态：R6-B、R8 关闭。九项原始退回（R1–R9）经四轮全部闭环，等 ChatGPT ITERATION 5 终审。**
+
+## 24. ChatGPT 6 Pro 复审 ITERATION 5（2026-09-20，CHANGES_REQUESTED，关 R6-B + 补读证据，剩 R8 一项）
+
+原文：research/c2c_a7e2-executed-iteration-5/REVIEW-ITERATION-5.md。R6-B 关闭；ITERATION 4 的 502 证据全部补读核验。**只剩 R8 一项**：Today.tsx 的 `orderTerminal = TERMINAL_CHAIN_PHASES.has(链级 phase)` 分支排在配对判断之前——链上 A complete、B live partial、快照属 B 时，B 的快照被显示"链已终结：整单完成"（被 A 覆盖）；链 complete/terminal_unfilled 且配对失败也不进未知分支。最小修改=订单相关判断移到配对之后（唯一配对用 snapOrder 自己的状态，完成证据优先于历史部分成交；配对失败统一"未能确定"不论链级 phase）。
+- **2026-09-20（ZCode 领导）**：EXECUTED 5 已发（execution_output id=12 被读取）。进入 ITERATION 6（最后一项）。
+
+## 25. ITERATION 6 执行（丙·前端，领导复验通过）——R8 最终分支关闭
+
+SizingLine 分支重排：删除链级 `TERMINAL_CHAIN_PHASES.has(phase)` 优先分支；意图生命周期判断（replaced/discarded/cleared/superseded）保留在前；订单相关判断全部移到配对之后——唯一配对成功只读 snapOrder 自身证据（filled_evidence 完成**优先**于历史 partial 证据 > partial+terminal > partial 存活 > 仅 terminal 无成交）；配对失败统一"对应订单/终态未能确定"（partial/complete/terminal_unfilled 一视同仁）；submit_rejected 链保留（该链无可配对订单，拒绝即快照那次提交自身结果）。红测试 3 例（复审反例①原文复现——B 区域曾被 A 的链终态覆盖为"链已终结：整单完成"；完成证据优先；终结链配对失败不借词），新增 chain_sizing_region() 区域定位 helper 防跨区误判。渲染 19 例。**P1 全量 844 / P2 682+1skip / P3 997 / P4 961；sync exit 0；build 零 TS 错误。九项退回（R1–R9）全部关闭，等终审。**
+
+## 26. ChatGPT 6 Pro 复审 ITERATION 6（2026-09-20，CHANGES_REQUESTED，R8 只剩 submit_rejected 例外）
+
+原文：research/c2c_a7e2-executed-iteration-6/REVIEW-ITERATION-6.md。上轮三处修复确认；证据全核验无缺口。**最后一项**：`unpairedChainRejected = unpaired && phase==="submit_rejected"` 例外——同一 intent A 被拒（无 order_id）、B 结果不明（无 order_id、带最新快照）时，链级拒绝把 B 的快照显示成"提交被拒绝"（借 A 结果）。修法=提交尝试结果与 order_id 解耦：快照可靠对应某次提交尝试才用其 submit_status（含无 order_id 的 order_submitted 条目），无法对应保持未知、不回退链级。红测试三组（A拒+B不明 / A拒+后续 sizing 否决 / 唯一拒绝对照）。**其他三盘可沿用本轮已核验记录（复审原话——前端只在本盘）。**
+
+## 27. ITERATION 7 执行（丙·前端，领导复验通过）——R8 submit_rejected 例外关闭
+
+snapshotOrder() 去掉 order_id 硬过滤——无单号提交尝试（聚合的 no-order-id 条目，各带 submitted_at/submit_status/submit_phase）进入 submitted_at===snap.event_ts 唯一匹配；配对成功且该次提交自身 submit_phase=submit_rejected → "历史快照（该次提交被拒绝）"（证据来自那次提交）；**删除 unpairedChainRejected 链级借词分支**；配不上（含拒绝链）统一"对应订单/终态未能确定"（UNDETERMINED_CHAIN_PHASES + submit_rejected）。红测试 2 例（A 拒+B 不明快照不借 / 拒绝链配不上不回退）+ 对照改写（唯一拒绝+自己快照仍展示）；三回归与全部控制通过。聚合字段零缺口（api.ts 已够）。**P1 全量 846；build 零 TS 错误；sync exit 0。R1–R9 全部关闭（含全部子项），等终审。**
+
+## 28. ITERATION 8 执行（领导亲手——一行入口门禁 + 一个红测试）
+
+ITERATION 7 复审只剩一个入口检查：snapshotOrder() 只按时间匹配、未落实 event_kind==="order_submitted" 前提——同时间戳的"拒绝提交 + 随后 sizing 否决事件"会让 sizing 快照借到拒绝结论（跨事件种类误配）。修复=配对入口先验证事件种类（非提交快照直接走"未能确定"，不参与时间匹配），保留无 order_id 提交的匹配能力。红测试（同刻拒绝提交+sizing 事件：先断言聚合快照 event_kind=sizing，再断言渲染不显示"该次提交被拒绝"、拒绝仍在原尝试明细）。P1 **847**；渲染+聚合 67 绿；build 零错误。R1–R9 含全部子项关闭，等 ITERATION 8 终审。
+
+## 29. ChatGPT 6 Pro 终审（2026-09-20）：c2c_a7e2 — STATE: DONE / REVIEW: APPROVED / OPEN_ITEMS: NONE
+
+原文：research/c2c_a7e2-executed-iteration-8/REVIEW-ITERATION-8-DONE.md。**八轮收敛 9→5→4→2→1→1→1→0，零遗留。**R8 关闭依据三条全部核验（入口门禁/下游一致/反例回归）。P1 847；65 共享文件一致；构建通过；三盘沿用已核验记录。它的 NEXT_EXPECTED_STEP：DONE 登记（本条）；修复包进入既定提交流程，按明确文件清单（已审源码/测试/fixture/必要台账），不带散落 research 文件；不再要求返修或重跑；冻结区/订单参数/paper-only 不变。
+- **2026-09-20（ZCode 领导）**：c2c_a7e2 全程结束。执行侧：ZCode 领导（甲，run.py/logger/manager/funnel/终部门禁）+ 乙·存储 ×2 + 丙·后端 ×3 + 丙·前端 ×3，全部经领导逐包 diff 复验。**工作树未 commit，等用户执行或授权提交。**

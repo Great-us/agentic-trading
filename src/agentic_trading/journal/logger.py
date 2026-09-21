@@ -3,9 +3,16 @@ whatever order resulted. This is the audit trail for reviewing/tuning the
 strategy later; nothing else in the pipeline reads it back."""
 from __future__ import annotations
 
+import logging
+
+import json
+import math
 import sqlite3
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Literal
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = ROOT / "data" / "journal.db"
@@ -151,6 +158,127 @@ CREATE TABLE IF NOT EXISTS intent_events (
 CREATE INDEX IF NOT EXISTS idx_intent_events_ts ON intent_events(timestamp);
 """
 
+# A-1 (c2c_a7e2 §14.2): nullable identity/linkage columns for intent_events.
+# Kept out of SCHEMA on purpose — CREATE TABLE IF NOT EXISTS cannot add columns
+# to an existing table, so these go through the incremental migration below and
+# the unique index is created only after the columns exist on every journal.
+_INTENT_EVENT_COLUMNS = (
+    ("event_id", "TEXT"),
+    ("run_id", "TEXT"),
+    ("mode", "TEXT"),
+    ("decision_key", "TEXT"),
+    ("intent_id", "TEXT"),
+    ("attempt_id", "TEXT"),
+    ("order_id", "TEXT"),
+    ("payload", "TEXT"),
+)
+
+# Whitelist of top-level payload keys stored on intent_events. Deliberately
+# excludes anything credential-, prompt- or raw-broker-response-shaped
+# (PLAN §A-2: no credentials, raw prompts, raw broker responses). Unknown keys
+# are dropped, not stored.
+INTENT_EVENT_PAYLOAD_KEYS = frozenset({
+    "reason",
+    "skip_reason",
+    "wait_reason",
+    "not_before",
+    "client_order_id",
+    "order_id",
+    "order_status",
+    "submit_status",     # order_submitted fact: accepted / rejected / dry_run (leader, 2026-09-20)
+    "notional",          # submitted/reserved dollar amount — display value, not a secret
+    "previous_version",
+    "sizing",
+    "cash_available",
+    "available_notional",
+    "min_notional",
+    "limit",
+    "limits",
+    "filled_qty",
+    "filled_avg_price",
+    "filled_at",         # broker-reported fill timestamp (absent = never claimed)
+    "observed_at",
+    "error",
+    "attempt",
+    "note",
+    "note_key",
+    "unprocessed",       # order-cap run event: determinable not-yet-processed symbols (R6, iter 3)
+})
+
+# R7 (c2c_a7e2 ITERATION 2): secret-key blacklist applied RECURSIVELY inside
+# nested payloads. Vocabulary mirrors live_events._SECRET_KEYS (the JSONL
+# tail's field filter) on purpose — one secret vocabulary across both
+# destinations; tests/test_payload_sanitizer.py pins the two sets equal so
+# they cannot drift apart silently. The top-level whitelist above never
+# contained any of these names; the extra check is defense in depth in case
+# a future whitelist edit would let one through.
+INTENT_EVENT_SECRET_KEYS = frozenset({
+    "api_key", "secret", "secret_key", "password", "token", "prompt",
+    "authorization", "alpaca_api_key", "alpaca_secret_key", "moonshot_api_key",
+})
+
+
+def sanitize_intent_payload(payload: Any) -> Any:
+    """R7: the one safe-shape cleaning step for intent-event payloads, shared
+    by both destinations — SQLite reads its JSON via _encode_payload, and the
+    funnel hands the returned dict straight to the JSONL tail.
+
+    - top level: whitelist INTENT_EVENT_PAYLOAD_KEYS — unknown keys are
+      dropped, never stored (PLAN §A-2);
+    - nested dicts / lists: recursed; any dict key in INTENT_EVENT_SECRET_KEYS
+      is dropped together with its subtree, at every depth (extends
+      live_events.emit's top-level skip below the first level);
+    - non-finite floats -> None at every depth (never the non-standard
+      NaN/Infinity literals);
+    - anything non-JSON-native degrades to its str() rather than failing the
+      business write around it;
+    - non-dict payloads wrap as {"value": ...} (the historical _encode_payload
+      contract); None passes through unchanged.
+    """
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        return {"value": _sanitize_nested(payload)}
+    cleaned: dict[str, Any] = {}
+    for key, value in payload.items():
+        key = str(key)
+        if key in INTENT_EVENT_SECRET_KEYS or key not in INTENT_EVENT_PAYLOAD_KEYS:
+            continue
+        cleaned[key] = _sanitize_nested(value)
+    return cleaned
+
+
+def _sanitize_nested(value: Any) -> Any:
+    """Recursive body of sanitize_intent_payload: containers get the
+    secret-key blacklist, non-finite floats and str() degradation at every
+    depth; JSON natives pass through untouched."""
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            key = str(key)
+            if key in INTENT_EVENT_SECRET_KEYS:
+                continue
+            cleaned[key] = _sanitize_nested(item)
+        return cleaned
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_nested(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _encode_payload(payload: Any) -> str | None:
+    """Whitelist + recursively sanitize a payload into JSON text (None
+    passthrough). R7: the recursion is where nested secret keys die — a
+    top-level whitelist alone let {"sizing": {"api_key": ...}} through."""
+    if payload is None:
+        return None
+    return json.dumps(sanitize_intent_payload(payload),
+                      ensure_ascii=False, allow_nan=False)
+
+
 
 @dataclass
 class DecisionRow:
@@ -223,6 +351,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
     intent_cols = {row[1] for row in conn.execute("PRAGMA table_info(trade_intents)")}
     if "not_before" not in intent_cols:
         conn.execute("ALTER TABLE trade_intents ADD COLUMN not_before TEXT")
+    if "version" not in intent_cols:
+        conn.execute("ALTER TABLE trade_intents ADD COLUMN version TEXT")
+    # Old journals: add the nullable linkage columns, but never backfill —
+    # historical events/intents keep NULL identities. Re-running is a no-op.
+    event_cols = {row[1] for row in conn.execute("PRAGMA table_info(intent_events)")}
+    for column, ddl in _INTENT_EVENT_COLUMNS:
+        if column not in event_cols:
+            conn.execute(f"ALTER TABLE intent_events ADD COLUMN {column} {ddl}")
+    # Only after every journal has the column does this index become creatable;
+    # SQLite treats NULLs as distinct so the historical NULL rows coexist.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_events_event_id "
+        "ON intent_events(event_id)"
+    )
     conn.commit()
 
 
@@ -364,13 +506,47 @@ class TradeIntent:
     combined_score: float
     reasoning: str
     not_before: str | None = None  # ISO UTC; None = executable immediately
+    # Immutable identity assigned by save_trade_intent (UUID4 string). Old
+    # journals and old constructors leave it None until a real new decision
+    # replaces the row — loads and flushes never invent one.
+    version: str | None = None
 
 
-def save_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
+@dataclass(frozen=True)
+class IntentSaveReceipt:
+    """What save_trade_intent actually wrote — the only trustworthy source for
+    "which identity did this save get". Never re-query the table to guess it."""
+    version: str
+    action: Literal["created", "replaced"]
+    previous_version: str | None
+
+
+def save_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> IntentSaveReceipt:
+    """Creates or replaces the intent row and mints its immutable version.
+
+    Every save is a new UUID4; loads and flushes never generate one, and a
+    delete + recreate gets a fresh identity (never reused). Callers may ignore
+    the receipt — legacy ``-> None`` usage keeps working."""
+    previous = conn.execute(
+        "SELECT version FROM trade_intents WHERE symbol = ?", (intent.symbol,)
+    ).fetchone()
+    action: Literal["created", "replaced"] = "replaced" if previous else "created"
+    previous_version = previous[0] if previous else None
+    # R1 (review round 2): identity minting must never block the business
+    # save — a uuid failure degrades to a NULL version (the row is saved,
+    # the decision is NOT flipped to save_failed/WAIT). A later real save
+    # still mints a fresh identity; no identity is ever reused.
+    try:
+        version = str(uuid.uuid4())
+    except Exception:
+        logger_ = logging.getLogger(__name__)
+        logger_.warning("version minting failed for %s — saving with NULL "
+                        "identity.", intent.symbol, exc_info=True)
+        version = None
     conn.execute(
         """INSERT INTO trade_intents
-           (symbol, created_at, signal_price, atr14, quant_score, combined_score, reasoning, not_before)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           (symbol, created_at, signal_price, atr14, quant_score, combined_score, reasoning, not_before, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(symbol) DO UPDATE SET
              created_at = excluded.created_at,
              signal_price = excluded.signal_price,
@@ -378,16 +554,30 @@ def save_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
              quant_score = excluded.quant_score,
              combined_score = excluded.combined_score,
              reasoning = excluded.reasoning,
-             not_before = excluded.not_before""",
+             not_before = excluded.not_before,
+             version = excluded.version""",
         (intent.symbol, intent.created_at, intent.signal_price, intent.atr14,
-         intent.quant_score, intent.combined_score, intent.reasoning, intent.not_before),
+         intent.quant_score, intent.combined_score, intent.reasoning,
+         intent.not_before, version),
     )
     conn.commit()
+    # R1 (review round 2): the business write is already committed — a receipt
+    # failure here must never let the caller report the save as failed. A
+    # degraded receipt still tells the truth it can (action, previous), with
+    # the minted version only if it is a real string.
+    try:
+        return IntentSaveReceipt(version=version if isinstance(version, str) else None,
+                                 action=action, previous_version=previous_version)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "save receipt construction failed for %s — business save is "
+            "already committed.", intent.symbol, exc_info=True)
+        return None
 
 
 def load_trade_intents(conn: sqlite3.Connection) -> list[TradeIntent]:
     rows = conn.execute(
-        "SELECT symbol, created_at, signal_price, atr14, quant_score, combined_score, reasoning, not_before "
+        "SELECT symbol, created_at, signal_price, atr14, quant_score, combined_score, reasoning, not_before, version "
         "FROM trade_intents"
     ).fetchall()
     return [TradeIntent(*row) for row in rows]
@@ -398,19 +588,100 @@ def clear_trade_intent(conn: sqlite3.Connection, symbol: str) -> None:
     conn.commit()
 
 
-def record_intent_event(conn: sqlite3.Connection, timestamp: str, symbol: str,
-                        kind: str, *, deferred: bool, detail: str | None = None) -> None:
-    """Log why a queued intent did not become an order this scan.
+def record_intent_event(
+    conn: sqlite3.Connection,
+    *args: Any,
+    timestamp: str | None = None,
+    deferred: bool | None = None,
+    detail: str | None = None,
+    event_id: str | None = None,
+    run_id: str | None = None,
+    mode: str | None = None,
+    decision_key: str | None = None,
+    intent_id: str | None = None,
+    attempt_id: str | None = None,
+    order_id: str | None = None,
+    payload: Any = None,
+) -> None:
+    """Log what happened to a queued intent (or, with the new kinds, anywhere
+    in the BUY decision -> fill funnel).
+
+    Two positional styles, kept distinguishable by arity:
+    - legacy: ``(timestamp, symbol, kind)`` with keyword ``deferred``/``detail``
+      (run.py flush outcomes — unchanged semantics);
+    - A-1:    ``(symbol, kind, deferred, detail)`` with the identity linkage
+      passed as keywords. ``intent_id`` is the intent's ``version``.
+
+    The same ``event_id`` delivered twice is not double-counted (INSERT OR
+    IGNORE against the unique index). The insert runs inside a savepoint so an
+    observability failure never leaves the caller's business transaction
+    poisoned — but it still raises, so callers that care can catch it (the
+    existing _journal_safe path does exactly that).
+
+    R3 transaction ownership: on an autocommit connection this function owns
+    the transaction and commits (persist-before-return, unchanged). When the
+    caller already holds an open transaction, only our savepoint is released —
+    the caller's work stays theirs to commit or roll back, and the event is
+    durable exactly when the caller's transaction is.
 
     Append-only: an intent that is deferred four times and then discarded leaves
     five rows, which is the point — "how often does the chase guard hold a name
-    back" is otherwise unanswerable from the journal."""
-    conn.execute(
-        "INSERT INTO intent_events (timestamp, symbol, kind, deferred, detail) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (timestamp, symbol, kind, 1 if deferred else 0, detail),
-    )
-    conn.commit()
+    back" is otherwise unanswerable from the journal.
+    """
+    if len(args) == 3:  # legacy (timestamp, symbol, kind)
+        ts, sym, knd = args
+    elif len(args) == 4:  # A-1 (symbol, kind, deferred, detail)
+        sym, knd, pos_deferred, pos_detail = args
+        if deferred is not None or detail is not None:
+            raise TypeError("deferred/detail passed both positionally and by keyword")
+        ts, deferred, detail = timestamp, pos_deferred, pos_detail
+    else:
+        raise TypeError(
+            "record_intent_event expects (timestamp, symbol, kind) legacy or "
+            "(symbol, kind, deferred, detail) positional arguments"
+        )
+    assert deferred is not None
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    payload_text = _encode_payload(payload)
+    # R3 (c2c_a7e2 ITERATION 2): transaction ownership. ``in_transaction`` is
+    # the C-level autocommit state (sqlite3_get_autocommit() == 0) — True
+    # exactly when someone (the caller's DML, an explicit BEGIN, or a caller
+    # savepoint) already opened a transaction. Checked BEFORE our SAVEPOINT,
+    # because SAVEPOINT itself flips it. If the connection is already in a
+    # transaction this function is a guest: the savepoint keeps our insert
+    # individually undoable, we release only our own savepoint and never
+    # commit or roll back the caller's business work (a top-level commit here
+    # would publish their uncommitted writes beyond their control — the
+    # review's leak). Only when we arrived on an autocommit connection do we
+    # own the transaction and commit, preserving the historical
+    # persist-before-return behavior every existing call site relies on.
+    owns_transaction = not conn.in_transaction
+    conn.execute("SAVEPOINT intent_event_write")
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO intent_events
+               (timestamp, symbol, kind, deferred, detail,
+                event_id, run_id, mode, decision_key, intent_id,
+                attempt_id, order_id, payload)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ts, sym, knd, 1 if deferred else 0, detail,
+             event_id, run_id, mode, decision_key, intent_id,
+             attempt_id, order_id, payload_text),
+        )
+    except BaseException:
+        try:
+            # Undo only our own statement; never the caller's transaction.
+            # finally-RELEASE guarantees the savepoint cannot outlive this
+            # handler even if the ROLLBACK TO itself fails (review: no
+            # leftover savepoint, connection still usable).
+            conn.execute("ROLLBACK TO intent_event_write")
+        finally:
+            conn.execute("RELEASE intent_event_write")
+        raise
+    conn.execute("RELEASE intent_event_write")
+    if owns_transaction:
+        conn.commit()
 
 
 def record_cycle(

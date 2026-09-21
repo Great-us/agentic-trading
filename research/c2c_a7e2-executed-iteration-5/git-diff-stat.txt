@@ -1,0 +1,11 @@
+ src/agentic_trading/dashboard/api.py               |  26 +
+ src/agentic_trading/dashboard/frontend/src/api.ts  | 205 +++++
+ .../dashboard/frontend/src/pages/Today.tsx         | 590 ++++++++++++-
+ src/agentic_trading/dashboard/views.py             | 961 +++++++++++++++++++++
+ src/agentic_trading/execution/broker.py            |  97 ++-
+ src/agentic_trading/journal/logger.py              | 303 ++++++-
+ src/agentic_trading/risk/manager.py                | 133 ++-
+ src/agentic_trading/run.py                         | 179 +++-
+ tests/test_dashboard.py                            |  20 +
+ tests/test_risk.py                                 | 252 +++++-
+ 10 files changed, 2701 insertions(+), 65 deletions(-)

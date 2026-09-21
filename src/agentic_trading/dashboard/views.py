@@ -565,6 +565,967 @@ def recent_intent_events(conn: sqlite3.Connection, *, limit: int = 20) -> list[d
     return [dict(row) for row in rows]
 
 
+# ---- A-4 (c2c_a7e2 PLAN §五): read-only execution-funnel aggregation -----------
+#
+# The Today funnel is aggregated from the SQLite intent_events ledger — never
+# from the rotating JSONL tail (120-line replay cap) and never by re-running
+# sizing. Identity layers per PLAN §一: BUY decision (run_id + symbol) →
+# intent version (intent_id = trade_intents.version) → order (order_id). Ten
+# flush_wait retries are ten attempts on ONE intent, not ten decisions; a
+# replaced intent's old failure stays with the decision that owned the old
+# version. accepted is not filled. Broker fills matched by order_id are
+# positive evidence; a non-match proves nothing. Old schema, identity-less
+# rows and unavailable data sources degrade explicitly — nothing is paired by
+# symbol + near-time and nothing is invented. Strictly read-only.
+#
+# Review R4 (c2c_a7e2 ITERATION-1): chains are built from the FULL event
+# history up to the cutoff `now`, any ET day — yesterday's creation, order_id
+# and sizing snapshot join today's observations via intent_id/order_id (the
+# creation date never bounds order lookup). Today's cohort DENOMINATOR still
+# counts only this session's decision_buy events; full history only enriches
+# the chain detail. Today's fills whose order matches a historical order pull
+# that chain onto the page even with no intent events today; fills whose
+# order matches nothing stay listed as unlinked positive evidence.
+#
+# Review R4 (ITERATION-3): identity-less order observations (older journals,
+# before the recovery pass carried intent_id) join a chain when their
+# order_id matches EXACTLY ONE identified order_submitted event of the same
+# book (run_id prefix) and the same mode. An order_id claimed by SEVERAL
+# intents, or a submission that itself has no identity, is UNATTRIBUTABLE —
+# the observation is listed in degraded.unattributed_order_events and never
+# guessed onto a chain by symbol.
+#
+# Review R4 (ITERATION-4): the SAME ownership rule now gates the fill side.
+# Broker fills join an intent chain only through the unique identified
+# submission of their order_id (same book, same mode, full history); an
+# order_id claimed by several intents, submitted without identity, or never
+# submitted at all keeps its fill evidence order-level in unlinked_fills
+# (with the reason) but gains no fill-attributed completion — one fill can
+# never complete two chains. Another mode's same-order_id history is a
+# different attribution key: it can neither steal the identity nor suppress
+# this mode's lookback.
+#
+# Review R5: state rules are explicit on the output, so the frontend never
+# re-derives meaning from a status string. Per order: ``phase`` ∈ complete |
+# partial | terminal_unfilled | submit_rejected | submitted | submit_unknown
+# | unknown, plus flags (filled_evidence / partial_evidence /
+# last_observation_failed, submit_status / submit_phase). Completion =
+# an order_filled observation, or a fill activity the broker itself marked
+# ``order_status == "fill"`` (its completing-fill marker — the ledger stores
+# notional, not order quantity, so a qty>=order-size comparison is NOT
+# computable here and is never fabricated). A partial-fill activity is a
+# partial, never a completion. Later unknown observations never erase earlier
+# reliable completion evidence. Fill degree and terminal status are
+# INDEPENDENT facts (R5 ITERATION-3): the terminal state is read from
+# payload.order_status in ANY order event — a canceled-with-partial arrives
+# as order_partial and keeps both the quantity and the canceled status, never
+# becoming an entire-order completion. Submit facts are separated:
+# acknowledged acceptance (order_id + submit_status), explicit rejection
+# (submit_status "rejected" — only for a positively confirmed rejection; run.py
+# records a None broker result as "unknown", ITERATION-3), and unknown
+# outcome; a NULL-order_id order_submitted is never an accepted submission.
+# Replaced intents say so: superseded_by, not "waiting".
+
+_FUNNEL_INTENT_EVENT_COLUMNS = (
+    "id", "timestamp", "symbol", "kind", "deferred", "detail",
+    "event_id", "run_id", "mode", "decision_key", "intent_id",
+    "attempt_id", "order_id", "payload",
+)
+# The identity columns added by A-1; a journal without them is pre-A-1.
+_FUNNEL_REQUIRED_COLUMNS = (
+    "run_id", "mode", "decision_key", "intent_id", "attempt_id", "order_id", "payload",
+)
+_FUNNEL_INTENT_KINDS = frozenset({"intent_created", "intent_replaced"})
+_FUNNEL_ORDER_KINDS = frozenset({
+    "order_submitted", "order_observed", "order_partial", "order_filled", "order_unknown",
+})
+# Stages that keep the intent alive for a later scan.
+_FUNNEL_WAIT_KINDS = frozenset({"flush_wait", "chase_signal", "chase_open", "sizing"})
+# Stages that discard the intent outright.
+_FUNNEL_DISCARD_KINDS = frozenset({"ttl", "gap"})
+# The pre-A-2 flush-outcome kinds (they carry identity columns since A-2).
+_FUNNEL_LEGACY_FLUSH_KINDS = frozenset({"gap", "chase_signal", "chase_open", "sizing", "ttl"})
+# Terminal non-fill broker statuses. Mirror of execution.broker.DEAD_ORDER_STATUSES —
+# defined locally (not imported) so the read-only dashboard keeps zero dependency on
+# the broker SDK module.
+_DEAD_ORDER_STATUSES = frozenset({
+    "rejected", "expired", "canceled", "cancelled", "replaced", "stopped",
+    "suspended", "done_for_day",
+})
+# The broker's marker on the fill activity that COMPLETED its order
+# (Alpaca activities: "fill" vs "partial_fill").
+_FILL_COMPLETE_STATUS = "fill"
+# R6 (ITERATION-3): kinds that count a run as an ATTEMPT — flush-stage WORK:
+# waiting, veto, discard, submit. Submitting IS flush work; status
+# observations are re-queries of an existing order and are NOT attempts
+# (1 submit + 10 requeries is 1 attempt and 10 observation runs, not 11).
+# intent_created/intent_replaced are creation, not attempts; they are counted
+# separately (created_runs), and the re-query runs are listed separately too
+# (observed_runs).
+_FUNNEL_ATTEMPT_KINDS = frozenset({
+    "flush_wait", "gap", "chase_signal", "chase_open", "sizing", "ttl",
+    "order_submitted",
+})
+_FUNNEL_OBSERVATION_KINDS = frozenset({
+    "order_observed", "order_partial", "order_filled", "order_unknown",
+})
+# R6 (ITERATION-3): every kind that NEEDS an intent identity. The
+# identity-less degraded gate covers the pre-A-2 flush five AND the modern
+# flush_wait / intent_cleared / order_submitted / order_* / clear_failed
+# events produced for a version-NULL intent — those used to vanish silently.
+_FUNNEL_IDENTITY_KINDS = (
+    _FUNNEL_LEGACY_FLUSH_KINDS | _FUNNEL_ORDER_KINDS
+    | {"flush_wait", "intent_cleared", "clear_failed"}
+)
+
+
+def _book_of(run_id: str | None) -> str | None:
+    """The book segment of a run_id (``{book}:{cycle_start}:{hex}``). The
+    journal is per-book, so this is the same-book guard on order→submission
+    attribution (review R4: never attribute across books)."""
+    if not run_id:
+        return None
+    return run_id.split(":", 1)[0]
+
+
+def _funnel_zero_summary() -> dict:
+    return {
+        "decisions": 0, "with_intent": 0,
+        "not_created": 0, "not_created_reasons": {},
+        "evidence_missing": 0,
+        "submitted": 0, "submitted_frac": "0/0",
+        "submit_rejected": 0, "submit_unknown": 0, "superseded": 0,
+        "filled_verified": 0, "partial": 0,
+        "waiting": 0, "discarded": 0, "cleared": 0, "created_pending": 0,
+        "carryover_intents": 0,
+    }
+
+
+def _funnel_empty_degraded() -> dict:
+    return {
+        "fills": {"degraded": True, "reason": None, "truncated": None},
+        "unattributed_decision_events": 0,
+        "unparseable_timestamps": 0,
+        "unparseable_payloads": 0,
+        "legacy_flush_events": 0,
+        "identityless_by_mode": {},
+        "duplicate_fill_activities": 0,
+        "post_cutoff_fills": 0,
+        "identityless_observed_today": [],
+        "unattributed_order_events": [],
+        "orphan_intents": [],
+        "unknown_origin_intents": [],
+        "notes": [],
+    }
+
+
+def _event_reason(event: dict) -> str | None:
+    payload = event.get("payload") or {}
+    for key in ("reason", "wait_reason", "skip_reason"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return event.get("detail")
+
+
+def _submit_phase(order_id: str | None, submit_status: str | None) -> str:
+    """R5: the submit FACT, separated. "rejected" appears only when a
+    rejection was POSITIVELY confirmed (run.py records a None broker result
+    as "unknown" — no confirmed-rejection claim without evidence); an attempt
+    with an order and a recorded status is an acknowledged acceptance;
+    everything else stays honestly unknown."""
+    if submit_status == "rejected":
+        return "submit_rejected"
+    if order_id and submit_status:
+        return "submitted_accepted"
+    return "submit_unknown"
+
+
+def _order_phase(entry: dict) -> str:
+    """R5 precedence: completion evidence > partial evidence > explicit
+    rejection > terminal-unfilled > submitted > attempt-unknown."""
+    if entry.get("filled_evidence"):
+        return "complete"                      # 整单完成
+    if entry.get("partial_evidence"):
+        return "partial"                       # 存在成交，未整单完成
+    if entry.get("submit_phase") == "submit_rejected":
+        return "submit_rejected"               # 明确拒绝
+    if entry.get("terminal_status"):
+        return "terminal_unfilled"             # 订单终结但未完成
+    if entry.get("submitted_at") and entry.get("order_id"):
+        return "submitted"                     # 已提交（受理情况见 submit_phase）
+    if entry.get("submitted_at"):
+        return "submit_unknown"                # 仅提交尝试，结果不明
+    return "unknown"
+
+
+def _chain_phase(orders: list[dict]) -> str | None:
+    """The chain's best order-level truth (R5: explicit, not re-derived).
+    A chain that holds a real order reports submitted/reached-state even if
+    an earlier attempt was rejected — that attempt stays visible on its own
+    order; "submit_rejected" is reserved for chains with NO live order."""
+    phases = [o.get("phase") for o in orders]
+    for want in ("complete", "partial", "terminal_unfilled"):
+        if want in phases:
+            return want
+    if any(o.get("submitted_at") and o.get("order_id") for o in orders):
+        return "submitted"
+    if "submit_rejected" in phases:
+        return "submit_rejected"
+    if "submit_unknown" in phases:
+        return "submit_unknown"
+    return None
+
+
+def _funnel_orders(events: list[dict], fills_by_order: dict[str, list[dict]],
+                   fills_available: bool,
+                   allowed_oids: set[str] | None = None) -> list[dict]:
+    """One entry per distinct order_id, in first-seen order. Multiple status
+    observations of the same order and multiple partial fills merge into ONE
+    order — they are not multiple submissions (PLAN §一). Evidence ACCUMULATES
+    (R5): a later unknown observation never erases an earlier reliable
+    completion; ``last_observation_failed`` records that the newest look
+    failed without un-knowing what was confirmed before.
+
+    R4 (ITERATION-4): ``allowed_oids`` is the chain's ownership grant — the
+    order_ids this intent UNIQUELY owns (exactly one identified submission,
+    same book and mode). Feed activity outside the grant is withheld from the
+    chain: the order entry reports ``fills_matched=None`` plus
+    ``fills_withheld=True`` and the activity stays order-level in
+    unlinked_fills with the reason — never fill-attributed completion."""
+    orders: dict[str, dict] = {}
+
+    def _entry(oid: str) -> dict:
+        return orders.setdefault(oid, {
+            "order_id": oid if not oid.startswith("no-order-id:") else None,
+            "client_order_id": None, "submitted_at": None,
+            "submit_status": None, "submit_phase": None,
+            "last_observation_kind": None, "observed_at": None,
+            "last_observation_failed": False,
+            "broker_status": None, "terminal_status": None,
+            "filled_evidence": False, "partial_evidence": False,
+            "filled_qty": None, "filled_avg_price": None,
+            "fills_matched": None, "fills_qty": None, "fills_notional": None,
+            "fills_withheld": False,
+            "fills_unavailable": not fills_available,
+        })
+
+    for event in events:
+        kind = event["kind"]
+        if kind not in _FUNNEL_ORDER_KINDS:
+            continue
+        oid = event.get("order_id")
+        key = str(oid) if oid else f"no-order-id:{event['id']}"
+        entry = _entry(key)
+        payload = event.get("payload") or {}
+        if kind == "order_submitted":
+            entry["submitted_at"] = event["ts"].isoformat()
+            if payload.get("client_order_id"):
+                entry["client_order_id"] = payload.get("client_order_id")
+            entry["submit_status"] = payload.get("submit_status")
+            entry["submit_phase"] = _submit_phase(
+                entry["order_id"], entry["submit_status"])
+        else:
+            entry["last_observation_kind"] = kind
+            entry["observed_at"] = event["ts"].isoformat()
+            status = payload.get("order_status")
+            if status is not None:
+                entry["broker_status"] = status
+            if kind == "order_unknown":
+                entry["last_observation_failed"] = True
+            else:
+                entry["last_observation_failed"] = False
+            # R5 (ITERATION-3): fill degree and terminal status are
+            # INDEPENDENT facts, each read off its own evidence — the
+            # terminal state comes from payload.order_status in ANY order
+            # event (a canceled-with-partial arrives as kind=order_partial
+            # and keeps BOTH the quantity and the canceled status).
+            if kind == "order_filled" or status == "filled":
+                entry["filled_evidence"] = True
+            if kind == "order_partial" or status == "partially_filled":
+                entry["partial_evidence"] = True
+            if status in _DEAD_ORDER_STATUSES:
+                entry["terminal_status"] = status
+            if payload.get("filled_qty") is not None:
+                entry["filled_qty"] = payload.get("filled_qty")
+            if payload.get("filled_avg_price") is not None:
+                entry["filled_avg_price"] = payload.get("filled_avg_price")
+    if fills_available:
+        for key, entry in orders.items():
+            oid = entry["order_id"]
+            if oid is None:
+                continue
+            allowed = allowed_oids is None or str(oid) in allowed_oids
+            matched = fills_by_order.get(str(oid)) if allowed else None
+            if matched:
+                entry["fills_matched"] = True
+                entry["fills_qty"] = sum(float(f.get("qty") or 0.0) for f in matched)
+                entry["fills_notional"] = round(
+                    sum(float(f.get("notional") or 0.0) for f in matched), 2)
+                if any((f.get("order_status") or "") == _FILL_COMPLETE_STATUS
+                       for f in matched):
+                    # The broker's own completing-fill marker — completion
+                    # evidence (R5); a lone "partial_fill" activity is not.
+                    entry["filled_evidence"] = True
+                elif (entry["fills_qty"] or 0.0) > 0:
+                    entry["partial_evidence"] = True
+            elif str(oid) in fills_by_order:
+                # The feed HAS activity for this order_id, but this chain
+                # holds no unique provable ownership of it (conflicted /
+                # identity-less submission — R4 ITERATION-4). Granting it
+                # would credit one fill to two chains; the evidence stays
+                # order-level in unlinked_fills with the reason.
+                entry["fills_matched"] = None
+                entry["fills_withheld"] = True
+            else:
+                # No match in a readable feed — that is absence of evidence,
+                # not evidence of zero fills.
+                entry["fills_matched"] = False
+    for entry in orders.values():
+        entry["phase"] = _order_phase(entry)
+    return list(orders.values())
+
+
+def _funnel_sizing_snapshot(events: list[dict]) -> dict | None:
+    """The latest sizing snapshot carried by any event payload — echoed, never
+    recomputed (PLAN §A-4: the number must come from the attempt that produced
+    it, not from the moment the page was opened)."""
+    snapshot = None
+    for event in events:  # events arrive in id (append) order — last wins
+        payload = event.get("payload") or {}
+        sizing = payload.get("sizing")
+        if isinstance(sizing, dict):
+            # R8: the snapshot carries ITS OWN timestamp and attempt identity
+            # (which attempt produced these numbers), not the page-open moment.
+            snapshot = {
+                "event_kind": event["kind"],
+                "event_ts": event["ts"].isoformat() if event.get("ts") else None,
+                "attempt_id": event.get("attempt_id"),
+                "sizing": sizing,
+            }
+            for key in ("reason", "cash_available", "available_notional", "min_notional"):
+                if key in payload:
+                    snapshot[key] = payload[key]
+    return snapshot
+
+
+def _funnel_classify(orders: list[dict], last_kind: str | None) -> str:
+    # R5: a real submission needs an order (order_id present) that was not
+    # explicitly rejected. NULL-order_id rejected/unknown attempts get their
+    # own buckets instead of inflating "submitted".
+    real_submissions = [
+        o for o in orders
+        if o.get("submitted_at") and o.get("order_id")
+        and o.get("submit_phase") != "submit_rejected"
+    ]
+    if real_submissions:
+        return "submitted"
+    if any(o.get("phase") == "submit_rejected" for o in orders):
+        return "submit_rejected"
+    if any(o.get("submitted_at") for o in orders):
+        return "submit_unknown"
+    if last_kind in _FUNNEL_WAIT_KINDS:
+        return "waiting"
+    if last_kind in _FUNNEL_DISCARD_KINDS:
+        return "discarded"
+    if last_kind == "intent_cleared":
+        return "cleared"
+    if last_kind in _FUNNEL_INTENT_KINDS:
+        return "created_pending"
+    return "other"
+
+
+def funnel_summary(
+    conn: sqlite3.Connection,
+    *,
+    mode: str = "paper",
+    now: datetime | None = None,
+    fills: list[dict] | None = None,
+    fills_reason: str | None = None,
+    fills_truncated: bool | None = None,
+    session_day: str | None = None,
+) -> dict:
+    """Read-only Today execution-funnel aggregation (c2c_a7e2 PLAN §五).
+
+    Cohort denominator: decision_buy events of THIS session — unified ET
+    session day (the latest paper cycle's, matching today_payload), the given
+    trading mode, and events at or before `now` — grouped by (run_id, symbol).
+    Intents created on an earlier ET day that keep flushing today are listed
+    separately as carryover and never enter the denominator. Every chain shows
+    the latest known stage, its structured reason, attempt counts, order
+    observations and the sizing snapshot carried by the events. Old schema /
+    identity-less rows / failed or truncated fills degrade explicitly.
+    """
+    now = _aware(now or datetime.now(timezone.utc))
+    day = session_day
+    notes: list[str] = []
+    if day is None:
+        try:
+            day = session_date(conn, now)
+        except sqlite3.Error:
+            day = et_date_of(now)
+            notes.append("cycles 表不可读——会话日回退为 ET 今日")
+    out = {
+        "session_date": day,
+        "mode": mode,
+        "generated_at": now.isoformat(),
+        "schema_degraded": False,
+        "schema_reason": None,
+        "summary": _funnel_zero_summary(),
+        "chains": [],
+        "carryover": [],
+        "unlinked_fills": [],
+        "run_skips": [],
+        "degraded": _funnel_empty_degraded(),
+    }
+
+    fills_available = fills is not None
+    out["degraded"]["fills"] = {
+        "degraded": not fills_available,
+        "reason": fills_reason if not fills_available else None,
+        "truncated": fills_truncated if fills_available else None,
+    }
+    # R5 tail: the fill index applies the same `now` cutoff as everything
+    # else and dedupes by activity id — executions after the cutoff and
+    # duplicated feed rows are neither evidence nor double-counted.
+    fills_by_order: dict[str, list[dict]] = {}
+    seen_fill_ids: set[str] = set()
+    if fills_available:
+        for fill in fills:
+            fid = fill.get("id")
+            if fid is not None:
+                if str(fid) in seen_fill_ids:
+                    out["degraded"]["duplicate_fill_activities"] += 1
+                    continue
+                seen_fill_ids.add(str(fid))
+            fts = parse_iso(fill.get("transaction_time"))
+            if fts is not None and fts > now:
+                out["degraded"]["post_cutoff_fills"] += 1
+                continue
+            oid = fill.get("order_id")
+            if oid:
+                fills_by_order.setdefault(str(oid), []).append(fill)
+
+    # -- schema gate: an old journal degrades instead of breaking --------------
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(intent_events)")}
+    except sqlite3.Error as exc:
+        out["schema_degraded"] = True
+        out["schema_reason"] = f"intent_events 不可读: {exc}"
+        out["degraded"]["notes"] = notes + ["旧 schema：无法做身份级漏斗聚合"]
+        return out
+    if not columns:
+        out["schema_degraded"] = True
+        out["schema_reason"] = "intent_events 表不存在"
+        out["degraded"]["notes"] = notes + ["旧 schema：无法做身份级漏斗聚合"]
+        return out
+    missing = [c for c in _FUNNEL_REQUIRED_COLUMNS if c not in columns]
+    if missing:
+        out["schema_degraded"] = True
+        out["schema_reason"] = (
+            "旧 schema——intent_events 缺少身份列: " + ", ".join(missing)
+        )
+        legacy: dict[str, int] = {}
+        try:
+            rows = conn.execute(
+                "SELECT timestamp, kind FROM intent_events ORDER BY id"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            ts = parse_iso(row[0])
+            if ts is not None and et_date_of(ts) == day and ts <= now:
+                legacy[row[1]] = legacy.get(row[1], 0) + 1
+        out["legacy_event_counts"] = legacy
+        out["degraded"]["notes"] = notes + [
+            "旧行无身份列，只按 kind 计数；不按 symbol+时间强行配对",
+        ]
+        return out
+
+    # -- read the whole ledger (explicit column list → works with any row factory)
+    try:
+        raw = conn.execute(
+            "SELECT id, timestamp, symbol, kind, deferred, detail, event_id, run_id, "
+            "mode, decision_key, intent_id, attempt_id, order_id, payload "
+            "FROM intent_events ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        out["schema_degraded"] = True
+        out["schema_reason"] = f"intent_events 读取失败: {exc}"
+        out["degraded"]["notes"] = notes
+        return out
+
+    degraded = out["degraded"]
+    today: list[dict] = []                      # in-session, in-mode events
+    by_intent_all: dict[str, list[dict]] = {}   # in-mode, any day, up to cutoff
+    # Pass 1 — parse, plus the R4 (ITERATION-3) attribution index: which
+    # intent(s) SUBMITTED each order_id (same book, same mode, identified
+    # submissions only, up to the cutoff). Resolution happens after the scan
+    # because a later row can turn a unique owner into a conflict.
+    submit_owners: dict[tuple, set] = {}
+    identityless_submit_keys: set[tuple] = set()
+    parsed: list[dict] = []
+    for row in raw:
+        r = dict(zip(_FUNNEL_INTENT_EVENT_COLUMNS, row))
+        ts = parse_iso(r["timestamp"])
+        payload = None
+        if r["payload"]:
+            try:
+                loaded = json.loads(r["payload"])
+            except (ValueError, TypeError):
+                degraded["unparseable_payloads"] += 1
+                loaded = None
+            payload = loaded if isinstance(loaded, dict) else None
+        event = {
+            "id": r["id"], "ts": ts, "symbol": r["symbol"], "kind": r["kind"],
+            "detail": r["detail"], "run_id": r["run_id"], "mode": r["mode"],
+            "decision_key": r["decision_key"], "intent_id": r["intent_id"],
+            "attempt_id": r["attempt_id"], "order_id": r["order_id"],
+            "payload": payload,
+        }
+        if ts is None:
+            degraded["unparseable_timestamps"] += 1
+        elif ts <= now and r["mode"] == mode and r["intent_id"]:
+            # R4: the chain-history index keeps every in-mode identified
+            # event up to the cutoff — any ET day. The creation date never
+            # bounds order lookup. (Exactly one append per event.)
+            by_intent_all.setdefault(r["intent_id"], []).append(event)
+            if r["kind"] == "order_submitted" and r["order_id"]:
+                submit_owners.setdefault(
+                    (_book_of(r["run_id"]), mode, str(r["order_id"])),
+                    set()).add(r["intent_id"])
+        elif (ts is not None and ts <= now and r["mode"] == mode
+                and r["kind"] == "order_submitted" and r["order_id"]
+                and not r["intent_id"]):
+            # A submission with no identity: its observations can never be
+            # attributed to a version — the owner identity never existed.
+            identityless_submit_keys.add(
+                (_book_of(r["run_id"]), mode, str(r["order_id"])))
+        parsed.append({"r": r, "event": event})
+
+    unique_owner: dict[tuple, str] = {}
+    conflict_keys: set[tuple] = set()
+    for key, owners in submit_owners.items():
+        if len(owners) == 1:
+            unique_owner[key] = next(iter(owners))
+        else:
+            conflict_keys.add(key)
+
+    # R4 (ITERATION-4): the same ownership facts, keyed by order_id alone.
+    # Broker fills carry no book/mode, so an order is fill-attributable only
+    # when its identified-submission owner set across the FULL in-mode
+    # history is EXACTLY ONE intent. submit_owners is mode-scoped, so another
+    # mode's same-order_id history never enters this set — a dry_run twin can
+    # neither steal the paper identity nor suppress the paper lookback. A
+    # conflicted order (or one whose only submission is identity-less, or one
+    # with no submission at all) stays OUT of the index: its fills are
+    # withheld from every chain and listed order-level with the reason.
+    owners_by_oid: dict[str, set] = {}
+    for (_book, _mode, oid), owners in submit_owners.items():
+        owners_by_oid.setdefault(oid, set()).update(owners)
+    order_to_intent: dict[str, str] = {}
+    conflict_oids: set[str] = set()
+    for oid, owners in owners_by_oid.items():
+        if len(owners) == 1:
+            order_to_intent[oid] = next(iter(owners))
+        else:
+            conflict_oids.add(oid)
+    identityless_submit_oids = {key[2] for key in identityless_submit_keys}
+
+    # Per-intent view of the fill index (R4 ITERATION-4): a chain is handed
+    # only the fills of orders it uniquely owns; everything else is withheld
+    # inside _funnel_orders and surfaces in unlinked_fills.
+    fills_by_intent: dict[str, dict[str, list[dict]]] = {}
+    if fills_available:
+        for oid, matched in fills_by_order.items():
+            iid = order_to_intent.get(oid)
+            if iid is not None:
+                fills_by_intent.setdefault(iid, {})[oid] = matched
+
+    # Pass 2 — R4 identity-less attachment, the identity-less degraded gate,
+    # and the in-session cohort intake.
+    for row in parsed:
+        r, event = row["r"], row["event"]
+        ts = event["ts"]
+        in_day = ts is not None and et_date_of(ts) == day and ts <= now
+        # R4 (ITERATION-3): an identity-less order observation joins a chain
+        # only through a UNIQUE identified submission of the same order_id in
+        # the same book and mode. Conflicts and identity-less/no submissions
+        # are listed as unattributed — never paired by symbol. A recovered
+        # event is NOT degraded accounting: its identity was established.
+        attached_to = None
+        if (ts is not None and ts <= now and r["mode"] == mode
+                and r["kind"] in _FUNNEL_OBSERVATION_KINDS
+                and not r["intent_id"] and r["order_id"]):
+            key = (_book_of(r["run_id"]), mode, str(r["order_id"]))
+            if key in unique_owner:
+                attached_to = unique_owner[key]
+                # RECOVERED identity from the unique submission — not invented.
+                event["intent_id"] = attached_to
+                by_intent_all.setdefault(attached_to, []).append(event)
+            elif in_day:
+                if key in conflict_keys:
+                    note = ("同一 order_id 归属多个意图（同书同 mode）——"
+                            "不按 symbol 猜测，显式列为无法归因")
+                elif key in identityless_submit_keys:
+                    note = ("原提交事件无意图身份（intent_id 为空）——"
+                            "不按 symbol 猜测，显式列为无法归因")
+                else:
+                    note = ("台账中无该订单（同书同 mode）的提交记录——"
+                            "不按 symbol 猜测，显式列为无法归因")
+                degraded["unattributed_order_events"].append({
+                    "kind": r["kind"],
+                    "order_id": str(r["order_id"]),
+                    "symbol": r["symbol"],
+                    "mode": r["mode"],
+                    "timestamp": r["timestamp"],
+                    "note": note,
+                })
+        if not in_day:
+            continue
+        if attached_to is not None:
+            today.append(event)
+            continue
+        # Identity-less rows: countable, not chainable. R6 (ITERATION-3): the
+        # gate is the MISSING IDENTITY — not the kind list, and not the mode —
+        # so it covers the pre-A-2 flush five AND the modern flush_wait /
+        # intent_cleared / order_submitted / order_* / clear_failed events
+        # produced for a version-NULL intent. Entries stay mode-distinguishable
+        # (paper and dry_run separable; mode-NULL history lands in the
+        # "unsplit" reference bucket, never folded into this page's own mode).
+        # No version is invented, so they stay out of every chain and
+        # denominator.
+        if r["kind"] in _FUNNEL_IDENTITY_KINDS and not r["intent_id"]:
+            degraded["legacy_flush_events"] += 1
+            mode_key = r["mode"] if r["mode"] else "unsplit"
+            degraded["identityless_by_mode"][mode_key] = (
+                degraded["identityless_by_mode"].get(mode_key, 0) + 1)
+            degraded["identityless_observed_today"].append({
+                "kind": r["kind"],
+                "symbol": r["symbol"],
+                "timestamp": r["timestamp"],
+                "mode": r["mode"],
+                "note": "本轮已观察、意图身份缺失（intent_id 为空）——"
+                        "不补造版本，不成链，不入分母；按 mode 区分，"
+                        "mode=NULL 归未分模式参考",
+            })
+        # A decision_buy with no run_id, or no mode at all, can never join any
+        # mode's cohort — count it as unattributed instead of fabricating one.
+        if r["kind"] == "decision_buy" and (not r["run_id"] or r["mode"] is None):
+            degraded["unattributed_decision_events"] += 1
+            continue
+        if r["mode"] != mode:
+            continue
+        today.append(event)
+
+    # -- cohort: this session's BUY decisions, keyed by (run_id, symbol) --------
+    decisions: dict[tuple[str, str], dict] = {}
+    for event in today:
+        if event["kind"] != "decision_buy":
+            continue
+        if not event["run_id"]:
+            degraded["unattributed_decision_events"] += 1
+            continue
+        decisions.setdefault((event["run_id"], event["symbol"]), event)
+
+    created_by_decision: dict[str, list[dict]] = {}
+    created_by_fallback: dict[tuple[str, str], list[dict]] = {}
+    not_created_by_decision: dict[str, list[dict]] = {}
+    not_created_by_fallback: dict[tuple[str, str], list[dict]] = {}
+    today_by_intent: dict[str, list[dict]] = {}
+    for event in today:
+        kind = event["kind"]
+        if kind in _FUNNEL_INTENT_KINDS and event["intent_id"]:
+            if event["decision_key"]:
+                created_by_decision.setdefault(event["decision_key"], []).append(event)
+            elif event["run_id"]:
+                created_by_fallback.setdefault(
+                    (event["run_id"], event["symbol"]), []).append(event)
+            today_by_intent.setdefault(event["intent_id"], []).append(event)
+        elif kind == "intent_not_created":
+            if event["decision_key"]:
+                not_created_by_decision.setdefault(event["decision_key"], []).append(event)
+            elif event["run_id"]:
+                not_created_by_fallback.setdefault(
+                    (event["run_id"], event["symbol"]), []).append(event)
+        elif event["intent_id"]:
+            today_by_intent.setdefault(event["intent_id"], []).append(event)
+
+    # -- cross-day indexes (R4) ---------------------------------------------------
+    # order_id → intent_id over the full in-mode history — built ABOVE from the
+    # unique-submission ownership facts (R4 ITERATION-4: the fill-attribution
+    # twin of the observation attachment) — so today's fills can find the chain
+    # an order belongs to even when nothing else happened today. Conflicted and
+    # identity-less orders are absent from it by construction.
+    superseded_by: dict[str, str] = {}
+    for iid, events in by_intent_all.items():
+        for event in events:
+            if event["kind"] == "intent_replaced":
+                prev = (event.get("payload") or {}).get("previous_version")
+                if prev:
+                    superseded_by.setdefault(str(prev), iid)
+    # Intents shown outside the cohort denominator: any in-session activity,
+    # plus orders whose TODAY fills matched history (fills-only days), plus
+    # intents that a today replacement superseded.
+    carry_ids: set[str] = set(today_by_intent)
+    if fills_available:
+        for oid, matched in fills_by_order.items():
+            if any(_fill_session_date(f) == day for f in matched):
+                iid = order_to_intent.get(oid)
+                if iid:
+                    carry_ids.add(iid)
+    for event in today:
+        if event["kind"] == "intent_replaced":
+            prev = (event.get("payload") or {}).get("previous_version")
+            if prev and prev in by_intent_all:
+                carry_ids.add(prev)
+
+    def _intent_chain(intent_id: str) -> dict:
+        # R4: the chain detail is the FULL history up to the cutoff —
+        # yesterday's creation, order_id and sizing snapshot join today's
+        # observations. The today cohort denominator is untouched (it is
+        # decided by today's decision_buy events alone).
+        events = sorted(by_intent_all.get(intent_id, []), key=lambda e: e["id"])
+        last = events[-1] if events else None
+        # R4 (ITERATION-4): the chain sees only fills of orders it UNIQUELY
+        # owns; feed activity outside the grant is withheld (see
+        # _funnel_orders) and stays order-level in unlinked_fills.
+        allowed = set(fills_by_intent.get(intent_id, {}))
+        orders = _funnel_orders(events, fills_by_order, fills_available,
+                                allowed_oids=allowed)
+        # R6 (ITERATION-3): attempts = flush ATTEMPTS — distinct runs whose
+        # events were flush-stage WORK (wait/veto/discard/submit). Submitting
+        # IS flush work; status observations are re-queries of an existing
+        # order, not attempts (1 submit + 10 requeries = 1 attempt and 10
+        # observed_runs, never 11). Creation and replacement runs are not
+        # attempts; open_missing waits are a skipped check, not a wait, and
+        # do not enter wait_events.
+        attempts = len({e["run_id"] for e in events
+                        if e["run_id"] and e["kind"] in _FUNNEL_ATTEMPT_KINDS})
+        created_runs = len({e["run_id"] for e in events
+                            if e["run_id"] and e["kind"] in _FUNNEL_INTENT_KINDS})
+        observed_runs = len({e["run_id"] for e in events
+                             if e["run_id"] and e["kind"] in _FUNNEL_OBSERVATION_KINDS})
+        wait_events = sum(
+            1 for e in events
+            if e["kind"] == "flush_wait" and _event_reason(e) != "open_missing")
+        return {
+            "intent_id": intent_id,
+            "attempts": attempts,
+            "created_runs": created_runs,
+            "observed_runs": observed_runs,
+            "wait_events": wait_events,
+            "stage": last["kind"] if last else None,
+            "reason": _event_reason(last) if last else None,
+            "orders": orders,
+            "sizing": _funnel_sizing_snapshot(events),
+            "phase": _chain_phase(orders),
+        }
+
+    # -- per-decision chains ------------------------------------------------------
+    summary = out["summary"]
+    linked_versions: set[str] = set()
+    for (run_id, symbol), decision_event in sorted(
+            decisions.items(), key=lambda kv: kv[1]["id"]):
+        key = f"{run_id}:{symbol}"
+        not_created = (not_created_by_decision.get(key)
+                       or not_created_by_fallback.get((run_id, symbol)))
+        creations = (created_by_decision.get(key)
+                     or created_by_fallback.get((run_id, symbol)))
+        chain = {
+            "decision_key": key,
+            "run_id": run_id,
+            "symbol": symbol,
+            "first_event_at": decision_event["ts"].isoformat(),
+            "last_event_at": decision_event["ts"].isoformat(),
+            "stage": None,
+            "reason": None,
+            "intent_id": None,
+            "replaced_previous_version": None,
+            "superseded_by": None,
+            "attempts": 0,
+            "created_runs": 0,
+            "observed_runs": 0,
+            "wait_events": 0,
+            "orders": [],
+            "sizing": None,
+            "classification": None,
+            "phase": None,
+        }
+        if not_created:
+            last = max(not_created, key=lambda e: e["id"])
+            chain["stage"] = "intent_not_created"
+            chain["reason"] = _event_reason(last)
+            chain["last_event_at"] = last["ts"].isoformat()
+            chain["classification"] = "not_created"
+            reason = chain["reason"] or "unknown"
+            summary["not_created_reasons"][reason] = (
+                summary["not_created_reasons"].get(reason, 0) + 1)
+        elif creations:
+            newest = max(creations, key=lambda e: e["id"])
+            version = newest["intent_id"]
+            linked_versions.add(version)
+            intent_chain = _intent_chain(version)
+            payload = newest.get("payload") or {}
+            chain.update({
+                "stage": intent_chain["stage"] or newest["kind"],
+                "reason": intent_chain["reason"] or _event_reason(newest),
+                "intent_id": version,
+                "replaced_previous_version": payload.get("previous_version"),
+                "attempts": intent_chain["attempts"],
+                "created_runs": intent_chain["created_runs"],
+                "observed_runs": intent_chain["observed_runs"],
+                "wait_events": intent_chain["wait_events"],
+                "orders": intent_chain["orders"],
+                "sizing": intent_chain["sizing"],
+                "last_event_at": max(
+                    [chain["first_event_at"]]
+                    + [e["ts"].isoformat() for e in by_intent_all.get(version, [])]
+                ),
+            })
+            chain["classification"] = _funnel_classify(chain["orders"], chain["stage"])
+            chain["phase"] = _chain_phase(chain["orders"])
+            # R5 display fix: a replaced intent is not "waiting" — say what
+            # replaced it, while keeping its own failure history intact. If
+            # the old version already acted (reached an order), the order
+            # buckets stay and only superseded_by is attached.
+            replaced_by = superseded_by.get(version)
+            if replaced_by:
+                chain["superseded_by"] = replaced_by
+                if chain["classification"] not in ("submitted", "submit_rejected"):
+                    chain["classification"] = "superseded"
+        else:
+            chain["stage"] = "evidence_missing"
+            chain["reason"] = None
+            chain["classification"] = "evidence_missing"
+        out["chains"].append(chain)
+        summary["decisions"] += 1
+        bucket = chain["classification"]
+        if bucket == "not_created":
+            summary["not_created"] += 1
+        elif bucket == "evidence_missing":
+            summary["evidence_missing"] += 1
+        else:
+            summary["with_intent"] += 1
+            summary[bucket] = summary.get(bucket, 0) + 1
+        # R5 fill accounting: completion = an order_filled observation or a
+        # fill activity the broker marked "fill" (see _funnel_orders); a
+        # partial quantity is a partial, never a completion; and a later
+        # unknown observation cannot un-verify earlier completion evidence
+        # (evidence accumulates in the order flags, not the latest kind).
+        chain_phase = chain["phase"]
+        if chain_phase == "complete":
+            summary["filled_verified"] += 1
+        elif chain_phase == "partial":
+            summary["partial"] += 1
+
+    # -- carryover / orphan / unknown-origin intents -------------------------------
+    first_creation: dict[str, dict] = {}
+    for intent_id, events in by_intent_all.items():
+        for event in sorted(events, key=lambda e: e["id"]):
+            if event["kind"] in _FUNNEL_INTENT_KINDS:
+                first_creation[intent_id] = event
+                break
+    for intent_id in sorted(carry_ids):
+        if intent_id in linked_versions:
+            continue
+        events = sorted(by_intent_all.get(intent_id, []), key=lambda e: e["id"])
+        creation = first_creation.get(intent_id)
+        if creation is None:
+            degraded["unknown_origin_intents"].append({
+                "intent_id": intent_id,
+                "symbol": events[0]["symbol"] if events else None,
+                "note": "今日有活动但找不到创建事件——来源不明，不并入任何分母",
+            })
+            continue
+        chain = _intent_chain(intent_id)
+        entry = {
+            "intent_id": intent_id,
+            "symbol": creation["symbol"],
+            "created_on": et_date_of(creation["ts"]),
+            "created_by_decision": creation.get("decision_key"),
+            **{k: chain[k] for k in
+               ("stage", "reason", "attempts", "created_runs", "observed_runs",
+                "wait_events", "orders", "sizing")},
+        }
+        entry["phase"] = _chain_phase(entry["orders"])
+        entry["superseded_by"] = None
+        entry["classification"] = _funnel_classify(entry["orders"], entry["stage"])
+        replaced_by = superseded_by.get(intent_id)
+        if replaced_by:
+            entry["superseded_by"] = replaced_by
+            if entry["classification"] not in ("submitted", "submit_rejected"):
+                entry["classification"] = "superseded"
+        if et_date_of(creation["ts"]) < day:
+            out["carryover"].append(entry)
+            summary["carryover_intents"] += 1
+        else:
+            degraded["orphan_intents"].append({
+                "intent_id": intent_id,
+                "symbol": entry["symbol"],
+                "created_by_decision": entry.get("created_by_decision"),
+                "note": "今日创建但对应的 decision_buy 事件缺失——不计入分母，不丢弃",
+                **{k: chain[k] for k in
+                   ("stage", "reason", "attempts", "created_runs", "observed_runs",
+                    "wait_events", "orders", "sizing", "phase")},
+            })
+
+    # -- fills that cannot be attributed stay visible, with the reason ------------
+    # R4 (ITERATION-4): attribution goes through the SAME unique-submission
+    # index as the observation attachment. A feed order outside the index —
+    # no ledger order at all, an identity-less-only submission, or one claimed
+    # by several intents — keeps its fill evidence listed HERE with the
+    # specific reason: never credited to a chain, never counted twice.
+    if fills_available:
+        for oid, matched in fills_by_order.items():
+            if oid in order_to_intent:
+                continue          # uniquely owned — the evidence lives on its chain
+            if oid in conflict_oids:
+                note = ("同一 order_id 归属多个意图（同书同 mode）——"
+                        "成交不归功任一意图，不重复计完成")
+            elif oid in identityless_submit_oids:
+                note = ("原提交事件无意图身份（intent_id 为空）——"
+                        "成交不归功任一意图，不并入任何链")
+            else:
+                note = ("order_id 在台账中无任何订单事件——无法归因；"
+                        "正面证据单独列出，不并入分母，不造链")
+            for fill in matched:
+                if _fill_session_date(fill) != day:
+                    continue
+                out["unlinked_fills"].append({
+                    "activity_id": fill.get("id"),
+                    "order_id": oid,
+                    "symbol": fill.get("symbol"),
+                    "side": fill.get("side"),
+                    "qty": fill.get("qty"),
+                    "notional": fill.get("notional"),
+                    "transaction_time": fill.get("transaction_time"),
+                    "fill_status": fill.get("order_status"),
+                    "note": note,
+                })
+
+    # -- run-level flush skips -------------------------------------------------------
+    for event in today:
+        if event["kind"] == "flush_skipped":
+            payload = event.get("payload") or {}
+            remainder = payload.get("unprocessed")
+            out["run_skips"].append({
+                "run_id": event["run_id"],
+                "reason": _event_reason(event),
+                "at": event["ts"].isoformat(),
+                # R6 (ITERATION-3): the detail prose is preserved VERBATIM —
+                # the aggregation never parses text. The structured remainder
+                # is forwarded AS DATA when the recorder's payload carries it
+                # (whitelisted key); a missing key is None, never re-derived.
+                "detail": event["detail"],
+                "unprocessed": remainder if isinstance(remainder, list) else None,
+            })
+
+    summary["submitted_frac"] = f"{summary['submitted']}/{summary['decisions']}"
+    degraded["notes"] = notes
+    return out
+
+
 def session_date(conn: sqlite3.Connection, now: datetime) -> str:
     """ET calendar date of the latest paper cycle, else ET today.
 

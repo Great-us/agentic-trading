@@ -5,9 +5,10 @@ import pandas as pd
 from agentic_trading.config import RiskConfig
 from agentic_trading.execution.broker import Position
 from agentic_trading.risk.manager import (
-    average_corr_to_holdings, check_exit, effective_max_exposure_pct,
-    plan_trims, portfolio_stop_risk, protective_stop_price,
-    sector_of, sector_room_dollars, size_position, stop_distance_pct,
+    SizingDiagnostics, average_corr_to_holdings, check_exit,
+    effective_max_exposure_pct, plan_trims, portfolio_stop_risk,
+    protective_stop_price, sector_of, sector_room_dollars, size_position,
+    stop_distance_pct,
 )
 
 RISK = RiskConfig(
@@ -363,3 +364,248 @@ def test_approved_sizing_also_reports_what_set_the_number():
     result = _size(0.06, equity=100_000, cash=100_000, invested=0)
     assert result.approved
     assert "set by " in result.reason
+
+
+# --- sizing diagnostics (c2c_a7e2 contract §14.4) ---------------------------
+# The baseline fixtures below pin approved / notional (float.hex) / reason
+# bit-for-bit as recorded on the pre-diagnostics code. They must pass unchanged
+# after the diagnostics snapshot is wired in — that is the evidence that
+# attaching it did not alter sizing results.
+
+_SIZING_BASELINE = {
+    "approved_risk_budget": (True, "0x1.d4c0000000000p+13",
+        "sized to $15,000 (15% of equity, 10.0% stop ≈ $1,500 at risk); "
+        "set by max_position_pct 18%"),
+    "approved_position_cap": (True, "0x1.1940000000000p+14",
+        "sized to $18,000 (18% of equity, 6.0% stop ≈ $1,080 at risk); "
+        "set by max_position_pct 18%; capped by max_position_pct"),
+    "approved_sector_cap": (True, "0x1.3880000000000p+12",
+        "sized to $5,000 (5% of equity, 12.0% stop ≈ $600 at risk); "
+        "set by sector cap; capped by sector limit"),
+    "approved_corr_haircut": (True, "0x1.86a0000000000p+12",
+        "sized to $6,250 (6% of equity, 12.0% stop ≈ $750 at risk); "
+        "set by max_position_pct 18% then the 50% correlation haircut; "
+        "cut to 50% for correlation vs holdings"),
+    "reject_exposure_cap": (False, "0x0.0p+0",
+        "only $0 available (limited by the exposure cap — invested 95.0% "
+        "of a 95% ceiling), below the 4% minimum position"),
+    "reject_cash": (False, "0x0.0p+0",
+        "only $100 available (limited by cash), below the 4% minimum position"),
+    "reject_stop_risk_budget": (False, "0x0.0p+0",
+        "only $167 available (limited by the book stop-risk budget — 5.99% "
+        "of 6% already committed), below the 4% minimum position"),
+    "reject_sector_room_zero": (False, "0x0.0p+0",
+        "only $0 available (limited by sector cap), below the 4% minimum position"),
+    "reject_below_min_cash": (False, "0x0.0p+0",
+        "only $500 available (limited by cash), below the 4% minimum position"),
+    "reject_invalid_price": (False, "0x0.0p+0", "invalid price"),
+    "reject_max_open_positions": (False, "0x0.0p+0", "at max_open_positions (6)"),
+    "reject_invalid_stop": (False, "0x0.0p+0", "invalid stop distance"),
+    "tie_cash_exposure": (True, "0x1.3880000000000p+12",
+        "sized to $5,000 (5% of equity, 10.0% stop ≈ $500 at risk); "
+        "set by the exposure cap — invested 90.0% of a 95% ceiling"),
+}
+
+
+def _baseline_results():
+    port_risk = replace(RISK, max_portfolio_stop_risk_pct=0.06)
+
+    def run(**kw):
+        args = dict(symbol="TEST", last_price=100.0, equity=100_000, cash=100_000,
+                    invested_value=0, open_position_count=0, risk=RISK, stop_pct=0.10)
+        args.update(kw)
+        return size_position(**args)
+
+    return {
+        "approved_risk_budget": run(stop_pct=0.10),
+        "approved_position_cap": run(stop_pct=0.06),
+        "approved_sector_cap": run(stop_pct=0.12, sector_room=5_000.0),
+        "approved_corr_haircut": run(stop_pct=0.12, corr_multiplier=0.5),
+        "reject_exposure_cap": run(stop_pct=0.06, cash=50_000.0, invested_value=95_000.0),
+        "reject_cash": run(stop_pct=0.06, cash=100.0),
+        "reject_stop_risk_budget": run(risk=port_risk, stop_pct=0.06,
+                                       open_position_count=1, existing_stop_risk=5_990.0),
+        "reject_sector_room_zero": run(stop_pct=0.10, sector_room=0.0),
+        "reject_below_min_cash": run(stop_pct=0.10, cash=500.0),
+        "reject_invalid_price": run(last_price=0.0),
+        "reject_max_open_positions": run(open_position_count=RISK.max_open_positions),
+        "reject_invalid_stop": run(stop_pct=0.0),
+        "tie_cash_exposure": run(cash=100_000 * RISK.max_total_exposure_pct - 90_000.0,
+                                 invested_value=90_000.0),
+    }
+
+
+def test_sizing_baseline_bit_exact():
+    results = _baseline_results()
+    assert set(results) == set(_SIZING_BASELINE)
+    for name, expected in _SIZING_BASELINE.items():
+        r = results[name]
+        assert (r.approved, r.notional.hex(), r.reason) == expected, name
+
+
+def _diag(**kw):
+    args = dict(symbol="TEST", last_price=100.0, equity=100_000, cash=100_000,
+                invested_value=0, open_position_count=0, risk=RISK, stop_pct=0.10)
+    args.update(kw)
+    result = size_position(**args)
+    assert isinstance(result.diagnostics, SizingDiagnostics)
+    return result
+
+
+def test_diagnostics_full_path_nothing_clamps():
+    d = _diag(stop_pct=0.10).diagnostics
+    assert d.cash_available == 100_000.0
+    assert d.exposure_room == 95_000.0
+    assert d.position_cap == 18_000.0
+    # RISK carries the RiskConfig default max_portfolio_stop_risk_pct=0.06, so
+    # the stop-risk branch runs and reports its room even when nothing binds.
+    remaining = max(0.0, 100_000 * RISK.max_portfolio_stop_risk_pct - 0.0)
+    assert d.stop_risk_room_pct == remaining / 100_000
+    assert d.stop_risk_room_notional == remaining / 0.10
+    assert d.sector_theme_room is None
+    target = (100_000 * RISK.risk_per_trade_pct * 1.0) / 0.10
+    assert d.pre_haircut_notional == target
+    assert d.post_haircut_notional == target
+    assert d.available_notional == 15_000.0
+    assert d.min_position_notional == 4_000.0
+    assert d.binding_constraints == ("risk_budget",)
+    assert d.reject_code is None
+
+
+def test_diagnostics_stop_risk_fields_none_when_cap_not_configured():
+    risk = replace(RISK, max_portfolio_stop_risk_pct=0.0)
+    d = _diag(risk=risk, stop_pct=0.10).diagnostics
+    assert d.stop_risk_room_pct is None
+    assert d.stop_risk_room_notional is None
+    assert d.binding_constraints == ("risk_budget",)
+
+
+def test_diagnostics_position_cap_binds():
+    d = _diag(stop_pct=0.06).diagnostics
+    assert d.pre_haircut_notional == 18_000.0
+    assert d.available_notional == 18_000.0
+    assert d.binding_constraints == ("position_cap",)
+    assert d.reject_code is None
+
+
+def test_diagnostics_exposure_cap_reject():
+    r = _diag(stop_pct=0.06, cash=50_000.0, invested_value=95_000.0)
+    d = r.diagnostics
+    assert r.notional == 0.0
+    assert d.cash_available == 50_000.0
+    assert d.exposure_room == 0.0
+    assert d.available_notional == 0.0
+    assert d.binding_constraints == ("exposure_cap",)
+    assert d.reject_code == "below_min_position"
+
+
+def test_diagnostics_cash_reject():
+    d = _diag(stop_pct=0.10, cash=500.0).diagnostics
+    assert d.cash_available == 500.0
+    assert d.available_notional == 500.0
+    assert d.binding_constraints == ("cash",)
+    assert d.reject_code == "below_min_position"
+
+
+def test_diagnostics_stop_risk_budget_reject():
+    risk = replace(RISK, max_portfolio_stop_risk_pct=0.06)
+    r = _diag(risk=risk, stop_pct=0.06, open_position_count=1, existing_stop_risk=5_990.0)
+    d = r.diagnostics
+    remaining = max(0.0, 100_000 * 0.06 - 5_990.0)
+    assert d.stop_risk_room_pct == remaining / 100_000
+    assert d.stop_risk_room_notional == remaining / 0.06
+    assert d.available_notional == round(remaining / 0.06, 2)
+    assert d.binding_constraints == ("stop_risk_budget",)
+    assert d.reject_code == "below_min_position"
+
+
+def test_diagnostics_sector_cap_binds_and_zero_room_rejects():
+    approved = _diag(stop_pct=0.12, sector_room=5_000.0)
+    d = approved.diagnostics
+    target = (100_000 * RISK.risk_per_trade_pct * 1.0) / 0.12
+    assert d.sector_theme_room == 5_000.0
+    assert d.pre_haircut_notional == target
+    assert d.post_haircut_notional == target
+    assert d.available_notional == 5_000.0
+    assert d.binding_constraints == ("sector_cap",)
+    assert d.reject_code is None
+
+    rejected = _diag(stop_pct=0.10, sector_room=0.0)
+    d = rejected.diagnostics
+    assert rejected.notional == 0.0
+    assert d.sector_theme_room == 0.0
+    assert d.available_notional == 0.0
+    assert d.binding_constraints == ("sector_cap",)
+    assert d.reject_code == "below_min_position"
+
+
+def test_diagnostics_tie_reports_every_binding_constraint():
+    room = 100_000 * RISK.max_total_exposure_pct - 90_000.0
+    d = _diag(cash=room, invested_value=90_000.0).diagnostics
+    assert d.exposure_room == room
+    assert d.binding_constraints == ("exposure_cap", "cash")
+
+
+def test_diagnostics_haircut_before_sector_before_round_before_minimum():
+    # Haircut first: pre-haircut 12.5k halves to 6.25k, under the 7k sector
+    # room, so the sector cap must NOT clamp (sector-first would give 3.5k).
+    r = _diag(stop_pct=0.12, corr_multiplier=0.5, sector_room=7_000.0)
+    d = r.diagnostics
+    target = (100_000 * RISK.risk_per_trade_pct * 1.0) / 0.12
+    assert d.pre_haircut_notional == target
+    assert d.post_haircut_notional == target * 0.5
+    assert d.available_notional == 6_250.0
+    assert d.binding_constraints == ("risk_budget", "correlation_haircut")
+
+    # Sector clamp applies to the post-haircut number.
+    r = _diag(stop_pct=0.12, corr_multiplier=0.5, sector_room=3_000.0)
+    d = r.diagnostics
+    assert d.post_haircut_notional == target * 0.5
+    assert d.available_notional == 3_000.0
+    assert d.binding_constraints == ("sector_cap",)
+    assert d.reject_code == "below_min_position"
+
+    # Round before the minimum check: 3,999.999 rounds up to 4,000.00, which
+    # passes the 4% ($4,000) minimum; comparing before rounding would reject.
+    r = _diag(stop_pct=0.10, cash=3_999.999)
+    d = r.diagnostics
+    assert r.approved is True
+    assert r.notional == 4_000.0
+    assert d.pre_haircut_notional == 3_999.999
+    assert d.available_notional == 4_000.0
+    assert d.min_position_notional == 4_000.0
+    assert d.binding_constraints == ("cash",)
+
+
+def test_diagnostics_early_exits_leave_uncomputed_fields_none():
+    cases = [
+        (dict(last_price=0.0), "invalid_price"),
+        (dict(last_price=-5.0), "invalid_price"),
+        (dict(open_position_count=RISK.max_open_positions), "max_open_positions"),
+        (dict(stop_pct=0.0), "invalid_stop_distance"),
+        (dict(stop_pct=-0.05), "invalid_stop_distance"),
+    ]
+    for kwargs, code in cases:
+        r = _diag(**kwargs)
+        d = r.diagnostics
+        assert r.approved is False and r.notional == 0.0
+        assert d.reject_code == code
+        assert d.binding_constraints == ()
+        for field in ("cash_available", "exposure_room", "position_cap",
+                      "stop_risk_room_pct", "stop_risk_room_notional",
+                      "sector_theme_room", "pre_haircut_notional",
+                      "post_haircut_notional", "available_notional",
+                      "min_position_notional"):
+            assert getattr(d, field) is None, (code, field)
+
+
+def test_diagnostics_to_dict_shape():
+    d = _diag(stop_pct=0.10).diagnostics.to_dict()
+    assert set(d) == {
+        "cash_available", "exposure_room", "position_cap", "stop_risk_room_pct",
+        "stop_risk_room_notional", "sector_theme_room", "pre_haircut_notional",
+        "post_haircut_notional", "available_notional", "min_position_notional",
+        "binding_constraints", "reject_code",
+    }
+    assert d["binding_constraints"] == ["risk_budget"]
+    assert d["reject_code"] is None

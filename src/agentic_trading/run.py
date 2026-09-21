@@ -25,6 +25,7 @@ from .config import Settings, load_settings
 from .data.feed import DataFeed, YFinanceFeed
 from .data.market_data import average_dollar_volume, fetch_last_price
 from .decision.engine import Action, Decision, decide
+from .execution_funnel import flush_run_skip, make_funnel
 from .execution.broker import (
     AlpacaBroker, Broker, DryRunBroker, OrderIdMinter, Position, stop_is_resting,
 )
@@ -1121,6 +1122,7 @@ def _flush_trade_intents(
     orders_readable: bool = True,
     ids: OrderIdMinter | None = None,
     now_utc: datetime | None = None,
+    funnel: FunnelRecorder | None = None,
 ) -> tuple[set[str], float, float, int, int]:
     """Execute queued BUY intents inside the entry window, with a gap check and
     chase guards. Intents whose time has not come (not_before) or that would
@@ -1128,6 +1130,17 @@ def _flush_trade_intents(
     the ones that never get a sane entry."""
     ids = ids or OrderIdMinter(cycle_timestamp)
     now_utc = now_utc or datetime.now(timezone.utc)
+
+    def _intent_event(kind, symbol, *, deferred, detail, intent_id=None, payload=None):
+        # Same event, with or without the funnel: with it the legacy kinds gain
+        # identity linkage + a JSONL mirror; without it the old plain journal
+        # write keeps every existing caller/test working unchanged.
+        if funnel is not None:
+            funnel.record(kind, symbol, deferred=deferred, detail=detail,
+                          intent_id=intent_id, payload=payload)
+        else:
+            _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
+                          symbol, kind, deferred=deferred, detail=detail)
     filled: set[str] = set()
     extra_risk = 0.0
     extra_held: list[str] = []
@@ -1137,14 +1150,19 @@ def _flush_trade_intents(
         # buy that genuinely is pending. Keep every intent for the next run.
         log.warning("TradeIntent flush skipped — open orders were unreadable; "
                     "intents preserved instead of cleared.")
+        if funnel is not None:
+            funnel.flush_skipped("orders_unreadable")
         return filled, cash_remaining, invested_value, open_position_count, orders_this_cycle
     if not _within_entry_window(now_utc, settings.risk):
         # No order is ever placed in the open's first half hour (the widest
         # spread, most chaotic tape of the day) or after the window closes.
         log.info("TradeIntent flush skipped — outside the entry window (%s–%s ET).",
                  settings.risk.entry_window_start_et, settings.risk.entry_window_end_et)
+        if funnel is not None:
+            funnel.flush_skipped("outside_window")
         return filled, cash_remaining, invested_value, open_position_count, orders_this_cycle
-    for intent in load_trade_intents(conn):
+    intents = load_trade_intents(conn)
+    for _intent_idx, intent in enumerate(intents):
         created = _intent_created_at(intent.created_at)
         if created is None or now_utc - created > TRADE_INTENT_TTL:
             age = ("unreadable timestamp" if created is None
@@ -1152,23 +1170,60 @@ def _flush_trade_intents(
             log.warning("%s: TradeIntent discarded — %s exceeds the %.0fh TTL; "
                         "stale analysis must not execute.", intent.symbol, age,
                         TRADE_INTENT_TTL.total_seconds() / 3600)
-            _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
-                          intent.symbol, "ttl", deferred=False, detail=age)
-            _journal_safe(log, clear_trade_intent, conn, intent.symbol)
+            # R6: the discard decision and the delete are distinct — the
+            # journal event is only written once the row is really gone;
+            # a failed delete gets its own NON-terminal attribution (R6-A).
+            if _journal_safe(log, clear_trade_intent, conn, intent.symbol):
+                _intent_event("ttl", intent.symbol, deferred=False, detail=age,
+                              intent_id=intent.version)
+            elif funnel is not None:
+                funnel.record("clear_failed", intent.symbol, deferred=False,
+                              intent_id=intent.version, detail="ttl",
+                              payload={"reason": "ttl"})
             _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
                        kind="ttl", reason=age)
             continue
         not_before = _intent_created_at(intent.not_before) if intent.not_before else None
         if not_before is not None and now_utc < not_before:
+            if funnel is not None:
+                funnel.flush_wait(intent.symbol, "not_before",
+                                  intent_id=intent.version,
+                                  payload={"not_before": intent.not_before})
             continue  # queued for a later window — keep it
         if intent.symbol in positions or intent.symbol in pending_buys:
-            _journal_safe(log, clear_trade_intent, conn, intent.symbol)
+            # R6: a terminal "cleared" claim may only follow a successful
+            # delete; a failed clear leaves the chain honestly queued — and
+            # is itself recorded as a NON-terminal attribution event.
+            if _journal_safe(log, clear_trade_intent, conn, intent.symbol):
+                if funnel is not None:
+                    funnel.intent_cleared_held(
+                        intent.symbol,
+                        "already_held" if intent.symbol in positions else "pending_buy",
+                        intent.version)
+            elif funnel is not None:
+                funnel.record("clear_failed", intent.symbol, deferred=False,
+                              intent_id=intent.version,
+                              detail="already_held" if intent.symbol in positions else "pending_buy",
+                              payload={"reason": "clear_failed"})
             continue
         if orders_this_cycle >= settings.risk.max_new_orders_per_cycle:
+            if funnel is not None:
+                # R6: run-level stop with the determinable remainder — one
+                # event, no per-item fabrication, the break itself unchanged.
+                # The remainder rides in `detail` (the payload whitelist has no
+                # list-of-symbols key; `limit` is whitelisted).
+                funnel.record("flush_skipped", "*", deferred=False,
+                              detail="max_new_orders_reached; unprocessed: "
+                                     + ", ".join(i.symbol for i in intents[_intent_idx:]),
+                              payload={"reason": "max_new_orders_reached",
+                                       "limit": settings.risk.max_new_orders_per_cycle,
+                                       "unprocessed": [i.symbol for i in intents[_intent_idx:]]})
             break
         live_price = fetch_last_price(intent.symbol)
         if live_price is None:
             log.warning("%s: TradeIntent skipped — no live quote for gap check.", intent.symbol)
+            if funnel is not None:
+                funnel.flush_wait(intent.symbol, "no_quote", intent_id=intent.version)
             continue
         if intent.atr14 > 0:
             gap_atr = (live_price - intent.signal_price) / intent.atr14
@@ -1179,12 +1234,16 @@ def _flush_trade_intents(
                 log.info("%s: TradeIntent discarded — live %.2f is %.2f ATR above signal %.2f; "
                          "the setup this was queued for is gone.",
                          intent.symbol, live_price, gap_atr, intent.signal_price)
-                _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
-                              intent.symbol, "gap", deferred=False,
-                              detail=f"live {live_price:.2f} is {gap_atr:.2f} ATR above "
-                                     f"signal {intent.signal_price:.2f} "
-                                     f"(cap {settings.risk.max_entry_gap_atr})")
-                _journal_safe(log, clear_trade_intent, conn, intent.symbol)
+                if _journal_safe(log, clear_trade_intent, conn, intent.symbol):
+                    _intent_event("gap", intent.symbol, deferred=False,
+                                  detail=f"live {live_price:.2f} is {gap_atr:.2f} ATR above "
+                                         f"signal {intent.signal_price:.2f} "
+                                         f"(cap {settings.risk.max_entry_gap_atr})",
+                                  intent_id=intent.version)
+                elif funnel is not None:
+                    funnel.record("clear_failed", intent.symbol, deferred=False,
+                                  intent_id=intent.version, detail="gap",
+                                  payload={"reason": "gap"})
                 _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
                            kind="gap")
                 continue
@@ -1197,10 +1256,10 @@ def _flush_trade_intents(
                      "(chase cap %.1f%%); keeping the intent for a later scan.",
                      intent.symbol, live_price, vs_signal * 100,
                      settings.risk.max_chase_vs_signal_pct * 100)
-            _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
-                          intent.symbol, "chase_signal", deferred=True,
+            _intent_event("chase_signal", intent.symbol, deferred=True,
                           detail=f"live {live_price:.2f} is {vs_signal * 100:+.1f}% above signal "
-                                 f"(cap {settings.risk.max_chase_vs_signal_pct * 100:.1f}%)")
+                                 f"(cap {settings.risk.max_chase_vs_signal_pct * 100:.1f}%)",
+                          intent_id=intent.version)
             _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="deferred",
                        kind="chase_signal")
             continue
@@ -1211,16 +1270,20 @@ def _flush_trade_intents(
                 today_open = open_price_of(intent.symbol)
             except Exception:
                 log.exception("%s: get_today_open failed — open-relative chase gate skipped.", intent.symbol)
+        if funnel is not None and not today_open:
+            # The open-relative gate could not run (no method, no data, or the
+            # call failed) — record the check as NOT EXECUTED, never as passed.
+            funnel.flush_wait(intent.symbol, "open_missing", intent_id=intent.version)
         if today_open and live_price / today_open - 1 > settings.risk.max_chase_vs_open_pct:
             log.info("%s: TradeIntent WAIT — live %.2f is %+.1f%% above today's open %.2f "
                      "(chase cap %.1f%%); keeping the intent for a later scan.",
                      intent.symbol, live_price, (live_price / today_open - 1) * 100, today_open,
                      settings.risk.max_chase_vs_open_pct * 100)
-            _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
-                          intent.symbol, "chase_open", deferred=True,
+            _intent_event("chase_open", intent.symbol, deferred=True,
                           detail=f"live {live_price:.2f} is "
-                                 f"{(live_price / today_open - 1) * 100:+.1f}% above open "
-                                 f"(cap {settings.risk.max_chase_vs_open_pct * 100:.1f}%)")
+                                  f"{(live_price / today_open - 1) * 100:+.1f}% above open "
+                                  f"(cap {settings.risk.max_chase_vs_open_pct * 100:.1f}%)",
+                          intent_id=intent.version)
             _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="deferred",
                        kind="chase_open")
             continue
@@ -1249,20 +1312,51 @@ def _flush_trade_intents(
             # same) and let the TTL be the only thing that discards analysis.
             log.info("%s: TradeIntent vetoed — %s; keeping the intent for a later scan.",
                      intent.symbol, sizing.reason)
-            _journal_safe(log, record_intent_event, conn, now_utc.isoformat(),
-                          intent.symbol, "sizing", deferred=True, detail=sizing.reason)
+            _intent_event("sizing", intent.symbol, deferred=True, detail=sizing.reason,
+                          intent_id=intent.version,
+                          payload=lambda: {
+                              "reason": sizing.reason,
+                              "cash_available": sizing.diagnostics.cash_available
+                                                if sizing.diagnostics else None,
+                              "available_notional": sizing.diagnostics.available_notional
+                                                    if sizing.diagnostics else None,
+                              "min_notional": sizing.diagnostics.min_position_notional
+                                              if sizing.diagnostics else None,
+                              "sizing": sizing.diagnostics.to_dict()
+                                        if sizing.diagnostics else None,
+                          })
             _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="veto",
                        kind="sizing", reason=sizing.reason)
             continue
+        client_order_id = ids.mint("intent-buy", intent.symbol)
         order = broker.submit_notional_buy(
             intent.symbol, sizing.notional, atr14=intent.atr14,
-            client_order_id=ids.mint("intent-buy", intent.symbol),
+            client_order_id=client_order_id,
         )
+        if funnel is not None:
+            # The submit FACT only — the broker's acknowledgement, not a fill.
+            funnel.order_submitted(
+                intent.symbol, getattr(order, "order_id", None),
+                intent_id=intent.version, client_order_id=client_order_id,
+                payload=lambda: {
+                    # R5 (review round 2): a None result (submit raised or was
+                    # refused without a stated reason) is an UNKNOWN outcome —
+                    # a confirmed rejection is a positive claim we cannot make.
+                    "submit_status": order.status if order is not None else "unknown",
+                    "notional": sizing.notional,
+                    "reason": sizing.reason,
+                    "sizing": sizing.diagnostics.to_dict()
+                              if sizing.diagnostics else None,
+                })
         if order is None:
             log.warning("%s: TradeIntent order rejected.", intent.symbol)
             _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="rejected",
                        kind="intent-buy")
             continue
+        if order.order_id and funnel is not None:
+            # Registered now, observed ONCE at cycle end after all
+            # order-affecting work (review R4 moved this pass out of flush).
+            funnel.note_submission(intent.symbol, order.order_id, intent.version)
         cash_remaining -= sizing.notional
         invested_value += sizing.notional
         extra_risk += sizing.notional * stop_pct
@@ -1277,9 +1371,9 @@ def _flush_trade_intents(
         _journal_safe(log, update_position_peak, conn, intent.symbol, live_price, cycle_timestamp)
         _journal_safe(log, clear_intraday_confirmation, conn, intent.symbol)
         _journal_safe(log, clear_trade_intent, conn, intent.symbol)
-        log.info("%s: TradeIntent filled $%.0f @ ~%.2f — %s",
+        log.info("%s: TradeIntent submitted $%.0f (reserved; fill unverified, quote %.2f) — %s",
                  intent.symbol, sizing.notional, live_price, sizing.reason)
-        _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="filled",
+        _emit_live(asof, "order_or_veto", symbol=intent.symbol, status="submitted",
                    kind="intent-buy", notional=round(sizing.notional, 2))
     return filled, cash_remaining, invested_value, open_position_count, orders_this_cycle
 
@@ -1388,6 +1482,9 @@ def run_cycle(
 
     account = broker.get_account()
     positions = broker.get_positions()
+    # Funnel observation mode: backtest rows must never mix into the live
+    # paper dashboard's cohort, and dry runs must be distinguishable too.
+    funnel_mode = "backtest" if asof is not None else ("dry_run" if use_dry_run else "paper")
     # How many positions the broker reported the last time a FULL read
     # succeeded. Updated only by successful reads (here, the opening refresh,
     # the end-of-cycle re-read, the post-fill refresh) — never by the
@@ -1410,6 +1507,10 @@ def run_cycle(
                  len(settings.watchlist), len(core))
 
     if fast_mode and not market_open:
+        # Run-level funnel skip event FIRST (kept above the log line so the
+        # heartbeat source-anchor test's window stays byte-identical).
+        flush_run_skip(cycle_timestamp, funnel_mode, "market_closed",
+                       jsonl=(asof is None))
         log.info("Fast-tier scan skipped — market is closed.")
         # Observability: prove the scheduler woke up even though there was
         # nothing to scan. Live runs only — backtests/tests (asof set, often
@@ -1433,6 +1534,7 @@ def run_cycle(
             cycle_no = int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM cycles").fetchone()[0])
         except Exception:
             cycle_no = None
+    funnel = make_funnel(conn, cycle_timestamp, funnel_mode, jsonl=(asof is None))
     _live("cycle_start", n_symbols=len(cycle_symbols), fast=fast_mode,
           skip_llm=skip_llm, dry_run=use_dry_run, market_open=market_open)
 
@@ -1681,6 +1783,10 @@ def run_cycle(
         _live("decide", symbol=symbol, action=item.decision.action.value,
               combined=round(item.decision.combined_score, 4),
               quant=round(item.decision.quant_score, 4))
+        if item.decision.action == Action.BUY:
+            # The funnel denominator: the FINAL decide() said BUY. Fast-tier
+            # quant-only candidates never reach this line, by design.
+            funnel.decision_buy(symbol)
         work.append(item)
 
     # Holdings no longer on any list still get full protection: their peaks
@@ -1854,9 +1960,11 @@ def run_cycle(
             regime_multiplier=regime_multiplier, cycle_timestamp=cycle_timestamp, log=log,
             atrs=atrs, feed=feed, asof=asof,
             sizing_risk=sizing_risk, sector_map=sector_map, occupancy=occupancy,
-            orders_readable=orders_readable, ids=ids,
+            orders_readable=orders_readable, ids=ids, funnel=funnel,
         )
         pending_buys.update(flushed)
+    elif live_session:
+        funnel.flush_skipped("market_closed" if not market_open else "regime_unknown")
 
     buy_items = [
         item for item in work
@@ -1870,12 +1978,15 @@ def run_cycle(
         if entry_symbols is not None and item.symbol not in entry_symbols:
             decision.action = Action.WAIT
             decision.reasoning += " Skipped: symbol is not entry-eligible on this session."
+            funnel.intent_not_created(item.symbol, "entry_ineligible")
             continue
         if item.symbol in pending_buys:
             decision.reasoning += " Skipped: an earlier buy for this symbol is still unfilled."
+            funnel.intent_not_created(item.symbol, "pending_buy")
             continue
         if item.symbol in positions:
             decision.reasoning += " Skipped: already held."
+            funnel.intent_not_created(item.symbol, "already_held")
             continue
         if (
             settings.risk.require_llm_for_entry
@@ -1893,13 +2004,16 @@ def run_cycle(
                 "new entries fail closed."
             )
             log.info("%s: BUY downgraded to WAIT — no LLM verdict available.", item.symbol)
+            funnel.intent_not_created(item.symbol, "llm_fail_closed")
             _live("order_or_veto", symbol=item.symbol, status="veto", kind="fail_closed")
             continue
         if unknown_regime:
             decision.reasoning += " Skipped: macro regime UNKNOWN — no new entries."
+            funnel.intent_not_created(item.symbol, "regime_unknown")
             continue
         if orders_this_cycle >= settings.risk.max_new_orders_per_cycle:
             decision.reasoning += " Skipped: max_new_orders_per_cycle reached for this run."
+            funnel.intent_not_created(item.symbol, "max_new_orders")
             continue
         if live_session:
             # Every live entry queues as a TradeIntent and executes inside the
@@ -1914,6 +2028,7 @@ def run_cycle(
                     " Skipped: a dry run never queues TradeIntents — re-decide in a real cycle."
                 )
                 log.info("%s: dry run — BUY not queued as TradeIntent.", item.symbol)
+                funnel.intent_not_created(item.symbol, "dry_run")
                 _live("order_or_veto", symbol=item.symbol, status="dry_run", kind="buy")
                 continue
             intent = TradeIntent(
@@ -1923,14 +2038,20 @@ def run_cycle(
                 reasoning=decision.reasoning,
                 not_before=_entry_not_before_utc(datetime.now(timezone.utc), settings.risk),
             )
-            if not _journal_safe(log, save_trade_intent, conn, intent):
+            try:
+                receipt = save_trade_intent(conn, intent)
+            except Exception:
                 # An unpersisted intent must not be reported as queued — it
                 # would silently never execute.
+                log.exception("%s: could not persist the TradeIntent — will re-decide next cycle.",
+                              item.symbol)
                 decision.action = Action.WAIT
                 decision.reasoning += (
                     " Skipped: could not persist the TradeIntent — will re-decide next cycle."
                 )
+                funnel.intent_not_created(item.symbol, "save_failed")
                 continue
+            funnel.intent_saved(item.symbol, receipt)
             item.order_status = "intent"
             decision.reasoning += (
                 " Recorded as TradeIntent — executes in the entry window "
@@ -2073,6 +2194,14 @@ def run_cycle(
                 f"protective stop filled on submit for {', '.join(sorted(refreshed.get('filled') or ()))} "
                 "and the positions re-read failed — this cycle's positions are the pre-fill snapshot"
             )
+    # R4: the ONE observation pass of the cycle — after every order-affecting
+    # step (flush, new intent queuing, end-of-cycle stop reconciliation) is
+    # complete: this cycle's submissions plus unresolved orders recovered from
+    # the persistent ledger, bounded by MAX_ORDER_OBSERVATIONS_PER_CYCLE. Live
+    # paper only — backtests have no broker to re-query, dry runs never submit.
+    if asof is None and not use_dry_run and funnel is not None:
+        funnel.observe_unresolved(conn, broker)
+
     # What the monitors are told (review round 4, R1). Execution above already
     # did its job against the working snapshot; the REPORT must not upgrade
     # that snapshot to a verified check:

@@ -1,0 +1,35 @@
+97a65d6 P0 + P1-B: fill accounting, book-vs-broker reconciliation, protection chain, heartbeat truth, diagnostics
+ M HANDOFF-DASHBOARD.md
+ M PROGRESS.md
+ M src/agentic_trading/dashboard/api.py
+ M src/agentic_trading/dashboard/frontend/src/api.ts
+ M src/agentic_trading/dashboard/frontend/src/pages/Today.tsx
+ M src/agentic_trading/dashboard/views.py
+ M src/agentic_trading/execution/broker.py
+ M src/agentic_trading/journal/logger.py
+ M src/agentic_trading/risk/manager.py
+ M src/agentic_trading/run.py
+ M tests/test_dashboard.py
+ M tests/test_risk.py
+?? research/alpaca-veev-appeal-reply-2026-09-20.txt
+?? research/c2c_a7e2-executed-iteration-1/
+?? research/c2c_a7e2-executed-iteration-2/
+?? research/c2c_a7e2-executed-iteration-3/
+?? research/c2c_a7e2-executed-iteration-4/
+?? research/c2c_a7e2-executed-iteration-5/
+?? research/c2c_a7e2-executed-iteration-6/
+?? research/c2c_a7e2-executed-iteration-7/
+?? research/c2c_a7e2-executed-iteration-8/
+?? research/c2c_a7e2-p1a-plan.md
+?? research/weekly-review-2026-09-19.md
+?? src/PROGRESS.md
+?? src/agentic_trading/execution_funnel.py
+?? src/research/
+?? tests/fixtures/
+?? tests/test_execution_funnel.py
+?? tests/test_frontend_render.py
+?? tests/test_funnel_aggregation.py
+?? tests/test_intent_identity.py
+?? tests/test_order_observation.py
+?? tests/test_payload_sanitizer.py
+?? tests/test_trade_trace_baseline.py

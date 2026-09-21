@@ -1,0 +1,20 @@
+# R9: baseline trace equivalence — exported 97a65d6 vs recorded fixture
+date: 2026-09-20T20:45:45Z
+
+method:
+  git archive 97a65d6 -> /tmp/c2c_a7e2-baseline-97a65d6 (read-only export; no reset/checkout on any book)
+  current scenario runner tests/test_trade_trace_baseline.py + tests/fixtures/trade_trace_baseline.json copied into the export
+  PYTHONPATH=<export>/src (verified: agentic_trading loads from the export, not the editable install)
+  interpreter: Trading/.venv (deps only; zero project code from the live tree)
+  runner compatibility: OrderObservation import guarded (absent at 97a65d6 — never called there; no funnel code exists on that tree)
+
+command:
+  cd /tmp/c2c_a7e2-baseline-97a65d6 && PYTHONPATH=<export>\src .venv/Scripts/python.exe -m pytest tests/test_trade_trace_baseline.py -q
+
+output:
+  1 passed in 0.18s
+
+conclusion: the six recorded trade calls (stop/market/cancel/stop/buy/buy with float.hex + client_order_id)
+are bit-identical between the ORIGINAL 97a65d6 commit and the current working tree fixture.
+The earlier 'recorded on a tree containing C's risk change' caveat is now closed by direct evidence,
+not by the 13-case sizing-baseline argument alone.

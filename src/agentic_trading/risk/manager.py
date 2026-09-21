@@ -15,11 +15,77 @@ Two things here are deliberately adaptive rather than fixed percentages:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import pandas as pd
 
 from ..config import RiskConfig
+
+_logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SizingDiagnostics:
+    """Read-only snapshot of the intermediate values behind one `size_position`
+    call — for display (Today's execution funnel) only. Never fed back into
+    sizing: nothing here changes `approved`, `notional`, or `reason`.
+
+    Fields reflect only what the current call site actually computed. An
+    early exit (invalid price, at max_open_positions, invalid stop distance)
+    leaves every numeric field None rather than backfilling zeros or running
+    a division that the original code path never reached."""
+    cash_available: float | None
+    exposure_room: float | None
+    position_cap: float | None
+    stop_risk_room_pct: float | None
+    stop_risk_room_notional: float | None
+    sector_theme_room: float | None      # _entry_sizing_inputs already took min(sector, theme)
+    pre_haircut_notional: float | None
+    post_haircut_notional: float | None
+    available_notional: float | None     # pre-rejection value; a reject still fills this in
+    min_position_notional: float | None
+    binding_constraints: tuple[str, ...]
+    reject_code: str | None
+
+    def to_dict(self) -> dict:
+        return {
+            "cash_available": self.cash_available,
+            "exposure_room": self.exposure_room,
+            "position_cap": self.position_cap,
+            "stop_risk_room_pct": self.stop_risk_room_pct,
+            "stop_risk_room_notional": self.stop_risk_room_notional,
+            "sector_theme_room": self.sector_theme_room,
+            "pre_haircut_notional": self.pre_haircut_notional,
+            "post_haircut_notional": self.post_haircut_notional,
+            "available_notional": self.available_notional,
+            "min_position_notional": self.min_position_notional,
+            "binding_constraints": list(self.binding_constraints),
+            "reject_code": self.reject_code,
+        }
+
+
+def _empty_sizing_diagnostics(reject_code: str) -> SizingDiagnostics:
+    """Early-exit shape: nothing past the guard clause was computed."""
+    return SizingDiagnostics(
+        cash_available=None, exposure_room=None, position_cap=None,
+        stop_risk_room_pct=None, stop_risk_room_notional=None,
+        sector_theme_room=None, pre_haircut_notional=None,
+        post_haircut_notional=None, available_notional=None,
+        min_position_notional=None, binding_constraints=(), reject_code=reject_code,
+    )
+
+def _safe_empty_diagnostics(reject_code: str) -> SizingDiagnostics | None:
+    """R1 (review round 2): the three sizing early exits must tolerate a
+    diagnostics-construction failure — the original veto result stands with
+    diagnostics=None rather than raising through the cycle."""
+    try:
+        return _empty_sizing_diagnostics(reject_code)
+    except Exception:
+        _logger.warning("early-exit diagnostics failed (%s) — veto result "
+                        "unchanged, diagnostics=None.", reject_code, exc_info=True)
+        return None
+
 
 
 @dataclass
@@ -28,6 +94,7 @@ class SizeResult:
     approved: bool
     notional: float   # dollars to deploy; fractional shares let this be exact
     reason: str
+    diagnostics: SizingDiagnostics | None = None
 
 
 @dataclass
@@ -295,11 +362,14 @@ def size_position(
     20%-stop name than on a 6%-stop one while calling both the same "size".
     """
     if last_price <= 0:
-        return SizeResult(symbol, False, 0.0, "invalid price")
+        return SizeResult(symbol, False, 0.0, "invalid price",
+                          diagnostics=_safe_empty_diagnostics("invalid_price"))
     if open_position_count >= risk.max_open_positions:
-        return SizeResult(symbol, False, 0.0, f"at max_open_positions ({risk.max_open_positions})")
+        return SizeResult(symbol, False, 0.0, f"at max_open_positions ({risk.max_open_positions})",
+                          diagnostics=_safe_empty_diagnostics("max_open_positions"))
     if stop_pct <= 0:
-        return SizeResult(symbol, False, 0.0, "invalid stop distance")
+        return SizeResult(symbol, False, 0.0, "invalid stop distance",
+                          diagnostics=_safe_empty_diagnostics("invalid_stop_distance"))
 
     risk_budget = equity * risk.risk_per_trade_pct * regime_multiplier
     target = risk_budget / stop_pct
@@ -308,7 +378,8 @@ def size_position(
     # Reporting only the surviving number reads as "out of cash" whatever the
     # real constraint was, and a $0 that means "exposure cap already breached"
     # has been misread as a broker-cash bug before.
-    capped = min(target, equity * risk.max_position_pct)
+    position_cap = equity * risk.max_position_pct
+    capped = min(target, position_cap)
     exposure_budget = max(0.0, equity * risk.max_total_exposure_pct - invested_value)
     limits: list[tuple[float, str]] = [
         (capped, f"max_position_pct {risk.max_position_pct:.0%}"),
@@ -317,31 +388,71 @@ def size_position(
          f"of a {risk.max_total_exposure_pct:.0%} ceiling"),
         (cash, "cash"),
     ]
+    limit_codes = ["position_cap" if capped < target else "risk_budget",
+                   "exposure_cap", "cash"]
 
     port_cap = getattr(risk, "max_portfolio_stop_risk_pct", 0.0) or 0.0
+    stop_risk_room_pct: float | None = None
+    stop_risk_room_notional: float | None = None
     if port_cap > 0 and stop_pct > 0:
         remaining_risk = max(0.0, equity * port_cap - existing_stop_risk)
-        limits.append((remaining_risk / stop_pct,
+        stop_risk_room_notional = remaining_risk / stop_pct
+        stop_risk_room_pct = remaining_risk / equity
+        limits.append((stop_risk_room_notional,
                        f"the book stop-risk budget — {existing_stop_risk / equity:.2%} "
                        f"of {port_cap:.0%} already committed"))
+        limit_codes.append("stop_risk_budget")
 
     notional, binding = min(limits, key=lambda item: item[0])
+    binding_codes = [code for (value, _), code in zip(limits, limit_codes)
+                     if value == notional]
 
+    pre_haircut_notional = notional
     if corr_multiplier < 1.0:
         notional *= corr_multiplier
         binding += f" then the {corr_multiplier:.0%} correlation haircut"
+        binding_codes.append("correlation_haircut")
+    post_haircut_notional = notional
 
-    if sector_room is not None and max(0.0, sector_room) < notional:
-        notional = max(0.0, sector_room)
-        binding = "sector cap"
+    sector_theme_room: float | None = None
+    if sector_room is not None:
+        sector_theme_room = max(0.0, sector_room)
+        if sector_theme_room < notional:
+            notional = sector_theme_room
+            binding = "sector cap"
+            binding_codes = ["sector_cap"]
 
     notional = round(max(notional, 0.0), 2)
+    min_position_notional = equity * risk.min_position_pct
 
-    if notional < equity * risk.min_position_pct:
+    try:
+        diagnostics = SizingDiagnostics(
+            cash_available=cash,
+            exposure_room=exposure_budget,
+            position_cap=position_cap,
+            stop_risk_room_pct=stop_risk_room_pct,
+            stop_risk_room_notional=stop_risk_room_notional,
+            sector_theme_room=sector_theme_room,
+            pre_haircut_notional=pre_haircut_notional,
+            post_haircut_notional=post_haircut_notional,
+            available_notional=notional,
+            min_position_notional=min_position_notional,
+            binding_constraints=tuple(binding_codes),
+            reject_code=None if notional >= min_position_notional else "below_min_position",
+        )
+    except Exception:
+        # c2c_a7e2 review R1: diagnostics are display-only — their construction
+        # must never block a sizing decision the arithmetic already made.
+        _logger.warning("SizingDiagnostics construction failed for %s — sizing "
+                        "result unchanged, diagnostics=None.", symbol, exc_info=True)
+        diagnostics = None
+
+    if notional < min_position_notional:
         return SizeResult(
             symbol, False, 0.0,
             f"only ${notional:,.0f} available (limited by {binding}), "
             f"below the {risk.min_position_pct:.0%} minimum position",
+            diagnostics=diagnostics,
         )
 
     detail = f"${notional:,.0f} ({notional / equity:.0%} of equity, {stop_pct:.1%} stop ≈ ${notional * stop_pct:,.0f} at risk)"
@@ -356,7 +467,7 @@ def size_position(
         detail += "; capped by sector limit"
     if regime_multiplier < 1.0:
         detail += f"; cut to {regime_multiplier:.0%} for risk-off regime"
-    return SizeResult(symbol, True, notional, f"sized to {detail}")
+    return SizeResult(symbol, True, notional, f"sized to {detail}", diagnostics=diagnostics)
 
 
 def check_exit(

@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "task": "c2c_a7e2 P1-A execution funnel",
+    "baseline_commit": "97a65d6",
+    "recorded_at": "2026-09-20",
+    "recorded_by": "员工甲 (Opus), tests/test_trade_trace_baseline.py run_scenario",
+    "scenario": "two frozen-clock (2026-08-26 14:30 UTC = 10:30 ET) live run_cycles on an in-memory journal; cycle 1: SELLER trailing-stop SELL, RATCHET stop placed @110 then ratcheted to @131.80 after the peak refresh, BUYA/BUYB/VETO/CHASE queue TradeIntents; cycle 2 flush: BUYA $18,000 and BUYB $17,000 submit (VETO sizing-vetoed by the Technology sector room, CHASE held by the signal-relative chase guard)",
+    "immutability": "NEVER regenerate against newer code to make a failing comparison pass; a diff here means the trading-call sequence changed"
+  },
+  "expectation": {
+    "buy_symbols": ["BUYA", "BUYB"],
+    "market_sells": ["SELLER"],
+    "stop_placements": 2,
+    "stop_cancels": 1,
+    "sizing_vetoed_not_submitted": ["VETO"],
+    "chase_deferred_not_submitted": ["CHASE"],
+    "remaining_intents": ["CHASE", "VETO"],
+    "final_positions": ["RATCHET"]
+  },
+  "expected_events": [
+    {
+      "op": "stop",
+      "symbol": "RATCHET",
+      "qty": 10.0,
+      "stop_price": 110.0,
+      "stop_hex": "0x1.b800000000000p+6",
+      "client_order_id": "at-stop-RATCHET-20260826T1430000000-1"
+    },
+    {
+      "op": "market",
+      "symbol": "SELLER",
+      "qty": 5.0,
+      "side": "sell",
+      "client_order_id": "at-exit-SELLER-20260826T1430000000-2"
+    },
+    {
+      "op": "cancel",
+      "order_id": "stop-1"
+    },
+    {
+      "op": "stop",
+      "symbol": "RATCHET",
+      "qty": 10.0,
+      "stop_price": 131.8,
+      "stop_hex": "0x1.079999999999ap+7",
+      "client_order_id": "at-stop-RATCHET-20260826T1430000000-3"
+    },
+    {
+      "op": "buy",
+      "symbol": "BUYA",
+      "notional": 18000.0,
+      "notional_hex": "0x1.1940000000000p+14",
+      "atr14": 3.8896279158285436,
+      "atr14_hex": "0x1.f1df53da0bce6p+1",
+      "client_order_id": "at-intent-buy-BUYA-20260826T1430000000-1"
+    },
+    {
+      "op": "buy",
+      "symbol": "BUYB",
+      "notional": 17000.0,
+      "notional_hex": "0x1.09a0000000000p+14",
+      "atr14": 3.8896279158285436,
+      "atr14_hex": "0x1.f1df53da0bce6p+1",
+      "client_order_id": "at-intent-buy-BUYB-20260826T1430000000-2"
+    }
+  ]
+}

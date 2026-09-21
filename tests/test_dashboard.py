@@ -891,6 +891,26 @@ class TestApi:
         assert body["progress"]["card"]["next_job"]["instruction"]
         assert client.get("/api/books/p1/progress").json()["present"] is True
 
+    def test_funnel_endpoint_is_read_only_aggregation(self, client: TestClient):
+        # A-4 (c2c_a7e2 §五): GET-only funnel summary over the seeded journal.
+        # The seeded journal's only intent_events row is the legacy-style
+        # sizing veto (identity columns NULL) — it must surface as an
+        # identity-less degraded count, not a fabricated chain.
+        body = client.get("/api/books/p1/funnel").json()
+        assert body["session_date"] == "2026-08-21"
+        assert body["mode"] == "paper"
+        assert body["schema_degraded"] is False
+        assert body["summary"]["decisions"] == 0
+        assert body["degraded"]["legacy_flush_events"] == 1
+        assert body["degraded"]["fills"]["degraded"] is False  # FakeReader fills are data
+        assert body["chains"] == [] and body["carryover"] == []
+        # Mode filtering is available on the same endpoint. Identity-less
+        # legacy rows predate the mode column entirely, so they count as a
+        # degraded bucket under every mode (never attributed to dry_run).
+        dry = client.get("/api/books/p1/funnel?mode=dry_run").json()
+        assert dry["summary"]["decisions"] == 0
+        assert dry["degraded"]["legacy_flush_events"] == 1
+
 
 # ---- R6: outcomes_summary mode filter + per-horizon small_sample ------------
 

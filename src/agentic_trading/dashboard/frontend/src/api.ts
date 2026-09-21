@@ -214,6 +214,209 @@ export interface TodayPayload {
   progress?: { present: boolean; card: ProgressCard | null };
 }
 
+// ---- A-4 (c2c_a7e2 §五): execution funnel --------------------------------------
+// Mirrors dashboard/views.py funnel_summary(). EVERY field is nullable: an
+// old journal returns schema_degraded with only legacy_event_counts, failed or
+// truncated fills surface as degraded flags instead of "no fills", and old
+// identity-less rows appear only as degraded counters. Rendering must never
+// assume a non-null value and never read absence of evidence as zero.
+
+export interface FunnelSizingDiagnostics {
+  cash_available?: number | null;
+  exposure_room?: number | null;
+  position_cap?: number | null;
+  stop_risk_room_pct?: number | null;
+  stop_risk_room_notional?: number | null;
+  // Upstream already took min(sector, theme) — this is the effective room,
+  // not a pure sector limit.
+  sector_theme_room?: number | null;
+  pre_haircut_notional?: number | null;
+  post_haircut_notional?: number | null;
+  available_notional?: number | null;
+  min_position_notional?: number | null;
+  binding_constraints?: string[] | null;
+  reject_code?: string | null;
+}
+
+// Echoed from the event payload that produced it — never recomputed at page
+// load (PLAN §五: the number comes from the attempt's own sizing snapshot).
+// R8 gap (honest): _funnel_sizing_snapshot() exposes only the EVENT KIND — no
+// snapshot timestamp and no attempt/run id — so the page names the event and
+// must not invent a time or attempt number. See the review handoff: adding
+// event ts/attempt_id to the snapshot is a backend contract change.
+export interface FunnelSizingSnapshot {
+  event_kind?: string | null;
+  sizing?: FunnelSizingDiagnostics | null;
+  reason?: string | null;
+  cash_available?: number | null;
+  available_notional?: number | null;
+  min_notional?: number | null;
+  event_ts?: string | null;
+  attempt_id?: string | null;
+}
+
+export interface FunnelOrder {
+  order_id?: string | null;
+  client_order_id?: string | null;
+  submitted_at?: string | null;
+  submit_status?: string | null;
+  // R5/R8: the backend's own state fields — the page must never re-derive
+  // meaning from a status string. phase ∈ complete | partial |
+  // terminal_unfilled | submit_rejected | submitted | submit_unknown | unknown;
+  // submit_phase ∈ submitted_accepted | submit_rejected | submit_unknown.
+  phase?: string | null;
+  submit_phase?: string | null;
+  last_observation_kind?: string | null;
+  observed_at?: string | null;
+  last_observation_failed?: boolean | null;
+  // Broker status; accepted is NOT filled (PLAN §一/§五).
+  broker_status?: string | null;
+  terminal_status?: string | null;
+  filled_evidence?: boolean | null;
+  partial_evidence?: boolean | null;
+  filled_qty?: number | null;
+  filled_avg_price?: number | null;
+  // null = the fills feed itself was unreadable; false = readable, no match
+  // (absence of evidence, not evidence of zero fills).
+  fills_matched?: boolean | null;
+  fills_qty?: number | null;
+  fills_notional?: number | null;
+  fills_unavailable?: boolean | null;
+}
+
+interface FunnelChainBase {
+  stage?: string | null;
+  reason?: string | null;
+  // Attempts (R6) = distinct runs doing flush-stage work; creation and
+  // status-observation runs are counted separately and listed separately.
+  attempts?: number | null;
+  created_runs?: number | null;
+  observed_runs?: number | null;
+  wait_events?: number | null;
+  orders?: FunnelOrder[] | null;
+  sizing?: FunnelSizingSnapshot | null;
+  // R8: the backend's intent-lifecycle classification — views.py
+  // _funnel_classify (waiting / discarded / cleared / created_pending /
+  // submitted / submit_rejected / submit_unknown / other) plus the
+  // chain-level overrides superseded / not_created / evidence_missing.
+  // The page may only say 意图保留 for waiting/created_pending; a partial
+  // order phase is NOT terminal.
+  classification?: string | null;
+  // R5: the backend's explicit chain/order-level truth and replacement mark.
+  phase?: string | null;
+  superseded_by?: string | null;
+}
+
+export interface FunnelChain extends FunnelChainBase {
+  decision_key?: string | null;
+  run_id?: string | null;
+  symbol?: string | null;
+  first_event_at?: string | null;
+  last_event_at?: string | null;
+  intent_id?: string | null;
+  replaced_previous_version?: string | null;
+}
+
+// Intents created on an earlier ET day that keep flushing today — displayed
+// separately and never counted in the session denominator.
+export interface FunnelCarryover extends FunnelChainBase {
+  intent_id?: string | null;
+  symbol?: string | null;
+  created_on?: string | null;
+  created_by_decision?: string | null;
+}
+
+// R4/R5: today's fills whose order_id matches no ledger event — listed as
+// positive evidence, never fabricated into a chain and never in the cohort.
+export interface FunnelUnlinkedFill {
+  activity_id?: string | null;
+  order_id?: string | null;
+  symbol?: string | null;
+  side?: string | null;
+  qty?: number | null;
+  notional?: number | null;
+  transaction_time?: string | null;
+  fill_status?: string | null;
+  note?: string | null;
+}
+
+export interface FunnelSummaryCounts {
+  decisions?: number | null;
+  with_intent?: number | null;
+  not_created?: number | null;
+  not_created_reasons?: Record<string, number> | null;
+  evidence_missing?: number | null;
+  submitted?: number | null;
+  submitted_frac?: string | null;
+  submit_rejected?: number | null;
+  submit_unknown?: number | null;
+  superseded?: number | null;
+  filled_verified?: number | null;
+  partial?: number | null;
+  waiting?: number | null;
+  discarded?: number | null;
+  cleared?: number | null;
+  created_pending?: number | null;
+  carryover_intents?: number | null;
+}
+
+export interface FunnelDegraded {
+  fills?: { degraded?: boolean | null; reason?: string | null; truncated?: boolean | null } | null;
+  unattributed_decision_events?: number | null;
+  unparseable_timestamps?: number | null;
+  unparseable_payloads?: number | null;
+  legacy_flush_events?: number | null;
+  duplicate_fill_activities?: number | null;
+  post_cutoff_fills?: number | null;
+  identityless_observed_today?: {
+    kind?: string | null; symbol?: string | null; timestamp?: string | null;
+    mode?: string | null; note?: string | null;
+  }[] | null;
+  // R6-B: the same identity-less rows counted PER MODE — "unsplit" is the
+  // backend's reference bucket for mode-NULL history and must never be
+  // folded into the page's own mode.
+  identityless_by_mode?: Record<string, number> | null;
+  // R6-B: order observations that could not be attributed to any intent
+  // (ownership conflict, identity-less submission, no submission on file).
+  // Each row names its own reason — displayed as data, never re-derived.
+  unattributed_order_events?: {
+    kind?: string | null;
+    order_id?: string | null;
+    symbol?: string | null;
+    mode?: string | null;
+    timestamp?: string | null;
+    note?: string | null;
+  }[] | null;
+  orphan_intents?: { intent_id?: string | null; symbol?: string | null; created_by_decision?: string | null; note?: string | null }[] | null;
+  unknown_origin_intents?: { intent_id?: string | null; symbol?: string | null; note?: string | null }[] | null;
+  notes?: string[] | null;
+}
+
+export interface FunnelPayload {
+  session_date?: string | null;
+  mode?: string | null;
+  generated_at?: string | null;
+  // Old journal: only legacy_event_counts kind counts, no identity chains.
+  schema_degraded?: boolean | null;
+  schema_reason?: string | null;
+  summary?: FunnelSummaryCounts | null;
+  chains?: FunnelChain[] | null;
+  carryover?: FunnelCarryover[] | null;
+  unlinked_fills?: FunnelUnlinkedFill[] | null;
+  run_skips?: {
+    run_id?: string | null;
+    reason?: string | null;
+    at?: string | null;
+    // R6-B: run.py writes the prose remainder VERBATIM in detail and the
+    // structured unprocessed intent symbols as a list — null when the payload
+    // carried none. Both render as data; the page never parses the prose.
+    detail?: string | null;
+    unprocessed?: string[] | null;
+  }[] | null;
+  degraded?: FunnelDegraded | null;
+  legacy_event_counts?: Record<string, number> | null;
+}
+
 export interface LiveSignalRow {
   symbol: string;
   score: number | null;
@@ -294,6 +497,8 @@ export const api = {
   compare: () => get<ComparePayload>("/api/compare"),
   health: (book: string) => get<HealthPayload>(`/api/books/${book}/health`),
   today: (book: string) => get<TodayPayload>(`/api/books/${book}/today`),
+  funnel: (book: string, mode = "paper") =>
+    get<FunnelPayload>(`/api/books/${book}/funnel?mode=${mode}`),
   liveSignals: (book: string) => get<LiveSignalsPayload>(`/api/books/${book}/live/signals`),
   liveStreamUrl: (book: string) => `/api/books/${book}/live/stream`,
 };
